@@ -1,9 +1,12 @@
 """Closed-form FLOPs and HBM-byte formulas for optimizer-step kernels,
 paired with primitives/forward.py and primitives/backward.py.
 
+Returns the same five-key dict as the forward / backward primitives,
+built via the shared `_kernel_result` helper:
+  {flops, transferred_bytes, input_bytes, weight_bytes, output_bytes}.
+
 The optimizer step is per-parameter — `n_param` is the total parameter
-count owned by this rank (after TP / ZeRO / EP sharding). Returns
-(flops, bytes) for the entire fused update.
+count owned by this rank (after TP / ZeRO / EP sharding).
 
 Bytes are accounted with three dtype knobs:
   - param_dtype   : storage of the optimizer's master parameter copy and
@@ -14,19 +17,24 @@ Bytes are accounted with three dtype knobs:
   - moment_dtype  : storage of AdamW's m, v buffers. Standard recipes use
                     fp32; "8-bit Adam" / fp8 Adam variants pass "fp8".
 
+Categorisation:
+  - input_bytes : the gradient `g` (the upstream signal consumed by the step).
+  - weight_bytes: persistent state reads (p, m, v).
+  - output_bytes: persistent state writes (p, m, v).
+
 Defaults reflect the conservative recipe (everything in fp32). The op
 enumerator passes recipe-specific dtypes per parameter group.
 """
 
-from typing import Tuple
-from .forward import dtype_bytes
+from typing import Dict
+from .forward import dtype_bytes, _kernel_result
 
 
 def adamw_step_flops_bytes(n_param: int,
                            param_dtype:  str = "fp32",
                            grad_dtype:   str = "fp32",
                            moment_dtype: str = "fp32",
-                           ) -> Tuple[float, float]:
+                           ) -> Dict[str, float]:
     """One AdamW step over n_param parameters owned by this rank.
 
     AdamW update (Loshchilov & Hutter 2017, decoupled weight decay):
@@ -62,21 +70,23 @@ def adamw_step_flops_bytes(n_param: int,
       not its MFU.)
 
     bytes (per parameter, fused single-pass):
-      - read p        :  sizeof(param_dtype)
-      - read g        :  sizeof(grad_dtype)
-      - read m, v     :  2 · sizeof(moment_dtype)
-      - write p       :  sizeof(param_dtype)
-      - write m, v    :  2 · sizeof(moment_dtype)
-      Total = 2·sizeof(param) + sizeof(grad) + 4·sizeof(moment).
+      input_bytes  = n_param · sizeof(grad_dtype)        (read g)
+      weight_bytes = n_param · (sizeof(param) + 2·sizeof(moment))
+                     (read p, m, v — persistent optimizer state)
+      output_bytes = n_param · (sizeof(param) + 2·sizeof(moment))
+                     (write p, m, v back)
+      transferred_bytes = n_param · (sizeof(grad) + 2·sizeof(param) + 4·sizeof(moment)).
 
       Optimizer state is dominant in bytes: with the default fp32-everything
-      recipe, AdamW state alone touches 24 B per parameter — comparable to
+      recipe, AdamW state alone touches 28 B per parameter — comparable to
       forward HBM traffic for a transformer block at moderate batch size,
       which is why optimizer ZeRO-1 / fused kernels matter for training MFU.
     """
-    flops = 13.0 * n_param
     p_b = dtype_bytes(param_dtype)
     g_b = dtype_bytes(grad_dtype)
     m_b = dtype_bytes(moment_dtype)
-    bytes_ = n_param * (2.0 * p_b + g_b + 4.0 * m_b)
-    return flops, bytes_
+    state_bytes  = n_param * (p_b + 2.0 * m_b)        # one read or one write
+    input_bytes  = n_param * g_b
+    weight_bytes = state_bytes
+    output_bytes = state_bytes
+    return _kernel_result(13.0 * n_param, input_bytes, weight_bytes, output_bytes)

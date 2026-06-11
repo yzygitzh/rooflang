@@ -1,13 +1,36 @@
 """Closed-form forward FLOPs and HBM-byte formulas for the model-roofline
 op enumerators.
 
-Each function returns (flops, bytes). The "bytes" definition is per-kernel:
-GEMM treats every input as freshly read from HBM (no reuse); attention
-assumes flash-style SMEM reuse of K/V tiles (no S² in HBM). Each docstring
-states its own reuse model. Backward and optimizer primitives live in
-separate modules.
+Each function returns a dict with the same five keys, so callers can
+sum / aggregate them uniformly:
+
+    {
+      "flops":             ...,    # floating-point operations
+      "transferred_bytes": ...,    # canonical HBM read+write — bandwidth roofline input
+      "input_bytes":       ...,    # incoming activations
+      "weight_bytes":      ...,    # weights + their scale tensors (γ / β fold in here)
+      "output_bytes":      ...,    # outgoing activations
+    }
+
+Default invariant (enforced by _kernel_result):
+    transferred_bytes == input_bytes + weight_bytes + output_bytes
+
+A primitive that needs to model traffic outside the 3-category split —
+workspace, K/V re-load across q-blocks, atomic-RMW, hierarchical-cache
+modelling — passes `transferred_bytes_override=<value>` into the helper;
+that value becomes `transferred_bytes` in the dict and the invariant no
+longer holds. Consumers always read `transferred_bytes` as authoritative.
+
+The per-category fields exist for downstream memory-capacity analysis
+(does it fit in HBM, peak activation memory, KV-cache headroom, …) which
+the bandwidth-side transferred_bytes number alone cannot answer.
+
+The "bytes" definition is per-kernel: GEMM treats every input as freshly
+read from HBM (no reuse); attention assumes flash-style SMEM reuse of K/V
+tiles (no S² in HBM). Each docstring states its own reuse model. Backward
+and optimizer primitives live in separate modules.
 """
-from typing import Tuple
+from typing import Dict, Optional
 
 
 def dtype_bytes(dtype: str) -> float:
@@ -23,9 +46,32 @@ def dtype_bytes(dtype: str) -> float:
     return table[dtype]
 
 
+def _kernel_result(flops: float, input_bytes: float,
+                   weight_bytes: float, output_bytes: float,
+                   transferred_bytes_override: Optional[float] = None,
+                   ) -> Dict[str, float]:
+    """Wrap a primitive's per-category bytes into the standard result dict.
+    Shared by primitives.forward / .backward / .optimizer.
+
+    transferred_bytes defaults to input_bytes + weight_bytes + output_bytes.
+    Pass transferred_bytes_override when a kernel needs to bypass that sum
+    (workspace, K/V re-load across q-blocks, hierarchical-cache modelling).
+    """
+    transferred = (transferred_bytes_override
+                   if transferred_bytes_override is not None
+                   else input_bytes + weight_bytes + output_bytes)
+    return {
+        "flops":             flops,
+        "transferred_bytes": transferred,
+        "input_bytes":       input_bytes,
+        "weight_bytes":      weight_bytes,
+        "output_bytes":      output_bytes,
+    }
+
+
 def gemm_flops_bytes(M: int, N: int, K: int,
                      w_dtype: str, a_dtype: str, out_dtype: str = "bf16",
-                     ) -> Tuple[float, float]:
+                     ) -> Dict[str, float]:
     """Dense GEMM C(M,N) = A(M,K) · B(K,N).
 
     flops:
@@ -34,16 +80,14 @@ def gemm_flops_bytes(M: int, N: int, K: int,
         Over M·N output elements, total = 2·M·N·K.
 
     bytes (HBM, no reuse):
-        Read A: M·K elements at sizeof(a_dtype) each.
-        Read B: K·N elements at sizeof(w_dtype) each.
-        Write C: M·N elements at sizeof(out_dtype) each.
-        Total = M·K·a + K·N·w + M·N·o.
+        input_bytes  = M·K · sizeof(a_dtype)              (read A)
+        weight_bytes = K·N · sizeof(w_dtype) + scale      (read B + per-block scales)
+        output_bytes = M·N · sizeof(out_dtype)            (write C)
     """
-    flops = 2.0 * M * N * K
-    bytes_ = (M * K * dtype_bytes(a_dtype)
-              + K * N * dtype_bytes(w_dtype)
-              + M * N * dtype_bytes(out_dtype))
-    return flops, bytes_
+    input_bytes  = M * K * dtype_bytes(a_dtype)
+    weight_bytes = K * N * dtype_bytes(w_dtype) + gemm_scale_bytes(N, K, w_dtype)
+    output_bytes = M * N * dtype_bytes(out_dtype)
+    return _kernel_result(2.0 * M * N * K, input_bytes, weight_bytes, output_bytes)
 
 
 def gemm_scale_bytes(out_features: int, in_features: int,
@@ -69,7 +113,7 @@ def gemm_scale_bytes(out_features: int, in_features: int,
 
 
 def rmsnorm_flops_bytes(M: int, D: int, dtype: str = "bf16",
-                        ) -> Tuple[float, float]:
+                        ) -> Dict[str, float]:
     """RMSNorm over M rows × D dims:  y = x · rsqrt(mean(x²) + eps) · gamma.
 
     flops:
@@ -81,21 +125,17 @@ def rmsnorm_flops_bytes(M: int, D: int, dtype: str = "bf16",
           - multiply by gamma[i]:        D mults
         Total per row = D + D + D + D = 4D, so 4·M·D over the batch.
 
-    bytes:
-        Fused single-pass kernel (Apex / Triton / aten::rms_norm style):
-        x is loaded once into SMEM/registers and reused for both reduction
-        and normalize. Unfused eager-mode would read x twice (~3·M·D bytes);
-        not modeled here.
-        Read x (M·D) + read gamma (D, broadcast) + write y (M·D)
-        = (2·M·D + D) · sizeof(dtype).
+    bytes (fused single-pass; eager-mode unfused would read x twice):
+        input_bytes  = M·D · sizeof(dtype)      (read x)
+        weight_bytes = D · sizeof(dtype)        (read gamma, broadcast once)
+        output_bytes = M·D · sizeof(dtype)      (write y)
     """
-    flops = 4.0 * M * D
-    bytes_ = (2 * M * D + D) * dtype_bytes(dtype)
-    return flops, bytes_
+    b = dtype_bytes(dtype)
+    return _kernel_result(4.0 * M * D, M * D * b, D * b, M * D * b)
 
 
 def layernorm_flops_bytes(M: int, D: int, dtype: str = "bf16",
-                          ) -> Tuple[float, float]:
+                          ) -> Dict[str, float]:
     """LayerNorm over M rows × D dims:
        mean = mean(x); var = mean((x-mean)²);
        y = (x-mean)·rsqrt(var+eps)·gamma + beta.
@@ -112,19 +152,17 @@ def layernorm_flops_bytes(M: int, D: int, dtype: str = "bf16",
           - add beta:                    D adds
         Total per row = D·7 = 7D, so 7·M·D over the batch.
 
-    bytes:
-        Fused single-pass assumption (same caveat as rmsnorm — eager-mode
-        unfused would read x twice for the two reductions).
-        Read x (M·D) + read gamma+beta (2·D, broadcast) + write y (M·D)
-        = (2·M·D + 2·D) · sizeof(dtype).
+    bytes (fused single-pass; same caveat as rmsnorm):
+        input_bytes  = M·D · sizeof(dtype)      (read x)
+        weight_bytes = 2·D · sizeof(dtype)      (read gamma + beta, broadcast)
+        output_bytes = M·D · sizeof(dtype)      (write y)
     """
-    flops = 7.0 * M * D
-    bytes_ = (2 * M * D + 2 * D) * dtype_bytes(dtype)
-    return flops, bytes_
+    b = dtype_bytes(dtype)
+    return _kernel_result(7.0 * M * D, M * D * b, 2 * D * b, M * D * b)
 
 
 def rope_flops_bytes(M: int, D: int, dtype: str = "bf16",
-                     ) -> Tuple[float, float]:
+                     ) -> Dict[str, float]:
     """RoPE rotation over M tokens × D dims (Q or K). The D dims are
     paired into D/2 (cos, sin)-rotated 2-D groups:
 
@@ -136,19 +174,19 @@ def rope_flops_bytes(M: int, D: int, dtype: str = "bf16",
         D/2 pairs per token → 3·D flops per token.
         Total = 3·M·D.
 
-    bytes:
-        Read x and write y: 2·M·D · sizeof(dtype). The cos/sin tables are
-        D-sized and assumed cached (negligible per-call HBM traffic).
+    bytes (cos/sin tables are D-sized and assumed cached):
+        input_bytes  = M·D · sizeof(dtype)      (read x)
+        weight_bytes = 0                        (cos/sin negligible)
+        output_bytes = M·D · sizeof(dtype)      (write y)
     """
-    flops = 3.0 * M * D
-    bytes_ = 2 * M * D * dtype_bytes(dtype)
-    return flops, bytes_
+    b = dtype_bytes(dtype)
+    return _kernel_result(3.0 * M * D, M * D * b, 0.0, M * D * b)
 
 
 def attn_flops_bytes(B: int, H: int, H_kv: int,
                      S_q: int, S_kv: int, Hd: int,
                      dtype: str = "bf16", causal: bool = False,
-                     ) -> Tuple[float, float]:
+                     ) -> Dict[str, float]:
     """Flash-style multi-head attention forward (no S² matrix in HBM).
 
     flops:
@@ -160,24 +198,26 @@ def attn_flops_bytes(B: int, H: int, H_kv: int,
         Sum over B·H heads: 4·B·H·S_q·S_kv·Hd.
         Causal with S_q == S_kv halves the work (upper-triangular skipped).
 
-    bytes (flash-tiled — K/V tiles reused in SMEM across queries; no S×S
-           attention matrix written back to HBM):
-        Read Q + write O: 2·B·H·S_q·Hd · sizeof(dtype).
-        Read K + V      : 2·B·H_kv·S_kv·Hd · sizeof(dtype). GQA-aware via H_kv.
-        Total = (2·B·H·S_q·Hd + 2·B·H_kv·S_kv·Hd) · sizeof(dtype).
+    bytes (flash-tiled — K/V tiles reused in SMEM; no S×S in HBM):
+        input_bytes  = (B·H·S_q·Hd + 2·B·H_kv·S_kv·Hd) · sizeof(dtype)
+                       (Q + K + V reads)
+        weight_bytes = 0                        (no weights — qkv-proj is a separate gemm)
+        output_bytes = B·H·S_q·Hd · sizeof(dtype)
+                       (O write)
     """
     flops = 4.0 * B * H * S_q * S_kv * Hd
     if causal and S_q == S_kv:
         flops *= 0.5
-    bytes_ = (2 * B * H * S_q * Hd
-              + 2 * B * H_kv * S_kv * Hd) * dtype_bytes(dtype)
-    return flops, bytes_
+    b = dtype_bytes(dtype)
+    input_bytes  = (B * H * S_q * Hd + 2 * B * H_kv * S_kv * Hd) * b
+    output_bytes = B * H * S_q * Hd * b
+    return _kernel_result(flops, input_bytes, 0.0, output_bytes)
 
 
 def sparse_attn_flops_bytes(B: int, H: int, H_kv: int,
                             S_q: int, k_sel: int, Hd: int,
                             dtype: str = "bf16",
-                            ) -> Tuple[float, float]:
+                            ) -> Dict[str, float]:
     """Sparse attention: each query attends to k_sel selected K/V tokens
     (e.g. window + index_topk in the deepseek-v4-pro design). H_kv < H
     covers GQA / MQA / MLA — set H_kv = 1 for MQA or MLA-style shared KV.
@@ -188,12 +228,13 @@ def sparse_attn_flops_bytes(B: int, H: int, H_kv: int,
         per Q-head before the dot, so the H factor is on Q-heads.)
 
     bytes:
-        Read Q + write O: 2·B·H·S_q·Hd · sizeof(dtype).
-        Gathered K + V  : 2·B·H_kv·S_q·k_sel·Hd · sizeof(dtype) — sized by
-            H_kv (one KV set per KV-head; reused across Q-heads in group).
-        Total = (2·B·H·S_q·Hd + 2·B·H_kv·S_q·k_sel·Hd) · sizeof(dtype).
+        input_bytes  = (B·H·S_q·Hd + 2·B·H_kv·S_q·k_sel·Hd) · sizeof(dtype)
+                       (Q read + gathered K + V at k_sel positions)
+        weight_bytes = 0
+        output_bytes = B·H·S_q·Hd · sizeof(dtype)        (O write)
     """
-    flops = 4.0 * B * H * S_q * k_sel * Hd
-    bytes_ = (2 * B * H * S_q * Hd
-              + 2 * B * H_kv * S_q * k_sel * Hd) * dtype_bytes(dtype)
-    return flops, bytes_
+    b = dtype_bytes(dtype)
+    input_bytes  = (B * H * S_q * Hd + 2 * B * H_kv * S_q * k_sel * Hd) * b
+    output_bytes = B * H * S_q * Hd * b
+    return _kernel_result(4.0 * B * H * S_q * k_sel * Hd,
+                          input_bytes, 0.0, output_bytes)

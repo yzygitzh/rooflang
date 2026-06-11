@@ -1,24 +1,33 @@
 """Closed-form backward FLOPs and HBM-byte formulas, paired with forward.py.
 
-Each function returns (flops, bytes). The "bytes" definition is per-kernel
-(same convention as forward): GEMM backward treats inputs as freshly read
-from HBM (no reuse); attention backward assumes flash-style SMEM tile reuse
-plus one extra QK^T recomputation pass to recover the softmax matrix from
-the saved log-sum-exp.
+Each function returns the same five-key dict as forward.py, built via the
+shared `_kernel_result` helper:
+  {flops, transferred_bytes, input_bytes, weight_bytes, output_bytes}.
+
+Per-kernel bytes convention:
+  - GEMM backward: every input freshly read from HBM (no reuse).
+  - Attention backward: per-tensor read-once / write-once accounting,
+    matching the same flash-style SMEM K/V tile reuse model the forward
+    primitive uses, plus one extra QK^T recomputation pass to recover
+    the softmax matrix from the saved log-sum-exp. This is a strict lower
+    bound — FA-v2's two-pass structure (outer-K to compute dK/dV, outer-Q
+    to compute dQ) typically incurs additional HBM traffic from K/V tile
+    re-loads across q-blocks that this closed form does not model. The
+    overhead depends on tile sizes (B_q, B_k) and is hardware-specific.
 
 Parameter-gradient writes (dW, dγ, dβ) take a `grad_dtype` argument that
 defaults to "fp32" — matching standard mixed-precision recipes (PyTorch
-AMP, Megatron-LM, DeepSpeed). Recipes that accumulate in bf16 / fp8 /
-fp4 should pass that explicitly. Activation gradients (dX, dQ/dK/dV) stay
-at the activation dtype, since they flow into the upstream op as inputs.
+AMP, Megatron-LM, DeepSpeed). Recipes that accumulate in bf16 / fp8 / fp4
+should pass that explicitly. Activation gradients (dX, dQ/dK/dV) stay at
+the activation dtype, since they flow into the upstream op as inputs.
 """
-from typing import Tuple
-from .forward import dtype_bytes
+from typing import Dict
+from .forward import dtype_bytes, gemm_scale_bytes, _kernel_result
 
 
 def gemm_dx_flops_bytes(M: int, N: int, K: int,
                         w_dtype: str, a_dtype: str, out_dtype: str = "bf16",
-                        ) -> Tuple[float, float]:
+                        ) -> Dict[str, float]:
     """Gradient w.r.t. the input X of forward Y(M,N) = X(M,K)·W^T(K,N).
 
     dX(M,K) = dY(M,N) · W(N,K).
@@ -28,22 +37,20 @@ def gemm_dx_flops_bytes(M: int, N: int, K: int,
         costing 2N flops. Over M·K elements → 2·M·N·K.
 
     bytes (HBM, no reuse):
-        Read dY: M·N · sizeof(out_dtype).
-        Read W : N·K · sizeof(w_dtype).
-        Write dX: M·K · sizeof(a_dtype) (passed back to upstream op).
-        Total = M·N·o + N·K·w + M·K·a.
+        input_bytes  = M·N · sizeof(out_dtype)              (read dY)
+        weight_bytes = N·K · sizeof(w_dtype) + scale        (read W + per-block scales)
+        output_bytes = M·K · sizeof(a_dtype)                (write dX, passed to upstream)
     """
-    flops = 2.0 * M * N * K
-    bytes_ = (M * N * dtype_bytes(out_dtype)
-              + N * K * dtype_bytes(w_dtype)
-              + M * K * dtype_bytes(a_dtype))
-    return flops, bytes_
+    input_bytes  = M * N * dtype_bytes(out_dtype)
+    weight_bytes = N * K * dtype_bytes(w_dtype) + gemm_scale_bytes(N, K, w_dtype)
+    output_bytes = M * K * dtype_bytes(a_dtype)
+    return _kernel_result(2.0 * M * N * K, input_bytes, weight_bytes, output_bytes)
 
 
 def gemm_dw_flops_bytes(M: int, N: int, K: int,
                         w_dtype: str, a_dtype: str, out_dtype: str = "bf16",
                         grad_dtype: str = "fp32",
-                        ) -> Tuple[float, float]:
+                        ) -> Dict[str, float]:
     """Gradient w.r.t. the weight W of forward Y(M,N) = X(M,K)·W^T(K,N).
 
     dW(N,K) = dY^T(N,M) · X(M,K).
@@ -53,24 +60,20 @@ def gemm_dw_flops_bytes(M: int, N: int, K: int,
         costing 2M flops. Over N·K elements → 2·M·N·K.
 
     bytes (HBM, no reuse):
-        Read dY: M·N · sizeof(out_dtype).
-        Read X : M·K · sizeof(a_dtype).
-        Write dW: N·K · sizeof(grad_dtype). Default fp32 matches standard
-            mixed-precision recipes (PyTorch AMP, Megatron-LM, DeepSpeed);
-            pass "bf16" / "fp8" if the recipe uses lower-precision grad
-            accumulation.
-        Total = M·N·o + M·K·a + N·K·g.
+        input_bytes  = M·N · sizeof(out_dtype) + M·K · sizeof(a_dtype)
+                       (read dY + read X — both saved-activation reads)
+        weight_bytes = 0                            (no weight is read)
+        output_bytes = N·K · sizeof(grad_dtype)     (write dW, fp32 by default)
     """
     flops = 2.0 * M * N * K
-    bytes_ = (M * N * dtype_bytes(out_dtype)
-              + M * K * dtype_bytes(a_dtype)
-              + N * K * dtype_bytes(grad_dtype))
-    return flops, bytes_
+    input_bytes  = M * N * dtype_bytes(out_dtype) + M * K * dtype_bytes(a_dtype)
+    output_bytes = N * K * dtype_bytes(grad_dtype)
+    return _kernel_result(flops, input_bytes, 0.0, output_bytes)
 
 
 def rmsnorm_backward_flops_bytes(M: int, D: int, dtype: str = "bf16",
                                  grad_dtype: str = "fp32",
-                                 ) -> Tuple[float, float]:
+                                 ) -> Dict[str, float]:
     """RMSNorm backward. Forward:  y = γ · x · r,  r = rsqrt(mean(x²)+eps).
 
     flops (per row of D):
@@ -85,20 +88,20 @@ def rmsnorm_backward_flops_bytes(M: int, D: int, dtype: str = "bf16",
       Total per row ≈ 9D, so 9·M·D over the batch (~2.25× forward 4MD).
 
     bytes (fused single-pass; same caveat as forward):
-        Read x, dy, γ:  (2·M·D + D) · sizeof(dtype).
-        Write dx:       M·D · sizeof(dtype).
-        Write dγ:       D · sizeof(grad_dtype) (recipe-dependent; fp32 by
-            default for atomic / reduce accumulation safety).
-        Total = (3·M·D + D) · sizeof(dtype) + D · sizeof(grad_dtype).
+        input_bytes  = 2·M·D · sizeof(dtype)       (read x + read dy)
+        weight_bytes = D · sizeof(dtype)           (read γ, broadcast)
+        output_bytes = M·D · sizeof(dtype) + D · sizeof(grad_dtype)
+                       (write dx + write dγ; dγ in grad_dtype, fp32 default)
     """
-    flops = 9.0 * M * D
-    bytes_ = (3 * M * D + D) * dtype_bytes(dtype) + D * dtype_bytes(grad_dtype)
-    return flops, bytes_
+    db = dtype_bytes(dtype)
+    gb = dtype_bytes(grad_dtype)
+    return _kernel_result(9.0 * M * D,
+                          2 * M * D * db, D * db, M * D * db + D * gb)
 
 
 def layernorm_backward_flops_bytes(M: int, D: int, dtype: str = "bf16",
                                    grad_dtype: str = "fp32",
-                                   ) -> Tuple[float, float]:
+                                   ) -> Dict[str, float]:
     """LayerNorm backward — like rmsnorm backward, plus the mean-subtract
     gradient and dβ accumulation.
 
@@ -110,33 +113,36 @@ def layernorm_backward_flops_bytes(M: int, D: int, dtype: str = "bf16",
       Megatron-LM accounting uses ~10D).
 
     bytes (fused single-pass):
-        Read x, dy, γ: (2·M·D + D) · sizeof(dtype).
-        Write dx:      M·D · sizeof(dtype).
-        Write dγ, dβ:  2·D · sizeof(grad_dtype) (recipe-dependent; fp32 default).
-        Total = (3·M·D + D) · sizeof(dtype) + 2·D · sizeof(grad_dtype).
+        input_bytes  = 2·M·D · sizeof(dtype)       (read x + read dy)
+        weight_bytes = D · sizeof(dtype)           (read γ; β not read in bwd)
+        output_bytes = M·D · sizeof(dtype) + 2·D · sizeof(grad_dtype)
+                       (write dx + dγ + dβ)
     """
-    flops = 11.0 * M * D
-    bytes_ = (3 * M * D + D) * dtype_bytes(dtype) + 2 * D * dtype_bytes(grad_dtype)
-    return flops, bytes_
+    db = dtype_bytes(dtype)
+    gb = dtype_bytes(grad_dtype)
+    return _kernel_result(11.0 * M * D,
+                          2 * M * D * db, D * db, M * D * db + 2 * D * gb)
 
 
 def rope_backward_flops_bytes(M: int, D: int, dtype: str = "bf16",
-                              ) -> Tuple[float, float]:
+                              ) -> Dict[str, float]:
     """RoPE backward = forward rotation with negated angle (transpose of
     the rotation matrix). Same per-pair cost as forward.
 
     flops:  3·M·D (D/2 pairs × 6 flops, identical breakdown to forward).
-    bytes:  2·M·D · sizeof(dtype) (read dy, write dx).
+    bytes:
+        input_bytes  = M·D · sizeof(dtype)         (read dy)
+        weight_bytes = 0                           (cos/sin tables cached)
+        output_bytes = M·D · sizeof(dtype)         (write dx)
     """
-    flops = 3.0 * M * D
-    bytes_ = 2 * M * D * dtype_bytes(dtype)
-    return flops, bytes_
+    b = dtype_bytes(dtype)
+    return _kernel_result(3.0 * M * D, M * D * b, 0.0, M * D * b)
 
 
 def attn_backward_flops_bytes(B: int, H: int, H_kv: int,
                               S_q: int, S_kv: int, Hd: int,
                               dtype: str = "bf16", causal: bool = False,
-                              ) -> Tuple[float, float]:
+                              ) -> Dict[str, float]:
     """Flash-Attention v2 backward (FA only saves log-sum-exp, recomputes S).
 
     flops (four backward matmuls + one recompute pass = 5 total, each
@@ -150,32 +156,43 @@ def attn_backward_flops_bytes(B: int, H: int, H_kv: int,
         Total = 10·B·H·S_q·S_kv·Hd = 2.5× forward (which was 4·B·H·S_q·S_kv·Hd).
         Causal halving applies when S_q == S_kv.
 
-    bytes (flash-tiled, similar SMEM K/V tile reuse to forward):
-        Read Q, K, V, dO at full precision + LSE (per-row fp32 scalar).
-        Write dQ, dK, dV in fp32 (gradient accumulators).
-        Per FA-v2 analysis this works out to ~2× forward bytes; modeled
-        as exactly 2× here.
+    bytes (per-tensor read-once / write-once; strict lower bound — see
+           module docstring for why real FA-v2 traffic exceeds this):
+        input_bytes  = (2·B·H·S_q·Hd + 2·B·H_kv·S_kv·Hd) · sizeof(dtype)
+                       (Q + K + V + dO reads)
+        weight_bytes = 0
+        output_bytes = (B·H·S_q·Hd + 2·B·H_kv·S_kv·Hd) · sizeof(dtype)
+                       (dQ + dK + dV writes, sized by H_q vs H_kv)
+        transferred_bytes = input + output
+                          = (3·B·H·S_q·Hd + 4·B·H_kv·S_kv·Hd) · sizeof(dtype).
     """
     flops = 10.0 * B * H * S_q * S_kv * Hd
     if causal and S_q == S_kv:
         flops *= 0.5
-    fwd_bytes = (2 * B * H * S_q * Hd
-                 + 2 * B * H_kv * S_kv * Hd) * dtype_bytes(dtype)
-    return flops, 2.0 * fwd_bytes
+    b = dtype_bytes(dtype)
+    input_bytes  = (2 * B * H * S_q * Hd + 2 * B * H_kv * S_kv * Hd) * b
+    output_bytes = (B * H * S_q * Hd + 2 * B * H_kv * S_kv * Hd) * b
+    return _kernel_result(flops, input_bytes, 0.0, output_bytes)
 
 
 def sparse_attn_backward_flops_bytes(B: int, H: int, H_kv: int,
                                      S_q: int, k_sel: int, Hd: int,
                                      dtype: str = "bf16",
-                                     ) -> Tuple[float, float]:
+                                     ) -> Dict[str, float]:
     """Sparse-attention backward — same FA-v2 structure with k_sel keys
     in place of S_kv, plus gather/scatter on K, V, dK, dV at the selected
     indices (the gather cost itself is bandwidth, accounted in bytes).
 
     flops:  10·B·H·S_q·k_sel·Hd  (2.5× forward sparse-attn).
-    bytes:  ~2× forward sparse-attn bytes.
+    bytes (per-tensor read-once / write-once; same caveat as attn bwd):
+        input_bytes  = (2·B·H·S_q·Hd + 2·B·H_kv·S_q·k_sel·Hd) · sizeof(dtype)
+                       (Q + dO + gathered K + gathered V)
+        weight_bytes = 0
+        output_bytes = (B·H·S_q·Hd + 2·B·H_kv·S_q·k_sel·Hd) · sizeof(dtype)
+                       (dQ + dK + dV writes)
     """
     flops = 10.0 * B * H * S_q * k_sel * Hd
-    fwd_bytes = (2 * B * H * S_q * Hd
-                 + 2 * B * H_kv * S_q * k_sel * Hd) * dtype_bytes(dtype)
-    return flops, 2.0 * fwd_bytes
+    b = dtype_bytes(dtype)
+    input_bytes  = (2 * B * H * S_q * Hd + 2 * B * H_kv * S_q * k_sel * Hd) * b
+    output_bytes = (B * H * S_q * Hd + 2 * B * H_kv * S_q * k_sel * Hd) * b
+    return _kernel_result(flops, input_bytes, 0.0, output_bytes)

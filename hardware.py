@@ -43,6 +43,7 @@ class HardwareSpec:
     peak_bw_gbs: float              # HBM bandwidth, GB/s
     intra_node: LinkSpec            # NVLink / xGMI / etc.
     inter_node: InterNodeSpec       # InfiniBand / RoCE / etc.
+    gpus_per_node: int = 8          # topology info for intra/inter resolution
 
 
 # -- Built-in presets ---------------------------------------------------------

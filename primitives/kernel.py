@@ -14,27 +14,51 @@ roofline metrics. Composition rules live here so they're defined once:
     handled by the scheduler layer — not part of the Kernel contract.
 """
 
-from dataclasses import dataclass
-from typing import Optional
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..parallelism import ShardingSpec
 
 
 @dataclass
 class Kernel:
-    """Base: one primitive or composite op with its roofline metrics."""
+    """Base: one primitive or composite with its roofline metrics.
+
+    Attributes beyond roofline numbers:
+      sharding:   per-primitive ShardingSpec (set by the enumerator).
+      recompute:  whether this primitive is recomputed during backward
+                  (adds one extra forward pass of FLOPs/bytes).
+    """
     flops: float
     transferred_bytes: float
     input_bytes: float
     weight_bytes: float
     output_bytes: float
+    sharding: Optional["ShardingSpec"] = field(default=None, repr=False)
+    recompute: Optional[bool] = field(default=None, repr=False)
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "flops":             self.flops,
             "transferred_bytes": self.transferred_bytes,
             "input_bytes":       self.input_bytes,
             "weight_bytes":      self.weight_bytes,
             "output_bytes":      self.output_bytes,
         }
+        if self.recompute is not None:
+            d["recompute"] = self.recompute
+        if self.sharding is not None:
+            d["sharding"] = {
+                "tp": self.sharding.tp,
+                "dp": self.sharding.dp,
+                "cp": self.sharding.cp,
+                "ep": self.sharding.ep,
+                "zero": self.sharding.zero,
+            }
+        return d
 
 
 class FusedKernel(Kernel):

@@ -1,11 +1,13 @@
-"""primitives — closed-form FLOPs / HBM-byte formulas split by phase:
+"""primitives — Kernel classes for closed-form FLOPs / HBM-byte formulas,
+split by phase:
 
-  forward.py    — forward kernels (GEMM, norms, RoPE, attention, sparse-attn)
-  backward.py   — gradient kernels (dX, dW, attention backward, …)
-  optimizer.py  — optimizer-step kernels (AdamW)
+  kernel.py     — Kernel base class + FusedKernel / OverlappedKernel compositors
+  forward.py    — GemmForward, RMSNormForward, LayerNormForward, RoPEForward,
+                  AttnForward, SparseAttnForward
+  backward.py   — gradient kernels (dX, dW, attention backward, …) [dict, pending migration]
+  optimizer.py  — AdamW step [dict, pending migration]
 
 Import directly from the submodule of interest:
-    from primitives.forward   import gemm_flops_bytes, attn_flops_bytes
-    from primitives.backward  import gemm_dx_flops_bytes, attn_backward_flops_bytes
-    from primitives.optimizer import adamw_step_flops_bytes
+    from primitives.kernel  import Kernel, FusedKernel, OverlappedKernel
+    from primitives.forward import GemmForward, AttnForward
 """

@@ -3,10 +3,12 @@ split by phase:
 
   kernel.py     — Kernel base class + FusedKernel / OverlappedKernel compositors
   forward.py    — Gemm, RMSNorm, LayerNorm, RoPE, Attn, SparseAttn
-  backward.py   — gradient kernels (dX, dW, attention backward, …) [dict, pending migration]
-  optimizer.py  — AdamW step [dict, pending migration]
+  backward.py   — GemmDX, GemmDW, RMSNorm, LayerNorm, RoPE, Attn, SparseAttn
+  optimizer.py  — AdamWStep
 
-Import directly from the submodule of interest:
-    from primitives.kernel  import Kernel, FusedKernel, OverlappedKernel
-    from primitives.forward import Gemm, Attn
+Forward and backward share class names; disambiguate via module:
+    from primitives import forward, backward
+    fwd = forward.Gemm(4096, 4096, 4096, 'fp8', 'fp8')
+    bwd_dx = backward.GemmDX(4096, 4096, 4096, 'fp8', 'fp8')
+    bwd_norm = backward.RMSNorm(4096, 7168)
 """

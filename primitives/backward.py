@@ -70,7 +70,7 @@ class GemmDW(Kernel):
         )
 
 
-class RMSNormBackward(Kernel):
+class RMSNorm(Kernel):
     """RMSNorm backward.
 
     flops = 9·M·D per batch (~2.25× forward 4MD).
@@ -96,7 +96,7 @@ class RMSNormBackward(Kernel):
         )
 
 
-class LayerNormBackward(Kernel):
+class LayerNorm(Kernel):
     """LayerNorm backward.
 
     flops = 11·M·D per batch.
@@ -122,7 +122,7 @@ class LayerNormBackward(Kernel):
         )
 
 
-class RoPEBackward(Kernel):
+class RoPE(Kernel):
     """RoPE backward = forward rotation with negated angle.
 
     flops = 3·M·D.
@@ -141,7 +141,7 @@ class RoPEBackward(Kernel):
         )
 
 
-class AttnBackward(Kernel):
+class Attn(Kernel):
     """Flash-Attention v2 backward (recompute S from saved LSE).
 
     flops = 10·B·H·S_q·S_kv·Hd (×0.5 if causal and S_q==S_kv).
@@ -169,7 +169,7 @@ class AttnBackward(Kernel):
         )
 
 
-class SparseAttnBackward(Kernel):
+class SparseAttn(Kernel):
     """Sparse-attention backward (FA-v2 structure with k_sel keys).
 
     flops = 10·B·H·S_q·k_sel·Hd.

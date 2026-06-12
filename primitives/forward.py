@@ -30,13 +30,15 @@ def gemm_scale_bytes(out_features: int, in_features: int,
     Other dtypes: 0.
     """
     if w_dtype == "fp8":
-        return ((out_features + 127) // 128) * ((in_features + 127) // 128)
+        n_blocks = ((out_features + 127) // 128) * ((in_features + 127) // 128)
+        return n_blocks * dtype_bytes("ue8m0")
     if w_dtype == "fp4":
-        return out_features * ((in_features + 31) // 32)
+        n_scales = out_features * ((in_features + 31) // 32)
+        return n_scales * dtype_bytes("ue8m0")
     return 0.0
 
 
-class GemmForward(Kernel):
+class Gemm(Kernel):
     """Dense GEMM C(M,N) = A(M,K) · B(K,N).
 
     flops = 2·M·N·K (fused MAC counted as 2 per output element).
@@ -60,7 +62,7 @@ class GemmForward(Kernel):
         )
 
 
-class RMSNormForward(Kernel):
+class RMSNorm(Kernel):
     """RMSNorm:  y = x · rsqrt(mean(x²) + eps) · gamma.
 
     flops = 4·M·D (square + reduce + mul-by-rsqrt + mul-by-gamma).
@@ -83,7 +85,7 @@ class RMSNormForward(Kernel):
         )
 
 
-class LayerNormForward(Kernel):
+class LayerNorm(Kernel):
     """LayerNorm:  y = (x-mean)·rsqrt(var+eps)·gamma + beta.
 
     flops = 7·M·D (mean + sub + sq + var + mul-invstd + mul-gamma + add-beta).
@@ -106,7 +108,7 @@ class LayerNormForward(Kernel):
         )
 
 
-class RoPEForward(Kernel):
+class RoPE(Kernel):
     """RoPE rotation: y[2i] = x[2i]·cos - x[2i+1]·sin, etc.
 
     flops = 3·M·D  (D/2 pairs × 6 flops per pair).
@@ -128,7 +130,7 @@ class RoPEForward(Kernel):
         )
 
 
-class AttnForward(Kernel):
+class Attn(Kernel):
     """Flash-style multi-head attention forward (no S² in HBM).
 
     flops = 4·B·H·S_q·S_kv·Hd  (×0.5 if causal and S_q==S_kv).
@@ -157,7 +159,7 @@ class AttnForward(Kernel):
         )
 
 
-class SparseAttnForward(Kernel):
+class SparseAttn(Kernel):
     """Sparse attention: each query attends to k_sel selected K/V tokens.
 
     flops = 4·B·H·S_q·k_sel·Hd.

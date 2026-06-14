@@ -5,6 +5,7 @@ split by phase:
   forward.py    — Gemm, RMSNorm, LayerNorm, RoPE, Attn, SparseAttn
   backward.py   — GemmDX, GemmDW, RMSNorm, LayerNorm, RoPE, Attn, SparseAttn
   optimizer.py  — AdamWStep
+  comm.py       — AllReduce, ReduceScatter, AllGather, AllToAll, Broadcast, SendRecv
 
 Forward and backward share class names; disambiguate via module:
     from primitives import forward, backward

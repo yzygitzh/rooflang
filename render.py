@@ -38,9 +38,22 @@ class PrimitiveRow:
     compute_time_s: float = field(init=False, default=0.0)
     mem_time_s: float = field(init=False, default=0.0)
     bound: str = field(init=False, default="")
+    weight_mem: float = field(init=False, default=0.0)
+    input_mem: float = field(init=False, default=0.0)
+    output_mem: float = field(init=False, default=0.0)
 
     def project(self, hw: HardwareSpec) -> None:
-        """Derive roofline projections from kernel metrics + hardware."""
+        """Derive roofline projections and memory footprint from kernel + hw.
+
+        Memory footprint (per-rank, assuming enumerator already sharded dims):
+          weight_mem: persistent weight storage on this rank (lives for the
+                      entire step; shared across fwd/bwd invocations).
+          input_mem:  activation memory consumed (must be live when this
+                      primitive executes; freed after consumption).
+          output_mem: activation memory produced (must stay live until the
+                      downstream consumer runs, or until backward if saved
+                      for gradient computation).
+        """
         k = self.kernel
         if k.transferred_bytes > 0:
             self.arith_intensity = k.flops / k.transferred_bytes
@@ -51,7 +64,6 @@ class PrimitiveRow:
         bw = hw.peak_bw_gbs
 
         if bw > 0:
-            ridge = peak * 1e3 / bw  # FLOP/byte at ridge point
             self.roofline_tflops = min(peak, self.arith_intensity * bw / 1e3)
         else:
             self.roofline_tflops = peak
@@ -66,6 +78,10 @@ class PrimitiveRow:
         else:
             self.bound = "memory"
 
+        self.weight_mem = k.weight_bytes
+        self.input_mem = k.input_bytes
+        self.output_mem = k.output_bytes
+
     def to_dict(self) -> dict:
         d = {
             "name": self.name,
@@ -77,6 +93,9 @@ class PrimitiveRow:
             "compute_time_s": self.compute_time_s,
             "mem_time_s": self.mem_time_s,
             "bound": self.bound,
+            "weight_mem": self.weight_mem,
+            "input_mem": self.input_mem,
+            "output_mem": self.output_mem,
         }
         d.update(self.kernel.to_dict())
         return d
@@ -90,6 +109,9 @@ class PhaseSummary:
     total_bytes: float = 0.0
     total_compute_time_s: float = 0.0
     total_mem_time_s: float = 0.0
+    total_weight_mem: float = 0.0
+    total_input_mem: float = 0.0
+    total_output_mem: float = 0.0
     n_ops: int = 0
 
     @property
@@ -110,6 +132,9 @@ class PhaseSummary:
             "total_bytes": self.total_bytes,
             "total_compute_time_s": self.total_compute_time_s,
             "total_mem_time_s": self.total_mem_time_s,
+            "total_weight_mem": self.total_weight_mem,
+            "total_input_mem": self.total_input_mem,
+            "total_output_mem": self.total_output_mem,
             "time_s": self.time_s,
             "realized_tflops": self.realized_tflops,
             "n_ops": self.n_ops,
@@ -124,6 +149,9 @@ def summarize(rows: List[PrimitiveRow], phase: str) -> PhaseSummary:
         s.total_bytes += r.kernel.transferred_bytes
         s.total_compute_time_s += r.compute_time_s
         s.total_mem_time_s += r.mem_time_s
+        s.total_weight_mem += r.weight_mem
+        s.total_input_mem += r.input_mem
+        s.total_output_mem += r.output_mem
         s.n_ops += 1
     return s
 

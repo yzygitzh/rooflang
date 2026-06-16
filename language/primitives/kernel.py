@@ -17,10 +17,9 @@ roofline metrics. Composition rules live here so they're defined once:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, TYPE_CHECKING
+from typing import Optional
 
-if TYPE_CHECKING:
-    from rooflang.language.parallelism import ShardingSpec
+from rooflang.language.parallelism import ShardingSpec
 
 
 @dataclass
@@ -37,7 +36,7 @@ class Kernel:
     input_bytes: float
     weight_bytes: float
     output_bytes: float
-    sharding: Optional["ShardingSpec"] = field(default=None, repr=False)
+    sharding: Optional[ShardingSpec] = field(default=None, repr=False)
     recompute: Optional[bool] = field(default=None, repr=False)
 
     def to_dict(self) -> dict:

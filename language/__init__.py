@@ -1,0 +1,10 @@
+"""rooflang.language — vocabulary for writing roofline programs.
+
+Subpackages:
+  primitives/   — Kernel classes (forward, backward, optimizer, comm)
+  hardware/     — hardware component model (CPU, GPU, NIC, Switch, Fabric)
+
+Modules:
+  tensor.py     — Tensor class (shape, dtype, location)
+  parallelism.py — ShardingSpec
+"""

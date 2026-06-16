@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ..parallelism import ShardingSpec
+    from rooflang.language.parallelism import ShardingSpec
 
 
 @dataclass

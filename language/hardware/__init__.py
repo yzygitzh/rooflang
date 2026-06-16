@@ -1,9 +1,17 @@
-"""rooflang.language.hardware — hardware component model.
+"""rooflang.language.hardware — hardware component graph.
 
-Currently re-exports from spec.py (the legacy HardwareSpec). Will be
-decomposed into component classes (CPU, GPU, NIC, Switch, Fabric) in
-subsequent commits.
+Hardware is a graph: Compute/Memory nodes connected by Fabric edges.
+Cluster holds the full topology. spec.py is retained for backward
+compatibility with render.py until the runtime is migrated.
 """
+
+from rooflang.language.hardware.component import (
+    HardwareComponent,
+    Compute,
+    Memory,
+    Fabric,
+    Cluster,
+)
 
 from rooflang.language.hardware.spec import (
     HardwareSpec,

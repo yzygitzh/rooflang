@@ -15,7 +15,7 @@ import json
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from rooflang.language.primitives.kernel import Kernel
+from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.hardware import HardwareSpec
 
 

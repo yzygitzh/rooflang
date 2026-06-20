@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Tuple
 
 from rooflang.language.hardware.component import Memory
-from rooflang.language.primitives.utils import dtype_bytes
+from rooflang.language.kernels.utils import dtype_bytes
 
 
 @dataclass

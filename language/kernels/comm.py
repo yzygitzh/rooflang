@@ -15,8 +15,8 @@ AllToAll is transfer-only — the permutation is a routing decision, not
 an arithmetic operation.
 """
 
-from rooflang.language.primitives.kernel import Kernel
-from rooflang.language.primitives.utils import dtype_bytes
+from rooflang.language.kernels.kernel import Kernel
+from rooflang.language.kernels.utils import dtype_bytes
 
 
 class AllReduce(Kernel):

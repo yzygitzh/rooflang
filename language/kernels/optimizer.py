@@ -18,8 +18,8 @@ Defaults reflect the conservative recipe (everything in fp32). The op
 enumerator passes recipe-specific dtypes per parameter group.
 """
 
-from rooflang.language.primitives.kernel import Kernel
-from rooflang.language.primitives.utils import dtype_bytes
+from rooflang.language.kernels.kernel import Kernel
+from rooflang.language.kernels.utils import dtype_bytes
 
 
 class AdamWStep(Kernel):

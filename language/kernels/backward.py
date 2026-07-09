@@ -34,14 +34,24 @@ class GemmDX(Kernel):
                  w_dtype: str, a_dtype: str, out_dtype: str = "bf16"):
         self.M, self.N, self.K = M, N, K
         self.w_dtype, self.a_dtype, self.out_dtype = w_dtype, a_dtype, out_dtype
-        ib = M * N * dtype_bytes(out_dtype)
-        wb = N * K * dtype_bytes(w_dtype) + gemm_scale_bytes(N, K, w_dtype)
-        ob = M * K * dtype_bytes(a_dtype)
-        super().__init__(
-            flops=2.0 * M * N * K,
-            transferred_bytes=ib + wb + ob,
-            input_bytes=ib, weight_bytes=wb, output_bytes=ob,
-        )
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        return 2.0 * self.M * self.N * self.K
+
+    @property
+    def input_bytes(self) -> float:
+        return self.M * self.N * dtype_bytes(self.out_dtype)
+
+    @property
+    def weight_bytes(self) -> float:
+        return (self.N * self.K * dtype_bytes(self.w_dtype)
+                + gemm_scale_bytes(self.N, self.K, self.w_dtype))
+
+    @property
+    def output_bytes(self) -> float:
+        return self.M * self.K * dtype_bytes(self.a_dtype)
 
 
 class GemmDW(Kernel):
@@ -61,13 +71,24 @@ class GemmDW(Kernel):
         self.M, self.N, self.K = M, N, K
         self.w_dtype, self.a_dtype, self.out_dtype = w_dtype, a_dtype, out_dtype
         self.grad_dtype = grad_dtype
-        ib = M * N * dtype_bytes(out_dtype) + M * K * dtype_bytes(a_dtype)
-        ob = N * K * dtype_bytes(grad_dtype)
-        super().__init__(
-            flops=2.0 * M * N * K,
-            transferred_bytes=ib + ob,
-            input_bytes=ib, weight_bytes=0.0, output_bytes=ob,
-        )
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        return 2.0 * self.M * self.N * self.K
+
+    @property
+    def input_bytes(self) -> float:
+        return (self.M * self.N * dtype_bytes(self.out_dtype)
+                + self.M * self.K * dtype_bytes(self.a_dtype))
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        return self.N * self.K * dtype_bytes(self.grad_dtype)
 
 
 class RMSNorm(Kernel):
@@ -84,16 +105,24 @@ class RMSNorm(Kernel):
     def __init__(self, M: int, D: int, dtype: str = "bf16",
                  grad_dtype: str = "fp32"):
         self.M, self.D, self.dtype_, self.grad_dtype = M, D, dtype, grad_dtype
-        db = dtype_bytes(dtype)
-        gb = dtype_bytes(grad_dtype)
-        ib = 2 * M * D * db
-        wb = D * db
-        ob = M * D * db + D * gb
-        super().__init__(
-            flops=9.0 * M * D,
-            transferred_bytes=ib + wb + ob,
-            input_bytes=ib, weight_bytes=wb, output_bytes=ob,
-        )
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        return 9.0 * self.M * self.D
+
+    @property
+    def input_bytes(self) -> float:
+        return 2 * self.M * self.D * dtype_bytes(self.dtype_)
+
+    @property
+    def weight_bytes(self) -> float:
+        return self.D * dtype_bytes(self.dtype_)
+
+    @property
+    def output_bytes(self) -> float:
+        return (self.M * self.D * dtype_bytes(self.dtype_)
+                + self.D * dtype_bytes(self.grad_dtype))
 
 
 class LayerNorm(Kernel):
@@ -110,16 +139,24 @@ class LayerNorm(Kernel):
     def __init__(self, M: int, D: int, dtype: str = "bf16",
                  grad_dtype: str = "fp32"):
         self.M, self.D, self.dtype_, self.grad_dtype = M, D, dtype, grad_dtype
-        db = dtype_bytes(dtype)
-        gb = dtype_bytes(grad_dtype)
-        ib = 2 * M * D * db
-        wb = D * db
-        ob = M * D * db + 2 * D * gb
-        super().__init__(
-            flops=11.0 * M * D,
-            transferred_bytes=ib + wb + ob,
-            input_bytes=ib, weight_bytes=wb, output_bytes=ob,
-        )
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        return 11.0 * self.M * self.D
+
+    @property
+    def input_bytes(self) -> float:
+        return 2 * self.M * self.D * dtype_bytes(self.dtype_)
+
+    @property
+    def weight_bytes(self) -> float:
+        return self.D * dtype_bytes(self.dtype_)
+
+    @property
+    def output_bytes(self) -> float:
+        return (self.M * self.D * dtype_bytes(self.dtype_)
+                + 2 * self.D * dtype_bytes(self.grad_dtype))
 
 
 class RoPE(Kernel):
@@ -131,14 +168,23 @@ class RoPE(Kernel):
 
     def __init__(self, M: int, D: int, dtype: str = "bf16"):
         self.M, self.D, self.dtype_ = M, D, dtype
-        b = dtype_bytes(dtype)
-        ib = M * D * b
-        ob = M * D * b
-        super().__init__(
-            flops=3.0 * M * D,
-            transferred_bytes=ib + ob,
-            input_bytes=ib, weight_bytes=0.0, output_bytes=ob,
-        )
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        return 3.0 * self.M * self.D
+
+    @property
+    def input_bytes(self) -> float:
+        return self.M * self.D * dtype_bytes(self.dtype_)
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        return self.M * self.D * dtype_bytes(self.dtype_)
 
 
 class Attn(Kernel):
@@ -156,17 +202,30 @@ class Attn(Kernel):
         self.B, self.H, self.H_kv = B, H, H_kv
         self.S_q, self.S_kv, self.Hd = S_q, S_kv, Hd
         self.dtype_, self.causal = dtype, causal
-        flops = 10.0 * B * H * S_q * S_kv * Hd
-        if causal and S_q == S_kv:
-            flops *= 0.5
-        b = dtype_bytes(dtype)
-        ib = (2 * B * H * S_q * Hd + 2 * B * H_kv * S_kv * Hd) * b
-        ob = (B * H * S_q * Hd + 2 * B * H_kv * S_kv * Hd) * b
-        super().__init__(
-            flops=flops,
-            transferred_bytes=ib + ob,
-            input_bytes=ib, weight_bytes=0.0, output_bytes=ob,
-        )
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        f = 10.0 * self.B * self.H * self.S_q * self.S_kv * self.Hd
+        if self.causal and self.S_q == self.S_kv:
+            f *= 0.5
+        return f
+
+    @property
+    def input_bytes(self) -> float:
+        b = dtype_bytes(self.dtype_)
+        return (2 * self.B * self.H * self.S_q * self.Hd
+                + 2 * self.B * self.H_kv * self.S_kv * self.Hd) * b
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        b = dtype_bytes(self.dtype_)
+        return (self.B * self.H * self.S_q * self.Hd
+                + 2 * self.B * self.H_kv * self.S_kv * self.Hd) * b
 
 
 class SparseAttn(Kernel):
@@ -184,11 +243,24 @@ class SparseAttn(Kernel):
         self.B, self.H, self.H_kv = B, H, H_kv
         self.S_q, self.k_sel, self.Hd = S_q, k_sel, Hd
         self.dtype_ = dtype
-        b = dtype_bytes(dtype)
-        ib = (2 * B * H * S_q * Hd + 2 * B * H_kv * S_q * k_sel * Hd) * b
-        ob = (B * H * S_q * Hd + 2 * B * H_kv * S_q * k_sel * Hd) * b
-        super().__init__(
-            flops=10.0 * B * H * S_q * k_sel * Hd,
-            transferred_bytes=ib + ob,
-            input_bytes=ib, weight_bytes=0.0, output_bytes=ob,
-        )
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        return 10.0 * self.B * self.H * self.S_q * self.k_sel * self.Hd
+
+    @property
+    def input_bytes(self) -> float:
+        b = dtype_bytes(self.dtype_)
+        return (2 * self.B * self.H * self.S_q * self.Hd
+                + 2 * self.B * self.H_kv * self.S_q * self.k_sel * self.Hd) * b
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        b = dtype_bytes(self.dtype_)
+        return (self.B * self.H * self.S_q * self.Hd
+                + 2 * self.B * self.H_kv * self.S_q * self.k_sel * self.Hd) * b

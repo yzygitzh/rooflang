@@ -44,13 +44,6 @@ class AdamWStep(Kernel):
                     (1 - lr·wd)·p − lr_t·update
       Total = 13 flops per parameter.
 
-      This is a direct count of the formula above, not a literature
-      citation; published references vary widely (~9–16 flops/param)
-      depending on FMA fusion and how sqrt / div are counted. The exact
-      constant barely matters here: AdamW is memory-bound by ~10×, so
-      the binding constraint on the roofline is HBM bandwidth, not peak
-      TFLOPS.
-
     bytes (per parameter, fused single-pass):
       input_bytes  = n_param · sizeof(grad_dtype)        (read g)
       weight_bytes = n_param · (sizeof(param) + 2·sizeof(moment))
@@ -67,15 +60,22 @@ class AdamWStep(Kernel):
         self.param_dtype = param_dtype
         self.grad_dtype = grad_dtype
         self.moment_dtype = moment_dtype
-        p_b = dtype_bytes(param_dtype)
-        g_b = dtype_bytes(grad_dtype)
-        m_b = dtype_bytes(moment_dtype)
-        state_bytes = n_param * (p_b + 2.0 * m_b)
-        ib = n_param * g_b
-        wb = state_bytes
-        ob = state_bytes
-        super().__init__(
-            flops=13.0 * n_param,
-            transferred_bytes=ib + wb + ob,
-            input_bytes=ib, weight_bytes=wb, output_bytes=ob,
-        )
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        return 13.0 * self.n_param
+
+    @property
+    def input_bytes(self) -> float:
+        return self.n_param * dtype_bytes(self.grad_dtype)
+
+    @property
+    def weight_bytes(self) -> float:
+        return self.n_param * (dtype_bytes(self.param_dtype)
+                               + 2.0 * dtype_bytes(self.moment_dtype))
+
+    @property
+    def output_bytes(self) -> float:
+        return self.n_param * (dtype_bytes(self.param_dtype)
+                               + 2.0 * dtype_bytes(self.moment_dtype))

@@ -13,6 +13,9 @@ Transfer-only collectives (AllGather, Broadcast) have flops=0.
 
 AllToAll is transfer-only — the permutation is a routing decision, not
 an arithmetic operation.
+
+Note: for comm kernels, transferred_bytes represents *wire* traffic,
+which differs from (input_bytes + weight_bytes + output_bytes).
 """
 
 from rooflang.language.kernels.kernel import Kernel
@@ -30,18 +33,31 @@ class AllReduce(Kernel):
 
     def __init__(self, bytes_per_rank: float, world: int,
                  dtype: str = "bf16"):
+        self.bytes_per_rank = bytes_per_rank
         self.world = world
-        W = world
-        n_elements = bytes_per_rank / dtype_bytes(dtype)
-        flops = (W - 1) / W * n_elements
-        wire = 2.0 * (W - 1) / W * bytes_per_rank
-        super().__init__(
-            flops=flops,
-            transferred_bytes=wire,
-            input_bytes=bytes_per_rank,
-            weight_bytes=0.0,
-            output_bytes=bytes_per_rank,
-        )
+        self.dtype_ = dtype
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        n_elements = self.bytes_per_rank / dtype_bytes(self.dtype_)
+        return (self.world - 1) / self.world * n_elements
+
+    @property
+    def transferred_bytes(self) -> float:
+        return 2.0 * (self.world - 1) / self.world * self.bytes_per_rank
+
+    @property
+    def input_bytes(self) -> float:
+        return self.bytes_per_rank
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        return self.bytes_per_rank
 
 
 class ReduceScatter(Kernel):
@@ -55,18 +71,31 @@ class ReduceScatter(Kernel):
 
     def __init__(self, bytes_per_rank: float, world: int,
                  dtype: str = "bf16"):
+        self.bytes_per_rank = bytes_per_rank
         self.world = world
-        W = world
-        n_elements = bytes_per_rank / dtype_bytes(dtype)
-        flops = (W - 1) / W * n_elements
-        wire = (W - 1) / W * bytes_per_rank
-        super().__init__(
-            flops=flops,
-            transferred_bytes=wire,
-            input_bytes=bytes_per_rank,
-            weight_bytes=0.0,
-            output_bytes=bytes_per_rank / W,
-        )
+        self.dtype_ = dtype
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        n_elements = self.bytes_per_rank / dtype_bytes(self.dtype_)
+        return (self.world - 1) / self.world * n_elements
+
+    @property
+    def transferred_bytes(self) -> float:
+        return (self.world - 1) / self.world * self.bytes_per_rank
+
+    @property
+    def input_bytes(self) -> float:
+        return self.bytes_per_rank
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        return self.bytes_per_rank / self.world
 
 
 class AllGather(Kernel):
@@ -79,16 +108,25 @@ class AllGather(Kernel):
     """
 
     def __init__(self, bytes_per_rank: float, world: int):
+        self.bytes_per_rank = bytes_per_rank
         self.world = world
-        W = world
-        wire = (W - 1) / W * bytes_per_rank
-        super().__init__(
-            flops=0.0,
-            transferred_bytes=wire,
-            input_bytes=bytes_per_rank / W,
-            weight_bytes=0.0,
-            output_bytes=bytes_per_rank,
-        )
+        super().__init__()
+
+    @property
+    def transferred_bytes(self) -> float:
+        return (self.world - 1) / self.world * self.bytes_per_rank
+
+    @property
+    def input_bytes(self) -> float:
+        return self.bytes_per_rank / self.world
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        return self.bytes_per_rank
 
 
 class AllToAll(Kernel):
@@ -101,16 +139,25 @@ class AllToAll(Kernel):
     """
 
     def __init__(self, bytes_per_rank: float, world: int):
+        self.bytes_per_rank = bytes_per_rank
         self.world = world
-        W = world
-        wire = (W - 1) / W * bytes_per_rank
-        super().__init__(
-            flops=0.0,
-            transferred_bytes=wire,
-            input_bytes=bytes_per_rank,
-            weight_bytes=0.0,
-            output_bytes=bytes_per_rank,
-        )
+        super().__init__()
+
+    @property
+    def transferred_bytes(self) -> float:
+        return (self.world - 1) / self.world * self.bytes_per_rank
+
+    @property
+    def input_bytes(self) -> float:
+        return self.bytes_per_rank
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        return self.bytes_per_rank
 
 
 class Broadcast(Kernel):
@@ -123,14 +170,25 @@ class Broadcast(Kernel):
     """
 
     def __init__(self, bytes_per_rank: float, world: int):
+        self.bytes_per_rank = bytes_per_rank
         self.world = world
-        super().__init__(
-            flops=0.0,
-            transferred_bytes=bytes_per_rank,
-            input_bytes=bytes_per_rank,
-            weight_bytes=0.0,
-            output_bytes=bytes_per_rank,
-        )
+        super().__init__()
+
+    @property
+    def transferred_bytes(self) -> float:
+        return self.bytes_per_rank
+
+    @property
+    def input_bytes(self) -> float:
+        return self.bytes_per_rank
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        return self.bytes_per_rank
 
 
 class Send(Kernel):
@@ -143,13 +201,24 @@ class Send(Kernel):
     """
 
     def __init__(self, bytes_total: float):
-        super().__init__(
-            flops=0.0,
-            transferred_bytes=bytes_total,
-            input_bytes=bytes_total,
-            weight_bytes=0.0,
-            output_bytes=0.0,
-        )
+        self.bytes_total = bytes_total
+        super().__init__()
+
+    @property
+    def transferred_bytes(self) -> float:
+        return self.bytes_total
+
+    @property
+    def input_bytes(self) -> float:
+        return self.bytes_total
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        return 0.0
 
 
 class Recv(Kernel):
@@ -162,10 +231,21 @@ class Recv(Kernel):
     """
 
     def __init__(self, bytes_total: float):
-        super().__init__(
-            flops=0.0,
-            transferred_bytes=bytes_total,
-            input_bytes=0.0,
-            weight_bytes=0.0,
-            output_bytes=bytes_total,
-        )
+        self.bytes_total = bytes_total
+        super().__init__()
+
+    @property
+    def transferred_bytes(self) -> float:
+        return self.bytes_total
+
+    @property
+    def input_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        return self.bytes_total

@@ -6,25 +6,12 @@ subclass carrying roofline metrics as @property methods.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import TYPE_CHECKING, Dict
 
-from rooflang.language.kernels.utils import dtype_bytes
+from rooflang.language.utils import dtype_bytes
 
-
-@dataclass
-class TensorDesc:
-    """Descriptor for a named tensor slot (input, weight, or output)."""
-    dtype: str
-    shape: Tuple[int, ...]
-    location: str | None = None
-
-    @property
-    def size_bytes(self) -> float:
-        n = 1
-        for d in self.shape:
-            n *= d
-        return n * dtype_bytes(self.dtype)
+if TYPE_CHECKING:
+    from rooflang.language.tensor import Tensor
 
 
 class Kernel:
@@ -37,14 +24,14 @@ class Kernel:
 
     def __init__(
         self,
-        inputs: Dict[str, TensorDesc] | None = None,
-        weights: Dict[str, TensorDesc] | None = None,
-        outputs: Dict[str, TensorDesc] | None = None,
+        inputs: Dict[str, Tensor] | None = None,
+        weights: Dict[str, Tensor] | None = None,
+        outputs: Dict[str, Tensor] | None = None,
         has_side_effect: bool = False,
     ) -> None:
-        self.inputs: Dict[str, TensorDesc] = inputs or {}
-        self.weights: Dict[str, TensorDesc] = weights or {}
-        self.outputs: Dict[str, TensorDesc] = outputs or {}
+        self.inputs: Dict[str, Tensor] = inputs or {}
+        self.weights: Dict[str, Tensor] = weights or {}
+        self.outputs: Dict[str, Tensor] = outputs or {}
         self.has_side_effect = has_side_effect
 
     @property

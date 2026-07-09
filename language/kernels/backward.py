@@ -17,7 +17,7 @@ Activation gradients (dX, dQ/dK/dV) stay at the activation dtype.
 """
 
 from rooflang.language.kernels.kernel import Kernel
-from rooflang.language.kernels.utils import dtype_bytes, gemm_scale_bytes
+from rooflang.language.utils import dtype_bytes, gemm_scale_bytes
 
 
 class GemmDX(Kernel):

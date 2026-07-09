@@ -1,4 +1,4 @@
-"""Shared utility functions for primitive Kernel constructors."""
+"""Dtype utilities — bytes-per-element and GEMM scale accounting."""
 
 
 def dtype_bytes(dtype: str) -> float:
@@ -14,7 +14,7 @@ def gemm_scale_bytes(out_features: int, in_features: int,
                      w_dtype: str) -> float:
     """HBM bytes for per-block scale tensor accompanying a quantized weight.
 
-    fp8: 1 ue8m0 scale per 128×128 weight block.
+    fp8: 1 ue8m0 scale per 128x128 weight block.
     fp4: 1 ue8m0 scale per 32 elements along K (per-row).
     Other dtypes: 0.
     """

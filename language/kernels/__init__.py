@@ -15,5 +15,6 @@ Forward and backward share class names; disambiguate via module:
     bwd_norm = backward.RMSNorm(4096, 7168)
 """
 
-from rooflang.language.kernels.kernel import Kernel, TensorDesc  # noqa: F401
+from rooflang.language.kernels.kernel import Kernel  # noqa: F401
 from rooflang.language.kernels.identity import Move  # noqa: F401
+from rooflang.language.tensor import Tensor  # noqa: F401

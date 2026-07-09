@@ -1,23 +1,26 @@
-"""Tensor — a named, shaped, typed array located in a specific Memory."""
+"""Tensor — a shaped, typed array with optional memory location."""
+
+from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import TYPE_CHECKING, Tuple
 
-from rooflang.language.hardware.component import Memory
-from rooflang.language.kernels.utils import dtype_bytes
+from rooflang.language.utils import dtype_bytes
+
+if TYPE_CHECKING:
+    from rooflang.language.hardware.component import Memory
 
 
 @dataclass
 class Tensor:
-    """A tensor living in a specific memory node.
+    """Descriptor for a tensor slot (input, weight, or output).
 
-    Kernels consume and produce Tensors. The location determines which
-    Memory node's capacity is consumed.
+    Before placement, location is None. After placement, it points to
+    the Memory node where this tensor resides.
     """
-    name: str
-    shape: Tuple[int, ...]
     dtype: str
-    location: Memory
+    shape: Tuple[int, ...]
+    location: Memory | None = None
 
     @property
     def n_elements(self) -> int:

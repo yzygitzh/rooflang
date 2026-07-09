@@ -9,7 +9,7 @@ tiles (no S² in HBM). Each docstring states its own reuse model.
 """
 
 from rooflang.language.kernels.kernel import Kernel
-from rooflang.language.kernels.utils import dtype_bytes, gemm_scale_bytes
+from rooflang.language.utils import dtype_bytes, gemm_scale_bytes
 
 
 class Gemm(Kernel):

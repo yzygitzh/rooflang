@@ -19,7 +19,7 @@ which differs from (input_bytes + weight_bytes + output_bytes).
 """
 
 from rooflang.language.kernels.kernel import Kernel
-from rooflang.language.kernels.utils import dtype_bytes
+from rooflang.language.utils import dtype_bytes
 
 
 class AllReduce(Kernel):

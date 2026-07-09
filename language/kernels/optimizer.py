@@ -19,7 +19,7 @@ enumerator passes recipe-specific dtypes per parameter group.
 """
 
 from rooflang.language.kernels.kernel import Kernel
-from rooflang.language.kernels.utils import dtype_bytes
+from rooflang.language.utils import dtype_bytes
 
 
 class AdamWStep(Kernel):

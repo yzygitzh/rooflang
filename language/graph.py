@@ -14,6 +14,7 @@ from typing import Callable, Dict, FrozenSet, List, NamedTuple, Set
 
 import networkx as nx
 
+from rooflang.language.kernels.comm import Broadcast
 from rooflang.language.kernels.kernel import Kernel
 
 
@@ -245,6 +246,161 @@ class ComputeGraph:
 
         self.remove_kernel(kernel)
         return prev_comm, copies, next_comm
+
+    def dedup(
+        self,
+        dedup_class: Callable[[List[Kernel]], tuple],
+        kernel_list: List[Kernel],
+    ) -> tuple:
+        """Merge redundant kernels into one, adding a broadcast after.
+
+        Before: preds → OldBroadcast → [K1, ..., Kn] → [S1, ...]
+            or: [K1, ..., Kn] (roots) → [S1, ...]
+        After:  preds → survivor → PostBroadcast → [S1, ...]
+
+        Preconditions (checked):
+        - All kernels have no side effects.
+        - All kernels are computationally identical (same type + to_dict).
+        - All share the same Broadcast predecessor, or all are roots.
+
+        dedup_class(kernel_list) -> (survivor, post_broadcast) where:
+          - survivor: Kernel to keep (may be from kernel_list or new).
+          - post_broadcast: Kernel placed after survivor. Its inputs are
+            ordered to match survivor.outputs. Its outputs are ordered by
+            successor: for each kernel in kernel_list order, for each out-edge
+            in order, the corresponding output chunk feeds that successor.
+
+        Returns (survivor, post_broadcast).
+        """
+        if len(kernel_list) < 2:
+            raise ValueError("Need at least 2 kernels to dedup")
+        for k in kernel_list:
+            self._check_in_graph(k)
+            if k.has_side_effect:
+                raise ValueError(f"Cannot dedup kernel with side effect: {k}")
+        ref_dict = kernel_list[0].to_dict()
+        ref_type = type(kernel_list[0])
+        for k in kernel_list[1:]:
+            if type(k) != ref_type or k.to_dict() != ref_dict:
+                raise ValueError(
+                    f"Dedup precondition violated: {k} is not computationally "
+                    f"identical to {kernel_list[0]}")
+        old_broadcast = None
+        for k in kernel_list:
+            in_edges = self._in_edges(k)
+            if not in_edges:
+                if old_broadcast is not None:
+                    raise ValueError(
+                        "Dedup precondition violated: mixed root and "
+                        "non-root kernels")
+            elif len(in_edges) == 1 and isinstance(in_edges[0].src, Broadcast):
+                if old_broadcast is None:
+                    old_broadcast = in_edges[0].src
+                elif old_broadcast is not in_edges[0].src:
+                    raise ValueError(
+                        "Dedup precondition violated: kernels have different "
+                        "Broadcast predecessors")
+            else:
+                raise ValueError(
+                    f"Dedup precondition violated: {k} must have either no "
+                    f"predecessor or a single Broadcast predecessor")
+
+        all_out_edges = []
+        for k in kernel_list:
+            all_out_edges.extend(self._out_edges(k))
+
+        survivor, post_broadcast = dedup_class(kernel_list)
+        if not self._dag.has_node(survivor):
+            self.add_kernel(survivor)
+        self.add_kernel(post_broadcast)
+
+        self.add_data_edge(
+            survivor, post_broadcast,
+            dict(zip(survivor.outputs, post_broadcast.inputs)))
+
+        post_out_keys = list(post_broadcast.outputs)
+        offset = 0
+        for edge in all_out_edges:
+            n = len(edge.mapping)
+            chunk = post_out_keys[offset:offset + n]
+            si_in_keys = list(edge.mapping.values())
+            self.add_data_edge(post_broadcast, edge.dst, dict(zip(chunk, si_in_keys)))
+            offset += n
+
+        if old_broadcast is not None:
+            bcast_in_edges = self._in_edges(old_broadcast)
+            for edge in bcast_in_edges:
+                self.add_data_edge(edge.src, survivor, edge.mapping)
+            self.remove_kernel(old_broadcast)
+
+        for k in kernel_list:
+            if k is not survivor:
+                self.remove_kernel(k)
+
+        return survivor, post_broadcast
+
+    def dup(
+        self,
+        dup_class: Callable[[Kernel, int], tuple],
+        kernel: Kernel,
+    ) -> tuple:
+        """Duplicate a kernel, moving broadcast from after to before.
+
+        Before: preds → kernel → OldBroadcast → [S1, ..., Sn]
+        After:  preds → PreBroadcast → [copy_1, ..., copy_n] → [S1, ..., Sn]
+
+        Preconditions (checked):
+        - kernel has no side effects.
+        - kernel's only data successor is a Broadcast.
+
+        dup_class(kernel, n) -> (pre_broadcast, copies) where:
+          - pre_broadcast: Kernel placed before copies. Its inputs are ordered
+            to match kernel's inputs. Its outputs are ordered by copy (chunked:
+            first len(copy.inputs) for copy_0, next for copy_1, etc.).
+          - copies: List[Kernel] of length n.
+
+        Each copy_i connects to S_i using ordered matching: zip(copy_i.outputs,
+        S_i's input keys from the old Broadcast→S_i edge).
+
+        Returns (pre_broadcast, copies).
+        """
+        self._check_in_graph(kernel)
+        if kernel.has_side_effect:
+            raise ValueError(f"Cannot dup kernel with side effect: {kernel}")
+        out_edges = self._out_edges(kernel)
+        if len(out_edges) != 1 or not isinstance(out_edges[0].dst, Broadcast):
+            raise ValueError(
+                "Dup precondition violated: kernel's only data successor "
+                "must be a Broadcast")
+        old_broadcast = out_edges[0].dst
+        bcast_out_edges = self._out_edges(old_broadcast)
+        n = len(bcast_out_edges)
+
+        pre_broadcast, copies = dup_class(kernel, n)
+        if len(copies) != n:
+            raise ValueError(
+                f"dup_class returned {len(copies)} copies, expected {n}")
+
+        in_edges = self._in_edges(kernel)
+
+        self.add_kernel(pre_broadcast)
+        for edge in in_edges:
+            self.add_data_edge(edge.src, pre_broadcast, edge.mapping)
+
+        pre_out_keys = list(pre_broadcast.outputs)
+        n_inputs_per_copy = len(copies[0].inputs)
+        for i, c in enumerate(copies):
+            self.add_kernel(c)
+            chunk = pre_out_keys[i * n_inputs_per_copy:(i + 1) * n_inputs_per_copy]
+            self.add_data_edge(pre_broadcast, c, dict(zip(chunk, c.inputs)))
+
+        for c, edge in zip(copies, bcast_out_edges):
+            self.add_data_edge(
+                c, edge.dst, dict(zip(c.outputs, edge.mapping.values())))
+
+        self.remove_kernel(old_broadcast)
+        self.remove_kernel(kernel)
+        return pre_broadcast, copies
 
     # ── Query API ─────────────────────────────────────────────────────
 

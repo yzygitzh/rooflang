@@ -10,7 +10,7 @@ Two edge types (distinguished by whether mapping is empty):
 
 from __future__ import annotations
 
-from typing import Dict, FrozenSet, List, NamedTuple, Set
+from typing import Callable, Dict, FrozenSet, List, NamedTuple, Set
 
 import networkx as nx
 
@@ -156,6 +156,95 @@ class ComputeGraph:
             reconnect[src_output] = dst_input
         self.add_data_edge(src_edge.src, dst_edge.dst, reconnect)
         self.remove_kernel(kernel)
+
+    def fuse_kernels(
+        self,
+        fuse_class: Callable[[List[Kernel]], Kernel],
+        kernel_list: List[Kernel],
+    ) -> Kernel:
+        """Fuse a subgraph of kernels into one, eliminating intermediate HBM traffic.
+
+        fuse_class: callable that takes the list of kernels and returns a new
+        Kernel instance representing the fused operation.
+        kernel_list: kernels forming a subgraph (not necessarily connected —
+        can be a forest). External inputs (edges from outside the subgraph
+        into roots) are rewired to the fused kernel. External outputs (edges
+        from exits to outside the subgraph) are rewired from the fused kernel.
+
+        Returns the fused kernel (already inserted into the graph).
+        """
+        if len(kernel_list) < 2:
+            raise ValueError("Need at least 2 kernels to fuse")
+        for k in kernel_list:
+            self._check_in_graph(k)
+        subgraph = set(kernel_list)
+        fused = fuse_class(kernel_list)
+        self.add_kernel(fused)
+        for k in kernel_list:
+            for edge in self._in_edges(k):
+                if edge.src not in subgraph:
+                    self.add_data_edge(edge.src, fused, edge.mapping)
+            for edge in self._out_edges(k):
+                if edge.dst not in subgraph:
+                    self.add_data_edge(fused, edge.dst, edge.mapping)
+        for k in kernel_list:
+            self.remove_kernel(k)
+        return fused
+
+    def split_kernel(
+        self,
+        split_class: Callable[[Kernel, int], tuple],
+        kernel: Kernel,
+        n: int,
+    ) -> tuple:
+        """Split a kernel into n copies with communication kernels.
+
+        split_class: callable that takes (kernel, n) and returns
+        (prev_comm, kernels, next_comm) where:
+          - prev_comm: Kernel — communication before the split copies
+            (e.g., Scatter/Broadcast). Its outputs are ordered by copy:
+            first len(copy.inputs) entries feed copy_0, next feed copy_1, etc.
+          - kernels: List[Kernel] of length n — the split copies.
+          - next_comm: Kernel — communication after the split copies
+            (e.g., Gather/Reduce). Its inputs are ordered by copy:
+            first len(copy.outputs) entries receive from copy_0, etc.
+
+        Returns (prev_comm, kernels, next_comm) — all already in the graph.
+        """
+        self._check_in_graph(kernel)
+        prev_comm, copies, next_comm = split_class(kernel, n)
+        if len(copies) != n:
+            raise ValueError(
+                f"split_class returned {len(copies)} kernels, expected {n}")
+        assert prev_comm is not None, "split_class must return prev_comm"
+        assert next_comm is not None, "split_class must return next_comm"
+
+        in_edges = self._in_edges(kernel)
+        out_edges = self._out_edges(kernel)
+
+        self.add_kernel(prev_comm)
+        for edge in in_edges:
+            self.add_data_edge(edge.src, prev_comm, edge.mapping)
+
+        prev_out_keys = list(prev_comm.outputs)
+        n_inputs_per_copy = len(copies[0].inputs)
+        for i, c in enumerate(copies):
+            self.add_kernel(c)
+            chunk = prev_out_keys[i * n_inputs_per_copy:(i + 1) * n_inputs_per_copy]
+            self.add_data_edge(prev_comm, c, dict(zip(chunk, c.inputs)))
+
+        self.add_kernel(next_comm)
+        next_in_keys = list(next_comm.inputs)
+        n_outputs_per_copy = len(copies[0].outputs)
+        for i, c in enumerate(copies):
+            chunk = next_in_keys[i * n_outputs_per_copy:(i + 1) * n_outputs_per_copy]
+            self.add_data_edge(c, next_comm, dict(zip(c.outputs, chunk)))
+
+        for edge in out_edges:
+            self.add_data_edge(next_comm, edge.dst, edge.mapping)
+
+        self.remove_kernel(kernel)
+        return prev_comm, copies, next_comm
 
     # ── Query API ─────────────────────────────────────────────────────
 

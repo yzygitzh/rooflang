@@ -109,6 +109,54 @@ class ComputeGraph:
             raise ValueError("Edge is a data edge, not a control edge")
         self._dag.remove_edge(src, dst)
 
+    # ── Mutation API ──────────────────────────────────────────────────
+
+    def insert_identity(
+        self, kernel: Kernel, k1: Kernel, k2: Kernel,
+        mapping: Dict[str, str],
+    ) -> None:
+        """Insert an identity kernel between k1 and k2.
+
+        mapping: {k1_output_name: k2_input_name} — connections to intercept.
+        The identity kernel's inputs/outputs are matched by iteration order
+        against the mapping entries.
+        """
+        k_ins = list(kernel.inputs)
+        k_outs = list(kernel.outputs)
+        if len(mapping) != len(k_ins) or len(mapping) != len(k_outs):
+            raise ValueError(
+                f"mapping has {len(mapping)} entries but kernel has "
+                f"{len(k_ins)} inputs and {len(k_outs)} outputs")
+        self.add_kernel(kernel)
+        in_map = {}
+        out_map = {}
+        for (k1_out, k2_in), k_in, k_out in zip(mapping.items(), k_ins, k_outs):
+            in_map[k1_out] = k_in
+            out_map[k_out] = k2_in
+        self.add_data_edge(k1, kernel, in_map)
+        self.add_data_edge(kernel, k2, out_map)
+        for k1_out in mapping:
+            self._remove_data_mapping(k1, k2, k1_out)
+
+    def remove_identity(self, kernel: Kernel) -> None:
+        """Remove an identity kernel, reconnecting predecessor to successor."""
+        in_edges = self._in_edges(kernel)
+        out_edges = self._out_edges(kernel)
+        if len(in_edges) != 1 or len(out_edges) != 1:
+            raise ValueError(
+                "Identity kernel must have exactly one in and one out data edge")
+        src_edge = in_edges[0]
+        dst_edge = out_edges[0]
+        reconnect = {}
+        k_ins = list(kernel.inputs)
+        k_outs = list(kernel.outputs)
+        for k_in, k_out in zip(k_ins, k_outs):
+            src_output = next(k for k, v in src_edge.mapping.items() if v == k_in)
+            dst_input = dst_edge.mapping[k_out]
+            reconnect[src_output] = dst_input
+        self.add_data_edge(src_edge.src, dst_edge.dst, reconnect)
+        self.remove_kernel(kernel)
+
     # ── Query API ─────────────────────────────────────────────────────
 
     def topological_sort(self) -> List[Kernel]:
@@ -184,3 +232,15 @@ class ComputeGraph:
     def _check_in_graph(self, kernel: Kernel) -> None:
         if not self._dag.has_node(kernel):
             raise ValueError(f"Kernel not in graph: {kernel}")
+
+    def _remove_data_mapping(
+        self, src: Kernel, dst: Kernel, src_output: str
+    ) -> None:
+        if not self._dag.has_edge(src, dst):
+            raise ValueError("No edge between src and dst")
+        mapping = self._dag.edges[src, dst]["mapping"]
+        if src_output not in mapping:
+            raise ValueError(f"'{src_output}' not in edge mapping")
+        del mapping[src_output]
+        if not mapping:
+            self._dag.remove_edge(src, dst)

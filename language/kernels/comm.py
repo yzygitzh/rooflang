@@ -191,6 +191,106 @@ class Broadcast(Kernel):
         return self.bytes_per_rank
 
 
+class Scatter(Kernel):
+    """Scatter: root distributes distinct slices to each rank.
+
+    flops = 0.
+    transferred_bytes = (W-1)/W · bytes_per_rank.
+    input_bytes = bytes_per_rank (root reads full tensor).
+    output_bytes = bytes_per_rank / W (each rank writes its slice).
+    """
+
+    def __init__(self, bytes_per_rank: float, world: int):
+        self.bytes_per_rank = bytes_per_rank
+        self.world = world
+        super().__init__()
+
+    @property
+    def transferred_bytes(self) -> float:
+        return (self.world - 1) / self.world * self.bytes_per_rank
+
+    @property
+    def input_bytes(self) -> float:
+        return self.bytes_per_rank
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        return self.bytes_per_rank / self.world
+
+
+class Gather(Kernel):
+    """Gather: each rank sends its slice to root which concatenates.
+
+    flops = 0.
+    transferred_bytes = (W-1)/W · bytes_per_rank.
+    input_bytes = bytes_per_rank / W (each rank reads its slice).
+    output_bytes = bytes_per_rank (root writes full tensor).
+    """
+
+    def __init__(self, bytes_per_rank: float, world: int):
+        self.bytes_per_rank = bytes_per_rank
+        self.world = world
+        super().__init__()
+
+    @property
+    def transferred_bytes(self) -> float:
+        return (self.world - 1) / self.world * self.bytes_per_rank
+
+    @property
+    def input_bytes(self) -> float:
+        return self.bytes_per_rank / self.world
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        return self.bytes_per_rank
+
+
+class Reduce(Kernel):
+    """Reduce: each rank sends full buffer; root reduces element-wise.
+
+    flops = (W-1)/W · n_elements (reduction adds).
+    transferred_bytes = (W-1)/W · bytes_per_rank.
+    input_bytes = bytes_per_rank (each rank reads full buffer).
+    output_bytes = bytes_per_rank (root writes reduced result).
+    """
+
+    def __init__(self, bytes_per_rank: float, world: int,
+                 dtype: str = "bf16"):
+        self.bytes_per_rank = bytes_per_rank
+        self.world = world
+        self.dtype_ = dtype
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        n_elements = self.bytes_per_rank / dtype_bytes(self.dtype_)
+        return (self.world - 1) / self.world * n_elements
+
+    @property
+    def transferred_bytes(self) -> float:
+        return (self.world - 1) / self.world * self.bytes_per_rank
+
+    @property
+    def input_bytes(self) -> float:
+        return self.bytes_per_rank
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        return self.bytes_per_rank
+
+
 class Send(Kernel):
     """Point-to-point send (e.g. PP stage boundary, sender side).
 

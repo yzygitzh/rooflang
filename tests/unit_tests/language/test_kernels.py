@@ -6,7 +6,8 @@ from rooflang.language.kernels.forward import (
 )
 from rooflang.language.kernels import backward
 from rooflang.language.kernels.comm import (
-    AllReduce, ReduceScatter, AllGather, AllToAll, Broadcast, Send, Recv,
+    AllReduce, ReduceScatter, AllGather, AllToAll, Broadcast,
+    Scatter, Gather, Reduce, Send, Recv,
 )
 from rooflang.language.kernels.optimizer import AdamWStep
 from rooflang.language.kernels.identity import Move
@@ -272,6 +273,36 @@ class TestBroadcast(TestKernelBase):
     expected_weight_bytes = 0.0
     expected_output_bytes = 1024.0
     expected_transferred_bytes = 1024.0
+
+
+class TestScatter(TestKernelBase):
+    __test__ = True
+    kernel = Scatter(bytes_per_rank=1024.0, world=4)
+    expected_flops = 0.0
+    expected_input_bytes = 1024.0
+    expected_weight_bytes = 0.0
+    expected_output_bytes = 1024.0 / 4
+    expected_transferred_bytes = (3 / 4) * 1024.0
+
+
+class TestGather(TestKernelBase):
+    __test__ = True
+    kernel = Gather(bytes_per_rank=1024.0, world=4)
+    expected_flops = 0.0
+    expected_input_bytes = 1024.0 / 4
+    expected_weight_bytes = 0.0
+    expected_output_bytes = 1024.0
+    expected_transferred_bytes = (3 / 4) * 1024.0
+
+
+class TestReduce(TestKernelBase):
+    __test__ = True
+    kernel = Reduce(bytes_per_rank=1024.0, world=4, dtype="bf16")
+    expected_flops = (3 / 4) * (1024.0 / 2.0)
+    expected_input_bytes = 1024.0
+    expected_weight_bytes = 0.0
+    expected_output_bytes = 1024.0
+    expected_transferred_bytes = (3 / 4) * 1024.0
 
 
 class TestSend(TestKernelBase):

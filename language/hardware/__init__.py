@@ -19,6 +19,4 @@ from rooflang.language.hardware.spec import (
     InterNodeSpec,
     HW_B300,
     hardware_spec,
-    collective_bytes,
-    collective_time,
 )

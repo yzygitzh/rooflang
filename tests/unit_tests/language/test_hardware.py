@@ -5,16 +5,13 @@ import pytest
 from rooflang.language.hardware.component import (
     Compute, Memory, Fabric, Cluster,
 )
-from rooflang.language.hardware.spec import (
-    HardwareSpec, LinkSpec, InterNodeSpec,
-    hardware_spec, collective_bytes, collective_time, HW_B300,
-)
+from rooflang.language.hardware.spec import hardware_spec, HW_B300
 
 
 # ── Component tests ──────────────────────────────────────────────────
 
 
-class TestCompute:
+class TestComputeInit:
     def test_basic(self):
         c = Compute(name="gpu0", tflops={"bf16": 2250.0})
         assert c.name == "gpu0"
@@ -25,7 +22,7 @@ class TestCompute:
         assert c.tflops == {}
 
 
-class TestMemory:
+class TestMemoryInit:
     def test_basic(self):
         m = Memory(name="hbm", capacity_gb=192.0)
         assert m.capacity_gb == 192.0
@@ -35,7 +32,7 @@ class TestMemory:
         assert m.capacity_gb == 0.0
 
 
-class TestFabric:
+class TestFabricTransferTimeUs:
     def test_full_duplex_time(self):
         f = Fabric(
             name="nvlink",
@@ -78,7 +75,7 @@ class TestFabric:
         assert f.transfer_time_us(0.0, 0.0) == 0.0
 
 
-class TestCluster:
+class TestClusterInit:
     def test_construction(self):
         g = Compute(name="gpu0")
         m = Memory(name="hbm0", capacity_gb=80.0)
@@ -96,7 +93,7 @@ class TestCluster:
 # ── Spec tests ───────────────────────────────────────────────────────
 
 
-class TestHardwareSpec:
+class TestHardwareSpecFunc:
     def test_b300_preset(self):
         hw = hardware_spec("b300")
         assert hw is HW_B300
@@ -106,64 +103,3 @@ class TestHardwareSpec:
     def test_unknown_preset_raises(self):
         with pytest.raises(ValueError, match="unknown hardware preset"):
             hardware_spec("nonexistent")
-
-
-class TestCollectiveBytes:
-    def test_all_reduce(self):
-        result = collective_bytes("all_reduce", 1024.0, 4)
-        assert result == pytest.approx(2.0 * (3 / 4) * 1024.0)
-
-    def test_all_gather(self):
-        result = collective_bytes("all_gather", 1024.0, 8)
-        assert result == pytest.approx((7 / 8) * 1024.0)
-
-    def test_reduce_scatter(self):
-        result = collective_bytes("reduce_scatter", 1024.0, 4)
-        assert result == pytest.approx((3 / 4) * 1024.0)
-
-    def test_all_to_all(self):
-        result = collective_bytes("all_to_all", 1024.0, 4)
-        assert result == pytest.approx((3 / 4) * 1024.0)
-
-    def test_broadcast(self):
-        result = collective_bytes("broadcast", 1024.0, 4)
-        assert result == 1024.0
-
-    def test_world_1_returns_zero(self):
-        assert collective_bytes("all_reduce", 1024.0, 1) == 0.0
-
-    def test_unknown_op_raises(self):
-        with pytest.raises(ValueError, match="unknown collective op"):
-            collective_bytes("scatter", 1024.0, 4)
-
-
-class TestCollectiveTime:
-    def test_world_1_returns_zero(self):
-        hw = hardware_spec("b300")
-        assert collective_time("all_reduce", 1024.0, 1, "intra", hw) == 0.0
-
-    def test_intra_uses_nvlink_bw(self):
-        hw = hardware_spec("b300")
-        t = collective_time("all_reduce", 1e9, 8, "intra", hw)
-        alpha = hw.intra_node.alpha_us * 1e-6
-        wire = collective_bytes("all_reduce", 1e9, 8)
-        expected = alpha + wire / (hw.intra_node.bw_gbs * 1e9)
-        assert t == pytest.approx(expected)
-
-    def test_inter_a2a_uses_p2p_bw(self):
-        hw = hardware_spec("b300")
-        t = collective_time("all_to_all", 1e9, 8, "inter", hw)
-        alpha = hw.inter_node.alpha_us * 1e-6
-        wire = collective_bytes("all_to_all", 1e9, 8)
-        bw = min(hw.intra_node.bw_gbs, hw.inter_node.p2p_bw_gbs) * 1e9
-        expected = alpha + wire / bw
-        assert t == pytest.approx(expected)
-
-    def test_inter_collective_uses_collective_bw(self):
-        hw = hardware_spec("b300")
-        t = collective_time("all_reduce", 1e9, 8, "inter", hw)
-        alpha = hw.inter_node.alpha_us * 1e-6
-        wire = collective_bytes("all_reduce", 1e9, 8)
-        bw = min(hw.intra_node.bw_gbs, hw.inter_node.collective_bw_gbs) * 1e9
-        expected = alpha + wire / bw
-        assert t == pytest.approx(expected)

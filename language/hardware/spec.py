@@ -1,14 +1,10 @@
-"""Hardware spec and collective-time model for model-roofline.
+"""Hardware spec for model-roofline.
 
 Defines HardwareSpec (peak TFLOPS per dtype, HBM bandwidth, intra/inter-
-node link bandwidth + latency) and a collective_time() function that
-estimates wall-clock time for NCCL-style collectives under a tree-based
-α + β·n model with pipelining.
+node link bandwidth + latency).
 
 Usage:
     hw = hardware_spec("b300")
-    t  = collective_time("all_reduce", bytes_per_rank=16384, world=8,
-                         kind="intra", hw=hw)
 """
 
 from dataclasses import dataclass
@@ -88,101 +84,3 @@ def hardware_spec(name: str) -> HardwareSpec:
             f"unknown hardware preset: {name!r}. "
             f"Available: {sorted(_HW_CATALOG.keys())}")
     return _HW_CATALOG[name]
-
-
-# -- Collective bytes + time model --------------------------------------------
-#
-# Model: tree-based (recursive-halving / recursive-doubling) with pipelining.
-#
-# Latency (α) term:
-#   The number of sequential message-initiation rounds is determined by the
-#   tree depth = log2(W). Each round incurs one α startup.
-#     - all_gather, reduce_scatter, broadcast: log2(W) rounds → log2(W)·α.
-#     - all_reduce = pipelined RS + AG: 2·log2(W) rounds → 2·log2(W)·α.
-#     - all_to_all: all sends are independent (full-bisection fabric) → 1·α.
-#
-# Bandwidth (β) term:
-#   Total effective wire bytes per rank (from collective_bytes) divided by
-#   link bandwidth. Pipelining within a phase means the β term is NOT
-#   multiplied by the number of rounds — once the pipeline fills, one
-#   chunk worth of data arrives per β·chunk_size interval. The aggregate
-#   over all rounds equals collective_bytes(op, n, W) bytes.
-#
-# Combined: time = α_factor(op, W) · α + collective_bytes(op, n, W) · β
-
-
-def collective_bytes(op: str, bytes_per_rank: float, world: int) -> float:
-    """Effective wire bytes moved per rank for a collective.
-
-    This is the bandwidth-cost portion (total data crossing the link from
-    this rank's perspective), not the payload:
-      - all_reduce (RS + AG): 2·(W-1)/W · n
-      - all_gather:             (W-1)/W · n
-      - reduce_scatter:         (W-1)/W · n
-      - all_to_all:             (W-1)/W · n
-      - broadcast:              n   (root sends full payload through tree)
-    """
-    if world <= 1:
-        return 0.0
-    W = world
-    n = bytes_per_rank
-    if op == "all_reduce":
-        return 2.0 * (W - 1) / W * n
-    elif op in ("all_gather", "reduce_scatter", "all_to_all"):
-        return (W - 1) / W * n
-    elif op == "broadcast":
-        return n
-    else:
-        raise ValueError(f"unknown collective op: {op}")
-
-
-def collective_time(op: str, bytes_per_rank: float, world: int,
-                    kind: str, hw: HardwareSpec) -> float:
-    """Estimate wall-clock time (seconds) for a NCCL-style collective.
-
-    Model:
-      time = α + collective_bytes(op, n, W) / effective_bw
-
-    α is a single message-initiation latency (full-bisection fabric — all
-    sends in parallel in one round).
-
-    effective_bw depends on `kind` and `op`:
-      - "intra": bw = intra_node.bw_gbs (NVLink).
-      - "inter", non-A2A (AR, AG, RS, broadcast):
-            bw = min(intra_node.bw_gbs, inter_node.collective_bw_gbs).
-            All NICs cooperate on the collective; per-GPU BW is the
-            aggregate node BW / gpus_per_node, bottlenecked against NVLink.
-      - "inter", all_to_all:
-            bw = min(intra_node.bw_gbs, inter_node.p2p_bw_gbs).
-            Each GPU uses one NIC standalone; per-GPU BW is the single-NIC
-            rate, bottlenecked against NVLink.
-
-    For inter-node ops, α comes from inter_node (the dominant latency is
-    the cross-node hop).
-
-    Args:
-      op   : "all_reduce" | "all_gather" | "reduce_scatter" |
-             "all_to_all" | "broadcast"
-      bytes_per_rank: payload bytes each rank contributes
-      world: number of ranks in the group
-      kind : "intra" | "inter" — selects latency source and BW bottleneck
-      hw   : HardwareSpec instance
-
-    Returns seconds. Returns 0 when world <= 1 (no comm needed).
-    """
-    if world <= 1:
-        return 0.0
-
-    if kind == "intra":
-        alpha = hw.intra_node.alpha_us * 1e-6
-        effective_bw = hw.intra_node.bw_gbs * 1e9
-    else:
-        alpha = hw.inter_node.alpha_us * 1e-6
-        if op == "all_to_all":
-            inter_bw = hw.inter_node.p2p_bw_gbs
-        else:
-            inter_bw = hw.inter_node.collective_bw_gbs
-        effective_bw = min(hw.intra_node.bw_gbs, inter_bw) * 1e9
-
-    wire_bytes = collective_bytes(op, bytes_per_rank, world)
-    return alpha + wire_bytes / effective_bw

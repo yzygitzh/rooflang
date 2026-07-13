@@ -59,10 +59,13 @@ class Placement:
         return frozenset(self._mapping.keys())
 
     def validate(self, graph: ComputeGraph) -> None:
-        """Verify every kernel in the graph has been placed.
+        """Verify placement and graph have exactly the same kernel set.
 
-        Raises ValueError listing unplaced kernels if any exist.
+        Raises ValueError if any kernel is unplaced or extraneous.
         """
         unplaced = graph.kernels - self.placed_kernels
         if unplaced:
             raise ValueError(f"Unplaced kernels: {unplaced}")
+        extraneous = self.placed_kernels - graph.kernels
+        if extraneous:
+            raise ValueError(f"Extraneous placements (not in graph): {extraneous}")

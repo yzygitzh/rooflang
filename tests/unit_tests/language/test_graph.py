@@ -2,64 +2,67 @@
 
 import pytest
 
-from rooflang.language.graph import ComputeGraph, DataEdge
+from rooflang.language.graph import ComputeGraph
 from rooflang.language.kernels.kernel import Kernel
-from rooflang.language.kernels.comm import Broadcast
 from rooflang.language.tensor import Tensor
 
 
-T = Tensor("bf16", (4, 4))
-
-
-def _k(ins=None, outs=None, side_effect=False):
+def make_kernel(ins=None, outs=None, side_effect=False):
     inputs = {k: Tensor("bf16", (4, 4)) for k in (ins or [])}
     outputs = {k: Tensor("bf16", (4, 4)) for k in (outs or [])}
     return Kernel(inputs=inputs, outputs=outputs, has_side_effect=side_effect)
 
 
-class _Broadcast(Broadcast):
-    def __init__(self, inputs, outputs):
-        Kernel.__init__(self, inputs=inputs, outputs=outputs)
-
-
 # ── Node API ─────────────────────────────────────────────────────────
 
 
-class TestNodeAPI:
-    def test_add_kernel(self):
+class TestAddKernel:
+    def test_add(self):
         g = ComputeGraph()
-        k = _k()
+        k = make_kernel()
         g.add_kernel(k)
         assert k in g.kernels
 
-    def test_add_duplicate_raises(self):
+    def test_duplicate_raises(self):
         g = ComputeGraph()
-        k = _k()
+        k = make_kernel()
         g.add_kernel(k)
         with pytest.raises(ValueError):
             g.add_kernel(k)
 
-    def test_remove_kernel(self):
+
+class TestRemoveKernel:
+    def test_remove(self):
         g = ComputeGraph()
-        k = _k()
+        k = make_kernel()
         g.add_kernel(k)
         g.remove_kernel(k)
         assert k not in g.kernels
 
-    def test_remove_nonexistent_raises(self):
+    def test_nonexistent_raises(self):
         g = ComputeGraph()
         with pytest.raises(ValueError):
-            g.remove_kernel(_k())
+            g.remove_kernel(make_kernel())
+
+
+class TestKernelsProperty:
+    def test_returns_frozenset(self):
+        g = ComputeGraph()
+        a = make_kernel()
+        b = make_kernel()
+        g.add_kernel(a)
+        g.add_kernel(b)
+        assert g.kernels == frozenset([a, b])
 
 
 # ── Data Edge API ────────────────────────────────────────────────────
 
 
-class TestDataEdgeAPI:
-    def test_add_data_edge(self):
+class TestAddDataEdge:
+    def test_basic(self):
         g = ComputeGraph()
-        a = _k(outs=["y"])
-        b = _k(ins=["x"])
+        a = make_kernel(outs=["y"])
+        b = make_kernel(ins=["x"])
         g.add_kernel(a)
         g.add_kernel(b)
         g.add_data_edge(a, b, {"y": "x"})
@@ -88,17 +91,17 @@ class TestDataEdgeAPI:
 
     def test_empty_mapping_raises(self):
         g = ComputeGraph()
-        a = _k(outs=["y"])
-        b = _k(ins=["x"])
+        a = make_kernel(outs=["y"])
+        b = make_kernel(ins=["x"])
         g.add_kernel(a)
         g.add_kernel(b)
         with pytest.raises(ValueError):
             g.add_data_edge(a, b, {})
 
-    def test_merge_data_edge(self):
+    def test_merge_existing_edge(self):
         g = ComputeGraph()
-        a = _k(outs=["y1", "y2"])
-        b = _k(ins=["x1", "x2"])
+        a = make_kernel(outs=["y1", "y2"])
+        b = make_kernel(ins=["x1", "x2"])
         g.add_kernel(a)
         g.add_kernel(b)
         g.add_data_edge(a, b, {"y1": "x1"})
@@ -107,10 +110,10 @@ class TestDataEdgeAPI:
         assert len(edges) == 1
         assert edges[0].mapping == {"y1": "x1", "y2": "x2"}
 
-    def test_data_edge_replaces_control(self):
+    def test_replaces_control_edge(self):
         g = ComputeGraph()
-        a = _k(outs=["y"])
-        b = _k(ins=["x"])
+        a = make_kernel(outs=["y"])
+        b = make_kernel(ins=["x"])
         g.add_kernel(a)
         g.add_kernel(b)
         g.add_control_edge(a, b)
@@ -123,39 +126,41 @@ class TestDataEdgeAPI:
 # ── Control Edge API ─────────────────────────────────────────────────
 
 
-class TestControlEdgeAPI:
-    def test_add_control_edge(self):
+class TestAddControlEdge:
+    def test_basic(self):
         g = ComputeGraph()
-        a, b = _k(), _k()
+        a, b = make_kernel(), make_kernel()
         g.add_kernel(a)
         g.add_kernel(b)
         g.add_control_edge(a, b)
         assert g._dag.has_edge(a, b)
         assert g._dag.edges[a, b]["mapping"] == {}
 
-    def test_add_control_noop_if_data_exists(self):
+    def test_noop_if_data_exists(self):
         g = ComputeGraph()
-        a = _k(outs=["y"])
-        b = _k(ins=["x"])
+        a = make_kernel(outs=["y"])
+        b = make_kernel(ins=["x"])
         g.add_kernel(a)
         g.add_kernel(b)
         g.add_data_edge(a, b, {"y": "x"})
         g.add_control_edge(a, b)
         assert g._dag.edges[a, b]["mapping"] == {"y": "x"}
 
-    def test_remove_control_edge(self):
+
+class TestRemoveControlEdge:
+    def test_basic(self):
         g = ComputeGraph()
-        a, b = _k(), _k()
+        a, b = make_kernel(), make_kernel()
         g.add_kernel(a)
         g.add_kernel(b)
         g.add_control_edge(a, b)
         g.remove_control_edge(a, b)
         assert not g._dag.has_edge(a, b)
 
-    def test_remove_data_edge_as_control_raises(self):
+    def test_data_edge_raises(self):
         g = ComputeGraph()
-        a = _k(outs=["y"])
-        b = _k(ins=["x"])
+        a = make_kernel(outs=["y"])
+        b = make_kernel(ins=["x"])
         g.add_kernel(a)
         g.add_kernel(b)
         g.add_data_edge(a, b, {"y": "x"})
@@ -163,40 +168,70 @@ class TestControlEdgeAPI:
             g.remove_control_edge(a, b)
 
 
-# ── Insert/Remove Identity ───────────────────────────────────────────
+# ── Mutation: insert_identity ─────────────────────────────────────────
 
 
-class TestInsertRemoveIdentity:
-    def test_insert_identity(self):
+class TestInsertIdentity:
+    def test_basic(self):
         g = ComputeGraph()
-        a = _k(outs=["y"])
-        b = _k(ins=["x"])
+        a = make_kernel(outs=["y"])
+        b = make_kernel(ins=["x"])
         g.add_kernel(a)
         g.add_kernel(b)
         g.add_data_edge(a, b, {"y": "x"})
-        mid = _k(ins=["src"], outs=["dst"])
+        mid = make_kernel(ins=["src"], outs=["dst"])
         g.insert_identity(mid, a, b, {"y": "x"})
         assert mid in g.kernels
         assert g._in_edges(mid)[0].src is a
         assert g._out_edges(mid)[0].dst is b
 
-    def test_insert_identity_multi_output(self):
+    def test_multi_output(self):
         g = ComputeGraph()
-        a = _k(outs=["y1", "y2"])
-        b = _k(ins=["x1", "x2"])
+        a = make_kernel(outs=["y1", "y2"])
+        b = make_kernel(ins=["x1", "x2"])
         g.add_kernel(a)
         g.add_kernel(b)
         g.add_data_edge(a, b, {"y1": "x1", "y2": "x2"})
-        mid = _k(ins=["i1", "i2"], outs=["o1", "o2"])
+        mid = make_kernel(ins=["i1", "i2"], outs=["o1", "o2"])
         g.insert_identity(mid, a, b, {"y1": "x1", "y2": "x2"})
         assert g._in_edges(mid)[0].mapping == {"y1": "i1", "y2": "i2"}
         assert g._out_edges(mid)[0].mapping == {"o1": "x1", "o2": "x2"}
 
-    def test_remove_identity(self):
+    def test_partial_mapping(self):
         g = ComputeGraph()
-        a = _k(outs=["y"])
-        b = _k(ins=["x"])
-        mid = _k(ins=["src"], outs=["dst"])
+        a = make_kernel(outs=["y1", "y2"])
+        b = make_kernel(ins=["x1", "x2"])
+        g.add_kernel(a)
+        g.add_kernel(b)
+        g.add_data_edge(a, b, {"y1": "x1", "y2": "x2"})
+        mid = make_kernel(ins=["src"], outs=["dst"])
+        g.insert_identity(mid, a, b, {"y1": "x1"})
+        assert g._in_edges(mid)[0].mapping == {"y1": "src"}
+        assert g._out_edges(mid)[0].mapping == {"dst": "x1"}
+        remaining = g._dag.edges[a, b]["mapping"]
+        assert remaining == {"y2": "x2"}
+
+    def test_mapping_size_mismatch_raises(self):
+        g = ComputeGraph()
+        a = make_kernel(outs=["y1", "y2"])
+        b = make_kernel(ins=["x1", "x2"])
+        g.add_kernel(a)
+        g.add_kernel(b)
+        g.add_data_edge(a, b, {"y1": "x1", "y2": "x2"})
+        mid = make_kernel(ins=["src"], outs=["dst"])
+        with pytest.raises(ValueError, match="mapping has 2 entries"):
+            g.insert_identity(mid, a, b, {"y1": "x1", "y2": "x2"})
+
+
+# ── Mutation: remove_identity ─────────────────────────────────────────
+
+
+class TestRemoveIdentity:
+    def test_basic(self):
+        g = ComputeGraph()
+        a = make_kernel(outs=["y"])
+        b = make_kernel(ins=["x"])
+        mid = make_kernel(ins=["src"], outs=["dst"])
         g.add_kernel(a)
         g.add_kernel(b)
         g.add_data_edge(a, b, {"y": "x"})
@@ -208,12 +243,12 @@ class TestInsertRemoveIdentity:
         assert edges[0].dst is b
         assert edges[0].mapping == {"y": "x"}
 
-    def test_remove_identity_not_single_edge_raises(self):
+    def test_not_single_edge_raises(self):
         g = ComputeGraph()
-        a = _k(outs=["y"])
-        b = _k(ins=["x1"])
-        c = _k(ins=["x2"])
-        mid = _k(ins=["src"], outs=["d1", "d2"])
+        a = make_kernel(outs=["y"])
+        b = make_kernel(ins=["x1"])
+        c = make_kernel(ins=["x2"])
+        mid = make_kernel(ins=["src"], outs=["d1", "d2"])
         g.add_kernel(a)
         g.add_kernel(b)
         g.add_kernel(c)
@@ -225,94 +260,84 @@ class TestInsertRemoveIdentity:
             g.remove_identity(mid)
 
 
-# ── Fuse Kernels ─────────────────────────────────────────────────────
+# ── Mutation: fuse_kernels ────────────────────────────────────────────
 
 
 class TestFuseKernels:
-    def test_fuse_chain(self):
+    def test_chain(self):
         g = ComputeGraph()
-        a = _k(outs=["y"])
-        b = _k(ins=["x"], outs=["z"])
-        c = _k(ins=["w"])
+        a = make_kernel(outs=["y"])
+        b = make_kernel(ins=["x"], outs=["z"])
+        c = make_kernel(ins=["w"])
         g.add_kernel(a)
         g.add_kernel(b)
         g.add_kernel(c)
         g.add_data_edge(a, b, {"y": "x"})
         g.add_data_edge(b, c, {"z": "w"})
 
-        def fuse_class(kl):
-            return _k(ins=["x"], outs=["z"])
-
-        fused = g.fuse_kernels(fuse_class, [a, b])
-        assert a not in g.kernels
-        assert b not in g.kernels
+        fused = g.fuse_kernels(lambda kl: make_kernel(ins=["x"], outs=["z"]),
+                               [a, b])
+        assert a not in g.kernels and b not in g.kernels
         assert fused in g.kernels
-        out_e = g._out_edges(fused)
-        assert len(out_e) == 1
-        assert out_e[0].dst is c
+        assert g._out_edges(fused)[0].dst is c
 
-    def test_fuse_forest(self):
+    def test_forest(self):
         g = ComputeGraph()
-        a = _k(outs=["y1"])
-        b = _k(outs=["y2"])
-        c = _k(ins=["x1", "x2"])
+        a = make_kernel(outs=["y1"])
+        b = make_kernel(outs=["y2"])
+        c = make_kernel(ins=["x1", "x2"])
         g.add_kernel(a)
         g.add_kernel(b)
         g.add_kernel(c)
         g.add_data_edge(a, c, {"y1": "x1"})
         g.add_data_edge(b, c, {"y2": "x2"})
 
-        def fuse_class(kl):
-            return _k(outs=["y1", "y2"])
-
-        fused = g.fuse_kernels(fuse_class, [a, b])
+        fused = g.fuse_kernels(lambda kl: make_kernel(outs=["y1", "y2"]),
+                               [a, b])
         assert fused in g.kernels
-        out_e = g._out_edges(fused)
-        assert len(out_e) == 1
-        assert out_e[0].dst is c
+        assert g._out_edges(fused)[0].dst is c
 
-    def test_fuse_less_than_2_raises(self):
+    def test_less_than_2_raises(self):
         g = ComputeGraph()
-        a = _k()
+        a = make_kernel()
         g.add_kernel(a)
         with pytest.raises(ValueError):
-            g.fuse_kernels(lambda kl: _k(), [a])
+            g.fuse_kernels(lambda kl: make_kernel(), [a])
 
-    def test_fuse_not_in_graph_raises(self):
+    def test_not_in_graph_raises(self):
         g = ComputeGraph()
-        a = _k()
-        b = _k()
+        a = make_kernel()
+        b = make_kernel()
         g.add_kernel(a)
         with pytest.raises(ValueError):
-            g.fuse_kernels(lambda kl: _k(), [a, b])
+            g.fuse_kernels(lambda kl: make_kernel(), [a, b])
 
 
-# ── Split Kernel ─────────────────────────────────────────────────────
+# ── Mutation: split_kernel ────────────────────────────────────────────
 
 
 class TestSplitKernel:
     def _make_split_class(self):
         def split_class(kernel, n):
-            prev = _k(
+            prev = make_kernel(
                 ins=list(kernel.inputs),
-                outs=[f"o{i}_{j}" for i in range(n)
-                      for j in kernel.inputs],
+                outs=[f"o{i}_{j}" for i in range(n) for j in kernel.inputs],
             )
-            copies = [_k(ins=list(kernel.inputs), outs=list(kernel.outputs))
+            copies = [make_kernel(ins=list(kernel.inputs),
+                                  outs=list(kernel.outputs))
                       for _ in range(n)]
-            nxt = _k(
-                ins=[f"i{i}_{j}" for i in range(n)
-                     for j in kernel.outputs],
+            next = make_kernel(
+                ins=[f"i{i}_{j}" for i in range(n) for j in kernel.outputs],
                 outs=list(kernel.outputs),
             )
-            return prev, copies, nxt
+            return prev, copies, next
         return split_class
 
-    def test_split_basic(self):
+    def test_basic(self):
         g = ComputeGraph()
-        pred = _k(outs=["y"])
-        k = _k(ins=["x"], outs=["z"])
-        succ = _k(ins=["w"])
+        pred = make_kernel(outs=["y"])
+        k = make_kernel(ins=["x"], outs=["z"])
+        succ = make_kernel(ins=["w"])
         g.add_kernel(pred)
         g.add_kernel(k)
         g.add_kernel(succ)
@@ -327,53 +352,123 @@ class TestSplitKernel:
         assert all(c in g.kernels for c in copies)
         assert len(copies) == 2
 
-    def test_split_rewires_predecessors(self):
+    def test_rewires_predecessors_and_successors(self):
         g = ComputeGraph()
-        pred = _k(outs=["y"])
-        k = _k(ins=["x"], outs=["z"])
+        pred = make_kernel(outs=["y"])
+        k = make_kernel(ins=["x"], outs=["z"])
+        succ = make_kernel(ins=["w"])
         g.add_kernel(pred)
         g.add_kernel(k)
-        g.add_data_edge(pred, k, {"y": "x"})
-
-        prev_comm, _, _ = g.split_kernel(self._make_split_class(), k, 2)
-        in_e = g._in_edges(prev_comm)
-        assert len(in_e) == 1
-        assert in_e[0].src is pred
-
-    def test_split_rewires_successors(self):
-        g = ComputeGraph()
-        k = _k(ins=["x"], outs=["z"])
-        succ = _k(ins=["w"])
-        g.add_kernel(k)
         g.add_kernel(succ)
+        g.add_data_edge(pred, k, {"y": "x"})
         g.add_data_edge(k, succ, {"z": "w"})
 
-        _, _, next_comm = g.split_kernel(self._make_split_class(), k, 2)
-        out_e = g._out_edges(next_comm)
-        assert len(out_e) == 1
-        assert out_e[0].dst is succ
+        prev_comm, _, next_comm = g.split_kernel(
+            self._make_split_class(), k, 2)
+        assert g._in_edges(prev_comm)[0].src is pred
+        assert g._out_edges(next_comm)[0].dst is succ
 
-    def test_split_count_mismatch_raises(self):
+    def test_count_mismatch_raises(self):
         g = ComputeGraph()
-        k = _k(ins=["x"], outs=["z"])
+        k = make_kernel(ins=["x"], outs=["z"])
         g.add_kernel(k)
 
         def bad_split(kernel, n):
-            prev = _k(ins=["x"], outs=["o0_x"])
-            copies = [_k(ins=["x"], outs=["z"])]
-            nxt = _k(ins=["i0_z"], outs=["z"])
-            return prev, copies, nxt
+            prev = make_kernel(ins=["x"], outs=["o0_x"])
+            copies = [make_kernel(ins=["x"], outs=["z"])]
+            next = make_kernel(ins=["i0_z"], outs=["z"])
+            return prev, copies, next
 
         with pytest.raises(ValueError, match="expected 2"):
             g.split_kernel(bad_split, k, 2)
 
-    def test_split_none_comm_raises(self):
+    def test_none_comm_raises(self):
         g = ComputeGraph()
-        k = _k(ins=["x"], outs=["z"])
+        k = make_kernel(ins=["x"], outs=["z"])
         g.add_kernel(k)
-
-        def bad_split(kernel, n):
-            return None, [_k(), _k()], _k()
-
         with pytest.raises(AssertionError):
-            g.split_kernel(bad_split, k, 2)
+            g.split_kernel(lambda ker, n: (None, [make_kernel()]*n, make_kernel()),
+                           k, 2)
+
+
+# ── Query: topological_sort ───────────────────────────────────────────
+
+
+class TestTopologicalSort:
+    def test_linear(self):
+        g = ComputeGraph()
+        a = make_kernel(outs=["y"])
+        b = make_kernel(ins=["x"], outs=["z"])
+        c = make_kernel(ins=["w"])
+        g.add_kernel(a)
+        g.add_kernel(b)
+        g.add_kernel(c)
+        g.add_data_edge(a, b, {"y": "x"})
+        g.add_data_edge(b, c, {"z": "w"})
+        assert g.topological_sort() == [a, b, c]
+
+    def test_diamond(self):
+        g = ComputeGraph()
+        a = make_kernel(outs=["y1", "y2"])
+        b = make_kernel(ins=["x1"], outs=["z1"])
+        c = make_kernel(ins=["x2"], outs=["z2"])
+        d = make_kernel(ins=["w1", "w2"])
+        g.add_kernel(a)
+        g.add_kernel(b)
+        g.add_kernel(c)
+        g.add_kernel(d)
+        g.add_data_edge(a, b, {"y1": "x1"})
+        g.add_data_edge(a, c, {"y2": "x2"})
+        g.add_data_edge(b, d, {"z1": "w1"})
+        g.add_data_edge(c, d, {"z2": "w2"})
+        order = g.topological_sort()
+        assert order[0] is a
+        assert order[-1] is d
+
+
+# ── Validation: validate ──────────────────────────────────────────────
+
+
+class TestValidate:
+    def test_valid_graph(self):
+        g = ComputeGraph()
+        a = make_kernel(outs=["y"])
+        b = make_kernel(ins=["x"])
+        g.add_kernel(a)
+        g.add_kernel(b)
+        g.add_data_edge(a, b, {"y": "x"})
+        g.validate()
+
+    def test_cycle_raises(self):
+        g = ComputeGraph()
+        a = make_kernel(outs=["y"])
+        b = make_kernel(ins=["x"], outs=["z"])
+        g.add_kernel(a)
+        g.add_kernel(b)
+        g.add_data_edge(a, b, {"y": "x"})
+        g._dag.add_edge(b, a, mapping={"z": "y"})
+        with pytest.raises(ValueError, match="cycle"):
+            g.validate()
+
+    def test_output_connected_to_multiple_raises(self):
+        g = ComputeGraph()
+        a = make_kernel(outs=["y"])
+        b = make_kernel(ins=["x"])
+        c = make_kernel(ins=["w"])
+        g.add_kernel(a)
+        g.add_kernel(b)
+        g.add_kernel(c)
+        g.add_data_edge(a, b, {"y": "x"})
+        g.add_data_edge(a, c, {"y": "w"})
+        with pytest.raises(ValueError, match="connected to multiple"):
+            g.validate()
+
+    def test_input_not_connected_raises(self):
+        g = ComputeGraph()
+        a = make_kernel(outs=["y"])
+        b = make_kernel(ins=["x1", "x2"])
+        g.add_kernel(a)
+        g.add_kernel(b)
+        g.add_data_edge(a, b, {"y": "x1"})
+        with pytest.raises(ValueError, match="not connected"):
+            g.validate()

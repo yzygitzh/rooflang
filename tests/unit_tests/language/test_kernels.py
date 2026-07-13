@@ -1,7 +1,5 @@
 """Unit tests for rooflang.language.kernels (Kernel base + all subclasses)."""
 
-import pytest
-
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.kernels.forward import (
     Gemm, RMSNorm, LayerNorm, RoPE, Attn, SparseAttn,

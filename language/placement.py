@@ -1,8 +1,8 @@
 """Placement — assigns kernels to physical devices with resource allocation.
 
-The placement pass produces a Placement object that maps each kernel in the
-compute graph to a (device, stream, resource_cap) triple. The simulator
-consumes this mapping to schedule kernels on devices.
+The placement pass produces a Placement object that maps each compute kernel
+in the graph to a (device, stream, resource_cap) triple. Communication kernels
+do not require placement — their cost is attributed to adjacent compute kernels.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class DeviceAssignment:
-    """A kernel's placement on a physical device.
+    """A kernel's placement on a single physical device.
 
     Attributes:
         device: the Compute node this kernel runs on.
@@ -33,7 +33,8 @@ class DeviceAssignment:
 class Placement:
     """Placement mapping: kernel -> DeviceAssignment.
 
-    Created by the placement pass, consumed by the simulator.
+    Only compute kernels (where _requires_placement is True) need entries.
+    Communication kernels are exempt.
     """
 
     def __init__(self) -> None:
@@ -41,7 +42,7 @@ class Placement:
 
     def set(self, kernel: Kernel, device: Compute, stream: int = 0,
             resource_cap: float = 1.0) -> None:
-        """Assign a kernel to a device/stream with resource allocation."""
+        """Assign a kernel to a single device/stream."""
         if resource_cap <= 0.0 or resource_cap > 1.0:
             raise ValueError(
                 f"resource_cap must be in (0, 1], got {resource_cap}")
@@ -59,13 +60,16 @@ class Placement:
         return frozenset(self._mapping.keys())
 
     def validate(self, graph: ComputeGraph) -> None:
-        """Verify placement and graph have exactly the same kernel set.
+        """Verify placement and graph are consistent.
 
-        Raises ValueError if any kernel is unplaced or extraneous.
+        Checks that every kernel requiring placement is placed, and that
+        no extraneous placements exist for kernels not in the graph.
         """
-        unplaced = graph.kernels - self.placed_kernels
+        required = {k for k in graph.kernels if k._requires_placement}
+        unplaced = required - self.placed_kernels
         if unplaced:
             raise ValueError(f"Unplaced kernels: {unplaced}")
         extraneous = self.placed_kernels - graph.kernels
         if extraneous:
-            raise ValueError(f"Extraneous placements (not in graph): {extraneous}")
+            raise ValueError(
+                f"Extraneous placements (not in graph): {extraneous}")

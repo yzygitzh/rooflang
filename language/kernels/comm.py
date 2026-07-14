@@ -22,7 +22,16 @@ from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.utils import dtype_bytes
 
 
-class AllReduce(Kernel):
+class CommKernel(Kernel):
+    """Base class for all communication kernels.
+
+    Communication kernels do not require placement — their cost is
+    attributed to adjacent compute kernels in the simulator.
+    """
+    _requires_placement = False
+
+
+class AllReduce(CommKernel):
     """All-reduce: every rank ends with the full reduced result.
 
     flops = (W-1)/W · n_elements (reduction adds).
@@ -60,7 +69,7 @@ class AllReduce(Kernel):
         return self.bytes_per_rank
 
 
-class ReduceScatter(Kernel):
+class ReduceScatter(CommKernel):
     """Reduce-scatter: each rank gets 1/W of the reduced result.
 
     flops = (W-1)/W · n_elements (reduction adds).
@@ -98,7 +107,7 @@ class ReduceScatter(Kernel):
         return self.bytes_per_rank / self.world
 
 
-class AllGather(Kernel):
+class AllGather(CommKernel):
     """All-gather: each rank broadcasts its shard; all get the full tensor.
 
     flops = 0 (no arithmetic).
@@ -129,7 +138,7 @@ class AllGather(Kernel):
         return self.bytes_per_rank
 
 
-class AllToAll(Kernel):
+class AllToAll(CommKernel):
     """All-to-all: each rank sends a distinct chunk to every other rank.
 
     flops = 0 (permutation routing, no arithmetic).
@@ -160,7 +169,7 @@ class AllToAll(Kernel):
         return self.bytes_per_rank
 
 
-class Broadcast(Kernel):
+class Broadcast(CommKernel):
     """Broadcast: root sends full payload to all ranks.
 
     flops = 0.
@@ -191,7 +200,7 @@ class Broadcast(Kernel):
         return self.bytes_per_rank
 
 
-class Scatter(Kernel):
+class Scatter(CommKernel):
     """Scatter: root distributes distinct slices to each rank.
 
     flops = 0.
@@ -200,9 +209,10 @@ class Scatter(Kernel):
     output_bytes = bytes_per_rank / W (each rank writes its slice).
     """
 
-    def __init__(self, bytes_per_rank: float, world: int):
+    def __init__(self, bytes_per_rank: float, world: int, dim: int = 0):
         self.bytes_per_rank = bytes_per_rank
         self.world = world
+        self.dim = dim
         super().__init__()
 
     @property
@@ -222,7 +232,7 @@ class Scatter(Kernel):
         return self.bytes_per_rank / self.world
 
 
-class Gather(Kernel):
+class Gather(CommKernel):
     """Gather: each rank sends its slice to root which concatenates.
 
     flops = 0.
@@ -231,9 +241,10 @@ class Gather(Kernel):
     output_bytes = bytes_per_rank (root writes full tensor).
     """
 
-    def __init__(self, bytes_per_rank: float, world: int):
+    def __init__(self, bytes_per_rank: float, world: int, dim: int = 0):
         self.bytes_per_rank = bytes_per_rank
         self.world = world
+        self.dim = dim
         super().__init__()
 
     @property
@@ -253,7 +264,7 @@ class Gather(Kernel):
         return self.bytes_per_rank
 
 
-class Reduce(Kernel):
+class Reduce(CommKernel):
     """Reduce: each rank sends full buffer; root reduces element-wise.
 
     flops = (W-1)/W · n_elements (reduction adds).
@@ -291,7 +302,7 @@ class Reduce(Kernel):
         return self.bytes_per_rank
 
 
-class Send(Kernel):
+class Send(CommKernel):
     """Point-to-point send (e.g. PP stage boundary, sender side).
 
     flops = 0.
@@ -321,7 +332,7 @@ class Send(Kernel):
         return 0.0
 
 
-class Recv(Kernel):
+class Recv(CommKernel):
     """Point-to-point recv (e.g. PP stage boundary, receiver side).
 
     flops = 0.

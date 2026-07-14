@@ -5,6 +5,7 @@ import pytest
 from rooflang.language.placement import Placement, DeviceAssignment
 from rooflang.language.hardware.component import Compute
 from rooflang.language.kernels.kernel import Kernel
+from rooflang.language.kernels.comm import AllReduce
 from rooflang.language.graph import ComputeGraph
 from rooflang.language.tensor import Tensor
 
@@ -152,3 +153,14 @@ class TestPlacementValidate:
 
     def test_empty_graph_passes(self):
         Placement().validate(ComputeGraph())
+
+    def test_comm_kernel_skipped(self):
+        p = Placement()
+        g = ComputeGraph()
+        gpu = Compute(name="gpu0")
+        k = Kernel()
+        ar = AllReduce(bytes_per_rank=1024.0, world=4, dtype="bf16")
+        g.add_kernel(k)
+        g.add_kernel(ar)
+        p.set(k, gpu)
+        p.validate(g)

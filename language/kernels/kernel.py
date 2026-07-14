@@ -22,6 +22,8 @@ class Kernel:
     can override these properties for custom accounting.
     """
 
+    _requires_placement = True
+
     def __init__(
         self,
         inputs: Dict[str, Tensor] | None = None,

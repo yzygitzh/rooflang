@@ -10,12 +10,13 @@ Two edge types (distinguished by whether mapping is empty):
 
 from __future__ import annotations
 
-from typing import Callable, Dict, FrozenSet, List, NamedTuple, Set
+from typing import Callable, Dict, FrozenSet, List, NamedTuple, Optional, Set
 
 import networkx as nx
 
 from rooflang.language.kernels.comm import Broadcast
 from rooflang.language.kernels.kernel import Kernel
+from rooflang.language.hardware.component import Compute, HardwareComponent, Memory
 
 
 class DataEdge(NamedTuple):
@@ -489,3 +490,159 @@ class ComputeGraph:
         del mapping[src_output]
         if not mapping:
             self._dag.remove_edge(src, dst)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Hardware Graph
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class FabricEdge:
+    """An edge in the hardware graph (NVLink, PCIe, IB, etc.).
+
+    Bandwidth model:
+      - is_full_duplex=True: time = alpha + max(fwd_time, rev_time)
+      - is_full_duplex=False: time = alpha + fwd_time + rev_time
+    """
+
+    def __init__(
+        self,
+        name: str,
+        src: HardwareComponent,
+        dst: HardwareComponent,
+        src_to_dst_bandwidth_gbs: float,
+        dst_to_src_bandwidth_gbs: float,
+        is_full_duplex: bool,
+        alpha_us: float = 0.0,
+    ) -> None:
+        self.name = name
+        self.src = src
+        self.dst = dst
+        self.src_to_dst_bandwidth_gbs = src_to_dst_bandwidth_gbs
+        self.dst_to_src_bandwidth_gbs = dst_to_src_bandwidth_gbs
+        self.is_full_duplex = is_full_duplex
+        self.alpha_us = alpha_us
+
+    def transfer_time_us(self, src_to_dst_bytes: float = 0.0,
+                         dst_to_src_bytes: float = 0.0) -> float:
+        """Estimate transfer time (microseconds) for bidirectional traffic."""
+        t_fwd = (src_to_dst_bytes / (self.src_to_dst_bandwidth_gbs * 1e3)
+                 if self.src_to_dst_bandwidth_gbs > 0 and src_to_dst_bytes > 0
+                 else 0.0)
+        t_rev = (dst_to_src_bytes / (self.dst_to_src_bandwidth_gbs * 1e3)
+                 if self.dst_to_src_bandwidth_gbs > 0 and dst_to_src_bytes > 0
+                 else 0.0)
+        if self.is_full_duplex:
+            return self.alpha_us + max(t_fwd, t_rev)
+        else:
+            return self.alpha_us + t_fwd + t_rev
+
+
+class HardwareGraph:
+    """Undirected graph of hardware components connected by fabric edges.
+
+    Nodes: Compute / Memory instances.
+    Edges: FabricEdge instances (directional bandwidth stored per-edge).
+    Supports path-finding for effective bandwidth between any two nodes.
+    """
+
+    def __init__(self) -> None:
+        self._graph: nx.Graph = nx.Graph()
+
+    def add_node(self, component: HardwareComponent) -> None:
+        self._graph.add_node(component)
+
+    def add_edge(self, edge: FabricEdge) -> None:
+        if not self._graph.has_node(edge.src):
+            raise ValueError(f"Node not in graph: {edge.src.name}")
+        if not self._graph.has_node(edge.dst):
+            raise ValueError(f"Node not in graph: {edge.dst.name}")
+        if self._graph.has_edge(edge.src, edge.dst):
+            self._graph.edges[edge.src, edge.dst]["fabrics"].append(edge)
+        else:
+            self._graph.add_edge(edge.src, edge.dst, fabrics=[edge])
+
+    @property
+    def nodes(self) -> FrozenSet[HardwareComponent]:
+        return frozenset(self._graph.nodes)
+
+    def find_fabric(self, src: HardwareComponent, dst: HardwareComponent) -> FabricEdge:
+        """Find the effective fabric between src and dst.
+
+        Single-hop: returns the highest-bandwidth direct FabricEdge.
+        Multi-hop: returns a synthetic FabricEdge with bottleneck bandwidth
+        (min along path) and cumulative alpha (sum along path).
+        Raises ValueError if no path exists.
+        """
+        if not self._graph.has_node(src) or not self._graph.has_node(dst):
+            raise ValueError(f"No path between {src.name} and {dst.name}")
+        if src is dst:
+            raise ValueError(f"src and dst are the same node: {src.name}")
+        try:
+            path = nx.shortest_path(self._graph, src, dst)
+        except nx.NetworkXNoPath:
+            raise ValueError(f"No path between {src.name} and {dst.name}")
+
+        hops: List[FabricEdge] = []
+        for i in range(len(path) - 1):
+            a, b = path[i], path[i + 1]
+            hops.append(self._best_fabric(a, b))
+
+        if len(hops) == 1:
+            return hops[0]
+
+        fwd_bws: List[float] = []
+        rev_bws: List[float] = []
+        total_alpha = 0.0
+        all_full_duplex = True
+        for i, fab in enumerate(hops):
+            a = path[i]
+            if fab.src is a:
+                fwd_bws.append(fab.src_to_dst_bandwidth_gbs)
+                rev_bws.append(fab.dst_to_src_bandwidth_gbs)
+            else:
+                fwd_bws.append(fab.dst_to_src_bandwidth_gbs)
+                rev_bws.append(fab.src_to_dst_bandwidth_gbs)
+            total_alpha += fab.alpha_us
+            if not fab.is_full_duplex:
+                all_full_duplex = False
+
+        return FabricEdge(
+            name=f"path({src.name}->{dst.name})",
+            src=src, dst=dst,
+            src_to_dst_bandwidth_gbs=min(fwd_bws),
+            dst_to_src_bandwidth_gbs=min(rev_bws),
+            is_full_duplex=all_full_duplex,
+            alpha_us=total_alpha,
+        )
+
+    def find_local_memory(self, device: Compute) -> Memory:
+        """Find the Memory node connected to device with highest bandwidth."""
+        best_mem: Optional[Memory] = None
+        best_bw = 0.0
+        for neighbor in self._graph.neighbors(device):
+            if not isinstance(neighbor, Memory):
+                continue
+            for fab in self._graph.edges[device, neighbor]["fabrics"]:
+                bw = (fab.src_to_dst_bandwidth_gbs if fab.src is device
+                      else fab.dst_to_src_bandwidth_gbs)
+                if bw > best_bw:
+                    best_bw = bw
+                    best_mem = neighbor
+        if best_mem is None:
+            raise ValueError(f"No memory attached to device: {device.name}")
+        return best_mem
+
+    def _best_fabric(self, a: HardwareComponent, b: HardwareComponent) -> FabricEdge:
+        """Pick the highest-bandwidth fabric between two adjacent nodes."""
+        fabs = self._graph.edges[a, b]["fabrics"]
+        best = fabs[0]
+        best_bw = (best.src_to_dst_bandwidth_gbs if best.src is a
+                   else best.dst_to_src_bandwidth_gbs)
+        for fab in fabs[1:]:
+            bw = (fab.src_to_dst_bandwidth_gbs if fab.src is a
+                  else fab.dst_to_src_bandwidth_gbs)
+            if bw > best_bw:
+                best_bw = bw
+                best = fab
+        return best

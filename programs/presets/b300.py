@@ -1,9 +1,10 @@
 """B300 Cluster A preset."""
 
-from rooflang.language.hardware.component import Compute, Memory, Fabric, Cluster
+from rooflang.language.hardware.component import Compute, Memory
+from rooflang.language.graph import FabricEdge, HardwareGraph
 
 
-class B300ClusterA(Cluster):
+class B300ClusterA(HardwareGraph):
     """B300 Cluster A.
 
     Per-node topology:
@@ -21,7 +22,7 @@ class B300ClusterA(Cluster):
         super().__init__()
 
         ib_switch = Compute(name="ib-switch")
-        self.computes.append(ib_switch)
+        self.add_node(ib_switch)
 
         for node in range(n_nodes):
             p = f"n{node}-"
@@ -47,43 +48,44 @@ class B300ClusterA(Cluster):
 
             nvme_pcie_switch = Compute(name=f"{p}nvme-pcie-switch")
 
-            self.computes.extend(
-                gpus + [nvswitch, hgx_pcie_switch, cpu_pcie_switch,
-                        nvme_pcie_switch] + cpus + nics)
-            self.memories.extend(hbms + drams + [ssd])
+            for comp in (gpus + [nvswitch, hgx_pcie_switch, cpu_pcie_switch,
+                                 nvme_pcie_switch] + cpus + nics):
+                self.add_node(comp)
+            for mem in (hbms + drams + [ssd]):
+                self.add_node(mem)
 
             for i in range(8):
-                self.fabrics.append(Fabric(
+                self.add_edge(FabricEdge(
                     name="hbm", src=gpus[i], dst=hbms[i],
                     src_to_dst_bandwidth_gbs=7750.0,
                     dst_to_src_bandwidth_gbs=7750.0,
                     is_full_duplex=False, alpha_us=0.5,
                 ))
-                self.fabrics.append(Fabric(
+                self.add_edge(FabricEdge(
                     name="nvlink", src=gpus[i], dst=nvswitch,
                     src_to_dst_bandwidth_gbs=900.0,
                     dst_to_src_bandwidth_gbs=900.0,
                     is_full_duplex=True, alpha_us=0.5,
                 ))
-                self.fabrics.append(Fabric(
+                self.add_edge(FabricEdge(
                     name="pcie", src=gpus[i], dst=nics[i],
                     src_to_dst_bandwidth_gbs=128.0,
                     dst_to_src_bandwidth_gbs=128.0,
                     is_full_duplex=True, alpha_us=0.5,
                 ))
-                self.fabrics.append(Fabric(
+                self.add_edge(FabricEdge(
                     name="pcie", src=gpus[i], dst=hgx_pcie_switch,
                     src_to_dst_bandwidth_gbs=128.0,
                     dst_to_src_bandwidth_gbs=128.0,
                     is_full_duplex=True, alpha_us=0.5,
                 ))
-                self.fabrics.append(Fabric(
+                self.add_edge(FabricEdge(
                     name="pcie", src=nics[i], dst=hgx_pcie_switch,
                     src_to_dst_bandwidth_gbs=128.0,
                     dst_to_src_bandwidth_gbs=128.0,
                     is_full_duplex=True, alpha_us=0.5,
                 ))
-                self.fabrics.append(Fabric(
+                self.add_edge(FabricEdge(
                     name="infiniband", src=nics[i], dst=ib_switch,
                     src_to_dst_bandwidth_gbs=100.0,
                     dst_to_src_bandwidth_gbs=100.0,
@@ -91,38 +93,38 @@ class B300ClusterA(Cluster):
                 ))
 
             for s in range(2):
-                self.fabrics.append(Fabric(
+                self.add_edge(FabricEdge(
                     name="dram", src=cpus[s], dst=drams[s],
                     src_to_dst_bandwidth_gbs=332.8,
                     dst_to_src_bandwidth_gbs=332.8,
                     is_full_duplex=False, alpha_us=0.1,
                 ))
-                self.fabrics.append(Fabric(
+                self.add_edge(FabricEdge(
                     name="pcie", src=cpus[s], dst=cpu_pcie_switch,
                     src_to_dst_bandwidth_gbs=256.0,
                     dst_to_src_bandwidth_gbs=256.0,
                     is_full_duplex=True, alpha_us=0.5,
                 ))
 
-            self.fabrics.append(Fabric(
+            self.add_edge(FabricEdge(
                 name="qpi", src=cpus[0], dst=cpus[1],
                 src_to_dst_bandwidth_gbs=192.0,
                 dst_to_src_bandwidth_gbs=192.0,
                 is_full_duplex=True, alpha_us=0.05,
             ))
-            self.fabrics.append(Fabric(
+            self.add_edge(FabricEdge(
                 name="pcie", src=cpu_pcie_switch, dst=hgx_pcie_switch,
                 src_to_dst_bandwidth_gbs=512.0,
                 dst_to_src_bandwidth_gbs=512.0,
                 is_full_duplex=True, alpha_us=0.5,
             ))
-            self.fabrics.append(Fabric(
+            self.add_edge(FabricEdge(
                 name="pcie", src=cpus[0], dst=nvme_pcie_switch,
                 src_to_dst_bandwidth_gbs=64.0,
                 dst_to_src_bandwidth_gbs=64.0,
                 is_full_duplex=True, alpha_us=0.5,
             ))
-            self.fabrics.append(Fabric(
+            self.add_edge(FabricEdge(
                 name="pcie", src=ssd, dst=nvme_pcie_switch,
                 src_to_dst_bandwidth_gbs=14.0,
                 dst_to_src_bandwidth_gbs=7.0,

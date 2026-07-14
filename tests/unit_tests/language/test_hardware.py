@@ -1,10 +1,9 @@
-"""Unit tests for rooflang.language.hardware (component)."""
+"""Unit tests for rooflang.language.hardware (component nodes)."""
 
 import pytest
 
-from rooflang.language.hardware.component import (
-    Compute, Memory, Fabric, Cluster,
-)
+from rooflang.language.hardware.component import Compute, Memory
+from rooflang.language.graph import FabricEdge, HardwareGraph
 
 
 # ── Component tests ──────────────────────────────────────────────────
@@ -31,9 +30,9 @@ class TestMemoryInit:
         assert m.capacity_gb == 0.0
 
 
-class TestFabricTransferTimeUs:
+class TestFabricEdgeTransferTimeUs:
     def test_full_duplex_time(self):
-        f = Fabric(
+        f = FabricEdge(
             name="nvlink",
             src=Compute(name="g0"),
             dst=Compute(name="g1"),
@@ -48,7 +47,7 @@ class TestFabricTransferTimeUs:
         assert t == pytest.approx(1.0 + max(t_fwd, t_rev))
 
     def test_half_duplex_time(self):
-        f = Fabric(
+        f = FabricEdge(
             name="pcie",
             src=Compute(name="g0"),
             dst=Memory(name="dram"),
@@ -63,7 +62,7 @@ class TestFabricTransferTimeUs:
         assert t == pytest.approx(0.5 + t_fwd + t_rev)
 
     def test_zero_bytes_no_time(self):
-        f = Fabric(
+        f = FabricEdge(
             name="link",
             src=Compute(name="a"),
             dst=Compute(name="b"),
@@ -74,16 +73,18 @@ class TestFabricTransferTimeUs:
         assert f.transfer_time_us(0.0, 0.0) == 0.0
 
 
-class TestClusterInit:
+class TestHardwareGraphConstruction:
     def test_construction(self):
         g = Compute(name="gpu0")
         m = Memory(name="hbm0", capacity_gb=80.0)
-        f = Fabric(
+        hw = HardwareGraph()
+        hw.add_node(g)
+        hw.add_node(m)
+        hw.add_edge(FabricEdge(
             name="bus", src=g, dst=m,
             src_to_dst_bandwidth_gbs=3000.0,
             dst_to_src_bandwidth_gbs=3000.0,
             is_full_duplex=True,
-        )
-        c = Cluster(computes=[g], memories=[m], fabrics=[f])
-        assert len(c.computes) == 1
-        assert len(c.fabrics) == 1
+        ))
+        assert g in hw.nodes
+        assert m in hw.nodes

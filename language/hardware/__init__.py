@@ -1,13 +1,11 @@
-"""rooflang.language.hardware — hardware component graph.
+"""rooflang.language.hardware — hardware component nodes.
 
-Hardware is a graph: Compute/Memory nodes connected by Fabric edges.
-Cluster holds the full topology.
+Compute/Memory nodes live here. The hardware graph (HardwareGraph) and
+its edges (FabricEdge) live in language/graph.py alongside ComputeGraph.
 """
 
 from rooflang.language.hardware.component import (
     HardwareComponent,
     Compute,
     Memory,
-    Fabric,
-    Cluster,
 )

@@ -25,7 +25,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from rooflang.language.kernels.comm import (
-    AllGather, AllReduce, AllToAll, Broadcast, Gather, Reduce,
+    AllGather, AllReduce, AllToAll, Broadcast, CommKernel, Gather, Reduce,
     ReduceScatter, Scatter,
 )
 
@@ -40,18 +40,20 @@ def optimize_comms(graph: ComputeGraph, placement: Placement) -> None:
 
     Mutates graph in place. Reads placement for device-set checks only.
     """
-    _fuse_pairs(graph, placement)
-    _eliminate_dead(graph)
+    changed = True
+    while changed:
+        changed = _fuse_pairs(graph, placement)
+        changed |= _eliminate_dead(graph)
 
 
-def _pred_devices(graph: ComputeGraph, kernel: Kernel, placement: Placement):
-    """Device set of kernel's data predecessors."""
-    return {placement.get(e.src).device for e in graph._in_edges(kernel)}
-
-
-def _succ_devices(graph: ComputeGraph, kernel: Kernel, placement: Placement):
-    """Device set of kernel's data successors."""
-    return {placement.get(e.dst).device for e in graph._out_edges(kernel)}
+def _same_device_set(graph: ComputeGraph, collector: Kernel,
+                     distributor: Kernel, placement: Placement) -> bool:
+    """Check if collector's predecessors and distributor's successors share the same devices."""
+    preds = sorted((placement.get(e.src).device for e in graph._in_edges(collector)), key=id)
+    succs = sorted((placement.get(e.dst).device for e in graph._out_edges(distributor)), key=id)
+    if len(preds) != len(succs):
+        return False
+    return all(a is b for a, b in zip(preds, succs))
 
 
 def _create_collective(collector: Kernel, distributor: Kernel) -> Kernel | None:
@@ -77,9 +79,10 @@ def _create_collective(collector: Kernel, distributor: Kernel) -> Kernel | None:
     raise ValueError(f"Unexpected pair: {type(collector)}, {type(distributor)}")
 
 
-def _fuse_pairs(graph: ComputeGraph, placement: Placement) -> None:
+def _fuse_pairs(graph: ComputeGraph, placement: Placement) -> bool:
     """Fuse adjacent (Gather|Reduce) → (Scatter|Broadcast) pairs."""
     changed = True
+    did_change = False
     while changed:
         changed = False
         for kernel in list(graph.kernels):
@@ -98,8 +101,7 @@ def _fuse_pairs(graph: ComputeGraph, placement: Placement) -> None:
                 continue
             if kernel.world != successor.world:
                 continue
-            if _pred_devices(graph, kernel, placement) != \
-               _succ_devices(graph, successor, placement):
+            if not _same_device_set(graph, kernel, successor, placement):
                 continue
 
             collective = _create_collective(kernel, successor)
@@ -109,7 +111,9 @@ def _fuse_pairs(graph: ComputeGraph, placement: Placement) -> None:
             else:
                 _replace_pair(graph, kernel, successor, collective)
             changed = True
+            did_change = True
             break
+    return did_change
 
 
 def _replace_pair(
@@ -164,17 +168,20 @@ def _bypass_pair(
     graph.remove_kernel(distributor)
 
 
-def _eliminate_dead(graph: ComputeGraph) -> None:
-    """Remove trivial comm nodes (single-edge fanout/fanin)."""
+def _eliminate_dead(graph: ComputeGraph) -> bool:
+    """Remove trivial comm nodes (single in-edge and single out-edge)."""
     changed = True
+    did_change = False
     while changed:
         changed = False
         for kernel in list(graph.kernels):
-            if not isinstance(kernel, (Scatter, Broadcast, Gather, Reduce)):
+            if not isinstance(kernel, CommKernel):
                 continue
             in_edges = graph._in_edges(kernel)
             out_edges = graph._out_edges(kernel)
             if len(in_edges) == 1 and len(out_edges) == 1:
                 graph.remove_identity(kernel)
                 changed = True
+                did_change = True
                 break
+    return did_change

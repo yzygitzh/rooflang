@@ -1,11 +1,10 @@
-"""Unit tests for rooflang.language.hardware (component + spec)."""
+"""Unit tests for rooflang.language.hardware (component)."""
 
 import pytest
 
 from rooflang.language.hardware.component import (
     Compute, Memory, Fabric, Cluster,
 )
-from rooflang.language.hardware.spec import hardware_spec, HW_B300
 
 
 # ── Component tests ──────────────────────────────────────────────────
@@ -88,18 +87,3 @@ class TestClusterInit:
         c = Cluster(computes=[g], memories=[m], fabrics=[f])
         assert len(c.computes) == 1
         assert len(c.fabrics) == 1
-
-
-# ── Spec tests ───────────────────────────────────────────────────────
-
-
-class TestHardwareSpecFunc:
-    def test_b300_preset(self):
-        hw = hardware_spec("b300")
-        assert hw is HW_B300
-        assert hw.peak_tflops["bf16"] == 2250.0
-        assert hw.peak_bw_gbs == 7750.0
-
-    def test_unknown_preset_raises(self):
-        with pytest.raises(ValueError, match="unknown hardware preset"):
-            hardware_spec("nonexistent")

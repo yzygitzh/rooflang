@@ -1,8 +1,7 @@
 """rooflang.language.hardware — hardware component graph.
 
 Hardware is a graph: Compute/Memory nodes connected by Fabric edges.
-Cluster holds the full topology. spec.py is retained for backward
-compatibility with render.py until the runtime is migrated.
+Cluster holds the full topology.
 """
 
 from rooflang.language.hardware.component import (
@@ -11,12 +10,4 @@ from rooflang.language.hardware.component import (
     Memory,
     Fabric,
     Cluster,
-)
-
-from rooflang.language.hardware.spec import (
-    HardwareSpec,
-    LinkSpec,
-    InterNodeSpec,
-    HW_B300,
-    hardware_spec,
 )

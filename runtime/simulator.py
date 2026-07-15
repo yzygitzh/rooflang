@@ -399,30 +399,31 @@ class Simulator:
         ct = kernel.flops / peak if peak > 0 else 0.0
 
         mt = 0.0
-        for t in list(kernel.inputs.values()) + list(kernel.weights.values()):
-            mem = self._placement.get_tensor_memory(t) \
-                if self._placement.get_tensor_memory(t) \
-                else self._hardware.find_local_memory(device)
-            fab = self._hardware.find_fabric(device, mem)
-            bw = fab.dst_to_src_bandwidth_gbs * 1e3
-            if t.size_bytes > 0 and bw <= 0:
-                raise ValueError(
-                    f"Zero read bandwidth on fabric '{fab.name}' "
-                    f"for tensor with {t.size_bytes} bytes")
-            if bw > 0:
-                mt += t.size_bytes / bw
-        for t in kernel.outputs.values():
-            mem = self._placement.get_tensor_memory(t) \
-                if self._placement.get_tensor_memory(t) \
-                else self._hardware.find_local_memory(device)
-            fab = self._hardware.find_fabric(device, mem)
-            bw = fab.src_to_dst_bandwidth_gbs * 1e3
-            if t.size_bytes > 0 and bw <= 0:
-                raise ValueError(
-                    f"Zero write bandwidth on fabric '{fab.name}' "
-                    f"for tensor with {t.size_bytes} bytes")
-            if bw > 0:
-                mt += t.size_bytes / bw
+        if kernel._requires_placement:
+            for t in list(kernel.inputs.values()) + list(kernel.weights.values()):
+                mem = self._placement.get_tensor_memory(t) \
+                    if self._placement.get_tensor_memory(t) \
+                    else self._hardware.find_local_memory(device)
+                fab = self._hardware.find_fabric(device, mem)
+                bw = fab.dst_to_src_bandwidth_gbs * 1e3
+                if t.size_bytes > 0 and bw <= 0:
+                    raise ValueError(
+                        f"Zero read bandwidth on fabric '{fab.name}' "
+                        f"for tensor with {t.size_bytes} bytes")
+                if bw > 0:
+                    mt += t.size_bytes / bw
+            for t in kernel.outputs.values():
+                mem = self._placement.get_tensor_memory(t) \
+                    if self._placement.get_tensor_memory(t) \
+                    else self._hardware.find_local_memory(device)
+                fab = self._hardware.find_fabric(device, mem)
+                bw = fab.src_to_dst_bandwidth_gbs * 1e3
+                if t.size_bytes > 0 and bw <= 0:
+                    raise ValueError(
+                        f"Zero write bandwidth on fabric '{fab.name}' "
+                        f"for tensor with {t.size_bytes} bytes")
+                if bw > 0:
+                    mt += t.size_bytes / bw
 
         alpha = 0.0
         xfer = 0.0

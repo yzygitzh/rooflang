@@ -1,26 +1,18 @@
-"""Tensor — a shaped, typed array with optional memory location."""
+"""Tensor — a shaped, typed array descriptor."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Tuple
+from typing import Tuple
 
 from rooflang.language.utils import dtype_bytes
 
-if TYPE_CHECKING:
-    from rooflang.language.hardware.component import Memory
 
-
-@dataclass
 class Tensor:
-    """Descriptor for a tensor slot (input, weight, or output).
+    """Descriptor for a tensor slot (input, weight, or output)."""
 
-    Before placement, location is None. After placement, it points to
-    the Memory node where this tensor resides.
-    """
-    dtype: str
-    shape: Tuple[int, ...]
-    location: Memory | None = None
+    def __init__(self, dtype: str, shape: Tuple[int, ...]) -> None:
+        self.dtype = dtype
+        self.shape = shape
 
     @property
     def n_elements(self) -> int:

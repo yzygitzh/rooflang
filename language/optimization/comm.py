@@ -49,8 +49,8 @@ def optimize_comms(graph: ComputeGraph, placement: Placement) -> None:
 def _same_device_set(graph: ComputeGraph, collector: Kernel,
                      distributor: Kernel, placement: Placement) -> bool:
     """Check if collector's predecessors and distributor's successors share the same devices."""
-    preds = sorted((placement.get(e.src).device for e in graph._in_edges(collector)), key=id)
-    succs = sorted((placement.get(e.dst).device for e in graph._out_edges(distributor)), key=id)
+    preds = sorted((placement.get_kernel_device(e.src).device for e in graph._in_edges(collector)), key=id)
+    succs = sorted((placement.get_kernel_device(e.dst).device for e in graph._out_edges(distributor)), key=id)
     if len(preds) != len(succs):
         return False
     return all(a is b for a, b in zip(preds, succs))

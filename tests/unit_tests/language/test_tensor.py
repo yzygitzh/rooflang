@@ -29,20 +29,15 @@ class TestSizeBytes:
 
 
 class TestTensorInit:
-    def test_location_default_none(self):
-        assert Tensor("bf16", (4,)).location is None
+    def test_identity_based_equality(self):
+        t = Tensor("bf16", (4, 4))
+        assert t == t
 
-    def test_location_set(self):
-        assert Tensor("bf16", (4,), location="hbm").location == "hbm"
+    def test_different_instances_not_equal(self):
+        assert Tensor("bf16", (4, 4)) != Tensor("bf16", (4, 4))
 
-    def test_equal(self):
-        assert Tensor("bf16", (4, 4)) == Tensor("bf16", (4, 4))
-
-    def test_different_dtype(self):
-        assert Tensor("bf16", (4, 4)) != Tensor("fp32", (4, 4))
-
-    def test_different_shape(self):
-        assert Tensor("bf16", (4, 4)) != Tensor("bf16", (8, 8))
-
-    def test_different_location(self):
-        assert Tensor("bf16", (4,), location=None) != Tensor("bf16", (4,), location="hbm")
+    def test_hashable_by_identity(self):
+        t1 = Tensor("bf16", (4, 4))
+        t2 = Tensor("bf16", (4, 4))
+        d = {t1: "a", t2: "b"}
+        assert len(d) == 2

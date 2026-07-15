@@ -11,6 +11,7 @@ from rooflang.language.kernels.comm import (
 )
 from rooflang.language.kernels.optimizer import AdamWStep
 from rooflang.language.kernels.identity import Move
+from rooflang.language.hardware.component import Memory
 from rooflang.language.tensor import Tensor
 
 
@@ -39,7 +40,7 @@ class TestKernelToDict:
             "input_bytes": 8.0,
             "weight_bytes": 0.0,
             "output_bytes": 0.0,
-            "inputs": {"x": {"dtype": "bf16", "shape": (4,), "location": None}},
+            "inputs": {"x": {"dtype": "bf16", "shape": (4,)}},
         }
         assert k.to_dict() == expected
 
@@ -346,16 +347,18 @@ class TestAdamWStep(TestKernelBase):
 
 class TestMove(TestKernelBase):
     __test__ = True
-    kernel = Move(Tensor("bf16", (4, 4)), "nvme")
+    _nvme = Memory(name="nvme", capacity_gb=3840.0)
+    kernel = Move(Tensor("bf16", (4, 4)), _nvme)
     expected_flops = 0.0
     expected_input_bytes = 16 * 2.0
     expected_weight_bytes = 0.0
     expected_output_bytes = 16 * 2.0
 
     def test_dst_location(self):
-        assert self.kernel.outputs["dst"].location == "nvme"
+        assert self.kernel.dst_location is self._nvme
 
     def test_preserves_shape_and_dtype(self):
-        m = Move(Tensor("fp32", (8, 16)), "hbm")
+        hbm = Memory(name="hbm", capacity_gb=288.0)
+        m = Move(Tensor("fp32", (8, 16)), hbm)
         assert m.outputs["dst"].dtype == "fp32"
         assert m.outputs["dst"].shape == (8, 16)

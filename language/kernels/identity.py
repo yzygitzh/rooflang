@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.tensor import Tensor
+
+if TYPE_CHECKING:
+    from rooflang.language.hardware.component import Memory
 
 
 class Move(Kernel):
@@ -13,9 +18,9 @@ class Move(Kernel):
     HBM→DRAM, DRAM→HBM, etc.
     """
 
-    def __init__(self, tensor: Tensor, dst_location) -> None:
-        dst = Tensor(dtype=tensor.dtype, shape=tensor.shape,
-                     location=dst_location)
+    def __init__(self, tensor: Tensor, dst_location: Memory) -> None:
+        self.dst_location = dst_location
+        dst = Tensor(dtype=tensor.dtype, shape=tensor.shape)
         super().__init__(
             inputs={"src": tensor},
             outputs={"dst": dst},

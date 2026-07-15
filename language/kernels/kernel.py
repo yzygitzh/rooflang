@@ -68,17 +68,17 @@ class Kernel:
             d["has_side_effect"] = True
         if self.inputs:
             d["inputs"] = {
-                k: {"dtype": v.dtype, "shape": v.shape, "location": v.location}
+                k: {"dtype": v.dtype, "shape": v.shape}
                 for k, v in self.inputs.items()
             }
         if self.weights:
             d["weights"] = {
-                k: {"dtype": v.dtype, "shape": v.shape, "location": v.location}
+                k: {"dtype": v.dtype, "shape": v.shape}
                 for k, v in self.weights.items()
             }
         if self.outputs:
             d["outputs"] = {
-                k: {"dtype": v.dtype, "shape": v.shape, "location": v.location}
+                k: {"dtype": v.dtype, "shape": v.shape}
                 for k, v in self.outputs.items()
             }
         return d

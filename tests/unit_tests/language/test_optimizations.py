@@ -40,14 +40,14 @@ def _build_chain(collector, distributor, n, same_devices=True):
 
     placement = Placement()
     for i, p in enumerate(preds):
-        placement.set(p, gpus[i])
+        placement.set_kernel_device(p, gpus[i])
     if same_devices:
         for i, s in enumerate(succs):
-            placement.set(s, gpus[i])
+            placement.set_kernel_device(s, gpus[i])
     else:
         other_gpus = [Compute(name=f"other{i}") for i in range(n)]
         for i, s in enumerate(succs):
-            placement.set(s, other_gpus[i])
+            placement.set_kernel_device(s, other_gpus[i])
 
     return g, placement, preds, succs
 
@@ -162,8 +162,8 @@ class TestEliminateDead:
         g.add_data_edge(pred, comm, {"y": "x"})
         g.add_data_edge(comm, succ, {"y": "a"})
         p = Placement()
-        p.set(pred, gpu)
-        p.set(succ, gpu)
+        p.set_kernel_device(pred, gpu)
+        p.set_kernel_device(succ, gpu)
         optimize_comms(g, p)
         assert comm not in g.kernels
         assert g._out_edges(pred)[0].dst is succ
@@ -185,8 +185,8 @@ class TestEliminateDead:
         g.add_data_edge(comm, succ0, {"y0": "a"})
         g.add_data_edge(comm, succ1, {"y1": "a"})
         p = Placement()
-        p.set(pred, gpu)
-        p.set(succ0, gpu)
-        p.set(succ1, gpu)
+        p.set_kernel_device(pred, gpu)
+        p.set_kernel_device(succ0, gpu)
+        p.set_kernel_device(succ1, gpu)
         optimize_comms(g, p)
         assert comm in g.kernels

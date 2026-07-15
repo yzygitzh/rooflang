@@ -81,6 +81,11 @@ class TestExportTrace:
         assert ev["pid"] == "gpu0"
         assert ev["tid"] == "stream0"
         assert ev["cat"] == entry.bound.value
+        assert ev["args"]["weight_bytes"] == 0.0
+        assert ev["args"]["mfu"] >= 0.0
+        assert ev["args"]["input_bandwidth_gbs"] >= 0.0
+        assert ev["args"]["weight_bandwidth_gbs"] >= 0.0
+        assert ev["args"]["output_bandwidth_gbs"] >= 0.0
 
     def test_metadata_events_present(self, tmp_path):
         hw, gpu, hbm = _hw()

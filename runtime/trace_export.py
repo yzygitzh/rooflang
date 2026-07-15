@@ -24,18 +24,31 @@ def export_trace(result: SimulationResult, path: str) -> None:
         })
 
     for entry in result.trace:
+        dur_us = entry.end_us - entry.start_us
+        dur_s = dur_us / 1e6 if dur_us > 0 else 0.0
+        kernel = entry.kernel
+        peak_flops = max(entry.device.tflops.values(), default=0.0) * 1e12
+        mfu = kernel.flops / (peak_flops * dur_s) if peak_flops > 0 and dur_s > 0 else 0.0
+        input_bw = kernel.input_bytes / (dur_s * 1e9) if dur_s > 0 else 0.0
+        weight_bw = kernel.weight_bytes / (dur_s * 1e9) if dur_s > 0 else 0.0
+        output_bw = kernel.output_bytes / (dur_s * 1e9) if dur_s > 0 else 0.0
         events.append({
-            "name": type(entry.kernel).__name__,
+            "name": type(kernel).__name__,
             "cat": entry.bound.value,
             "ph": "X",
             "ts": entry.start_us,
-            "dur": entry.end_us - entry.start_us,
+            "dur": dur_us,
             "pid": entry.device.name,
             "tid": f"stream{entry.stream}",
             "args": {
-                "flops": entry.kernel.flops,
-                "input_bytes": entry.kernel.input_bytes,
-                "output_bytes": entry.kernel.output_bytes,
+                "flops": kernel.flops,
+                "input_bytes": kernel.input_bytes,
+                "weight_bytes": kernel.weight_bytes,
+                "output_bytes": kernel.output_bytes,
+                "input_bandwidth_gbs": input_bw,
+                "weight_bandwidth_gbs": weight_bw,
+                "output_bandwidth_gbs": output_bw,
+                "mfu": mfu,
                 "bound": entry.bound.value,
             },
         })

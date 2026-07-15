@@ -245,13 +245,16 @@ class Simulator:
                 p.advance_to(now)
 
     def _resched_peers(self, rk: RunningKernel):
+        seen: Set[RunningKernel] = set()
         for p in self._on_dev.get(rk.device, []):
             if p is not rk:
-                self._push(p.eta(), "end", p.kernel, p.device, p.stream)
+                seen.add(p)
         for fab in rk.fabric_edges:
             for p in self._on_fab.get(fab, []):
                 if p is not rk:
-                    self._push(p.eta(), "end", p.kernel, p.device, p.stream)
+                    seen.add(p)
+        for p in seen:
+            self._push(p.eta(), "end", p.kernel, p.device, p.stream)
 
     # ── Resolution helpers ──────────────────────────────────────────
 
@@ -271,7 +274,10 @@ class Simulator:
             if d not in seen:
                 seen.add(d)
                 devs.append(d)
-        primary = pd[0] if pd else sd[0]
+        primary = pd[0] if pd else sd[0] if sd else None
+        if primary is None:
+            raise ValueError(
+                f"Cannot resolve device for kernel: no placed neighbors")
         stream = 0
         for p in preds:
             if p._requires_placement:

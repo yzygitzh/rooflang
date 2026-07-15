@@ -134,6 +134,8 @@ class Placement:
         mem = self._hardware.find_local_memory(device)
 
         for t in kernel.weights.values():
+            if t in self._memory:
+                continue
             self._memory[t] = mem
 
         for name, t in kernel.inputs.items():

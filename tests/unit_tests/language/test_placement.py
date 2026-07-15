@@ -249,7 +249,7 @@ class TestPlacementTensorMemory:
         assert p.get_tensor_memory(t_in) is nvme
         assert p.get_tensor_memory(t_out) is nvme
 
-    def test_weights_always_reassigned(self):
+    def test_weights_skip_if_set(self):
         hw, gpu, hbm = _simple_hw()
         nvme = Memory(name="nvme", capacity_gb=3840.0)
         t_w = Tensor("bf16", (4096,))
@@ -257,7 +257,7 @@ class TestPlacementTensorMemory:
         p = Placement(hardware=hw)
         p.set_tensor_memory(t_w, nvme)
         p.set_kernel_device(k, gpu)
-        assert p.get_tensor_memory(t_w) is hbm
+        assert p.get_tensor_memory(t_w) is nvme
 
     def test_no_hardware_skips(self):
         t_in = Tensor("bf16", (1024,))

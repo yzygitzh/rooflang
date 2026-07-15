@@ -548,8 +548,13 @@ class HardwareGraph:
 
     def __init__(self) -> None:
         self._graph: nx.Graph = nx.Graph()
+        self._names: Set[str] = set()
 
     def add_node(self, component: HardwareComponent) -> None:
+        if component.name in self._names:
+            raise ValueError(
+                f"Duplicate hardware component name: '{component.name}'")
+        self._names.add(component.name)
         self._graph.add_node(component)
 
     def add_edge(self, edge: FabricEdge) -> None:

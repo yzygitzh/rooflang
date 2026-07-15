@@ -89,6 +89,12 @@ class TestHardwareGraphConstruction:
         assert g in hw.nodes
         assert m in hw.nodes
 
+    def test_duplicate_name_rejected(self):
+        hw = HardwareGraph()
+        hw.add_node(Compute(name="gpu0"))
+        with pytest.raises(ValueError, match="Duplicate hardware component name"):
+            hw.add_node(Memory(name="gpu0", capacity_gb=80.0))
+
 
 # ── Helpers ─────────────────────────────────────────────────────────
 

@@ -8,20 +8,47 @@ Stream semantics: kernels on the same (device, stream) execute serially.
 from __future__ import annotations
 
 import heapq
+from collections import defaultdict
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Set, Tuple
 
 from rooflang.language.graph import ComputeGraph, FabricEdge, HardwareGraph
-from rooflang.language.hardware.component import Compute
+from rooflang.language.hardware.component import Compute, Memory
 from rooflang.language.kernels.comm import AllToAll, CommKernel, Recv, Send
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.placement import Placement
+from rooflang.language.tensor import Tensor
 
 
 class Bound(Enum):
     COMPUTE = "compute"
     MEMORY = "memory"
     NETWORK = "network"
+
+
+@dataclass
+class TensorInfo:
+    """A tensor alive in memory at the time of OOM."""
+    tensor: Tensor
+    size_bytes: float
+    role: str  # "weight", "output", "root_input"
+
+
+class OOMError(Exception):
+    """Raised when a Memory node exceeds capacity during simulation."""
+
+    def __init__(self, memory: Memory, used_bytes: float,
+                 capacity_bytes: float, alive_tensors: List[TensorInfo],
+                 trigger_kernel: Kernel) -> None:
+        self.memory = memory
+        self.used_bytes = used_bytes
+        self.capacity_bytes = capacity_bytes
+        self.alive_tensors = alive_tensors
+        self.trigger_kernel = trigger_kernel
+        super().__init__(
+            f"OOM on '{memory.name}': {used_bytes / 1e9:.2f} GB used, "
+            f"{capacity_bytes / 1e9:.2f} GB capacity")
 
 
 class TraceEntry:
@@ -37,9 +64,11 @@ class TraceEntry:
 
 
 class SimulationResult:
-    def __init__(self, trace: List[TraceEntry], total_time_us: float):
+    def __init__(self, trace: List[TraceEntry], total_time_us: float,
+                 peak_memory: Dict[Memory, float]):
         self.trace = trace
         self.total_time_us = total_time_us
+        self.peak_memory = peak_memory
 
 
 class RunningKernel:
@@ -130,6 +159,42 @@ class Simulator:
         self._stream_active: Dict[Tuple[Compute, int], RunningKernel] = {}
         self._stream_pending: Dict[Tuple[Compute, int], List[Kernel]] = {}
 
+        # ── Memory tracking init ────────────────────────────────────
+        self._mem_usage: Dict[Memory, float] = defaultdict(float)
+        self._mem_peak: Dict[Memory, float] = defaultdict(float)
+        self._out_refcount: Dict[Tensor, int] = defaultdict(int)
+        self._root_inputs: Dict[Kernel, List[Tensor]] = {}
+        self._alive: Dict[Memory, Set[Tuple[Tensor, str]]] = defaultdict(set)
+
+        for kernel in self._graph.kernels:
+            for edge in self._graph._out_edges(kernel):
+                for out_name in edge.mapping:
+                    t = kernel.outputs[out_name]
+                    self._out_refcount[t] += 1
+
+        for kernel in self._graph.kernels:
+            for t in kernel.weights.values():
+                mem = self._placement.get_tensor_memory(t)
+                if mem is not None:
+                    self._mem_usage[mem] += t.size_bytes
+                    self._alive[mem].add((t, "weight"))
+            has_data_preds = bool(self._graph._in_edges(kernel))
+            if not has_data_preds:
+                inputs_for_kernel = []
+                for t in kernel.inputs.values():
+                    mem = self._placement.get_tensor_memory(t)
+                    if mem is not None:
+                        self._mem_usage[mem] += t.size_bytes
+                        self._alive[mem].add((t, "root_input"))
+                        inputs_for_kernel.append(t)
+                if inputs_for_kernel:
+                    self._root_inputs[kernel] = inputs_for_kernel
+
+        for mem, usage in self._mem_usage.items():
+            self._mem_peak[mem] = usage
+            self._check_oom(mem, None)
+
+        # ── Schedule root kernels ───────────────────────────────────
         for kernel in self._graph.topological_sort():
             if not list(self._graph._dag.predecessors(kernel)):
                 dev, stream, _, _ = self._resolve(kernel)
@@ -158,6 +223,7 @@ class Simulator:
                 self._stream_end[(dev, stream)] = now
                 self._trace.append(TraceEntry(
                     kernel, dev, stream, rk.start_us, now, rk.bound()))
+                self._complete_kernel_memory(kernel)
                 self._finish_kernel(rk, now)
                 for succ in self._graph._dag.successors(kernel):
                     if succ in self._completed:
@@ -170,7 +236,7 @@ class Simulator:
                         self._push(max(t, sr), "start", succ, s_dev, s_strm)
 
         total = max(self._kernel_end.values()) if self._kernel_end else 0.0
-        return SimulationResult(self._trace, total)
+        return SimulationResult(self._trace, total, dict(self._mem_peak))
 
     # ── Event queue ─────────────────────────────────────────────────
 
@@ -190,6 +256,7 @@ class Simulator:
         self._on_dev.setdefault(dev, []).append(rk)
         for fab in fabs:
             self._on_fab.setdefault(fab, []).append(rk)
+        self._allocate_outputs(kernel)
         self._advance_peers(rk, now)
         self._recompute_shares(rk)
         self._push(rk.eta(), "end", kernel, dev, stream)
@@ -216,7 +283,43 @@ class Simulator:
                 self._push(now, "start", next_k, rk.device, rk.stream)
                 break
 
-    # ── Resource sharing ────────────────────────────────────────────
+    # ── Memory tracking ────────────────────────────────────────────
+
+    def _allocate_outputs(self, kernel: Kernel) -> None:
+        for t in kernel.outputs.values():
+            mem = self._placement.get_tensor_memory(t)
+            if mem is None:
+                continue
+            self._mem_usage[mem] += t.size_bytes
+            self._alive[mem].add((t, "output"))
+            if self._mem_usage[mem] > self._mem_peak[mem]:
+                self._mem_peak[mem] = self._mem_usage[mem]
+            self._check_oom(mem, kernel)
+
+    def _complete_kernel_memory(self, kernel: Kernel) -> None:
+        for edge in self._graph._in_edges(kernel):
+            for out_name in edge.mapping:
+                src_t = edge.src.outputs[out_name]
+                self._out_refcount[src_t] -= 1
+                if self._out_refcount[src_t] == 0:
+                    mem = self._placement.get_tensor_memory(src_t)
+                    if mem is not None:
+                        self._mem_usage[mem] -= src_t.size_bytes
+                        self._alive[mem].discard((src_t, "output"))
+        if kernel in self._root_inputs:
+            for t in self._root_inputs[kernel]:
+                mem = self._placement.get_tensor_memory(t)
+                if mem is not None:
+                    self._mem_usage[mem] -= t.size_bytes
+                    self._alive[mem].discard((t, "root_input"))
+
+    def _check_oom(self, mem: Memory, trigger_kernel: Kernel | None) -> None:
+        capacity_bytes = mem.capacity_gb * 1e9
+        if self._mem_usage[mem] > capacity_bytes:
+            alive = [TensorInfo(t, t.size_bytes, role)
+                     for t, role in self._alive[mem]]
+            raise OOMError(mem, self._mem_usage[mem], capacity_bytes,
+                           alive, trigger_kernel)
 
     def _recompute_shares(self, rk: RunningKernel):
         peers = self._on_dev.get(rk.device, [])

@@ -1,5 +1,8 @@
 """B300 Cluster A preset."""
 
+from collections import Counter
+from typing import List
+
 from rooflang.language.hardware.component import Compute, Memory
 from rooflang.language.graph import FabricEdge, HardwareGraph
 
@@ -130,3 +133,12 @@ class B300ClusterA(HardwareGraph):
                 dst_to_src_bandwidth_gbs=7.0,
                 is_full_duplex=True, alpha_us=50.0,
             ))
+
+    def find_aggregate_bandwidth(self, devices: List[Compute]) -> float:
+        """B300 aggregate BW: NVLink intra-node, multi-rail IB inter-node."""
+        if len(devices) < 2:
+            return float("inf")
+        nodes = Counter(d.name.split("-")[0] for d in devices)
+        if len(nodes) == 1:
+            return 900.0
+        return min(nodes.values()) * 100.0

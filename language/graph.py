@@ -616,6 +616,21 @@ class HardwareGraph:
             alpha_us=total_alpha,
         )
 
+    def find_fabric_path(
+        self, src: HardwareComponent, dst: HardwareComponent,
+    ) -> List[FabricEdge]:
+        """Return the list of actual FabricEdge objects on the shortest path."""
+        if src is dst:
+            return []
+        try:
+            path = nx.shortest_path(self._graph, src, dst)
+        except nx.NetworkXNoPath:
+            raise ValueError(f"No path between {src.name} and {dst.name}")
+        hops: List[FabricEdge] = []
+        for i in range(len(path) - 1):
+            hops.append(self._best_fabric(path[i], path[i + 1]))
+        return hops
+
     def find_local_memory(self, device: Compute) -> Memory:
         """Find the Memory node connected to device with highest bandwidth."""
         best_mem: Optional[Memory] = None
@@ -632,6 +647,36 @@ class HardwareGraph:
         if best_mem is None:
             raise ValueError(f"No memory attached to device: {device.name}")
         return best_mem
+
+    def find_aggregate_bandwidth(self, devices: List[Compute]) -> float:
+        """Aggregate bandwidth for ring/tree collectives among devices.
+
+        Default: returns min pair BW (conservative, no multi-rail benefit).
+        Override in subclass for topologies with multiple parallel inter-node
+        links (e.g. return sum of per-NIC BWs for multi-rail IB).
+        """
+        if len(devices) < 2:
+            return float("inf")
+        min_bw = float("inf")
+        for i, d1 in enumerate(devices):
+            for d2 in devices[i + 1:]:
+                fab = self.find_fabric(d1, d2)
+                bw = min(fab.src_to_dst_bandwidth_gbs, fab.dst_to_src_bandwidth_gbs)
+                if bw < min_bw:
+                    min_bw = bw
+        return min_bw
+
+    def find_aggregate_latency(self, devices: List[Compute]) -> float:
+        """Max path latency (diameter) among all pairs in the device group."""
+        if len(devices) < 2:
+            return 0.0
+        max_alpha = 0.0
+        for i, d1 in enumerate(devices):
+            for d2 in devices[i + 1:]:
+                fab = self.find_fabric(d1, d2)
+                if fab.alpha_us > max_alpha:
+                    max_alpha = fab.alpha_us
+        return max_alpha
 
     def _best_fabric(self, a: HardwareComponent, b: HardwareComponent) -> FabricEdge:
         """Pick the highest-bandwidth fabric between two adjacent nodes."""

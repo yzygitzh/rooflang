@@ -8,7 +8,7 @@ from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.kernels.comm import AllReduce
 from rooflang.language.placement import Placement
 from rooflang.language.tensor import Tensor
-from rooflang.runtime.simulator import Bound, Simulator
+from rooflang.runtime.simulator import Bound, OOMError, Simulator
 
 
 # ── Test helpers ─────────────────────────────────────────────────────
@@ -375,3 +375,113 @@ class TestEdgeCases:
         result = _sim(g, p, hw)
         assert result.total_time_us == 0.0
         assert result.trace == []
+
+
+# ── OOM detection ───────────────────────────────────────────────────
+
+
+def _hw_small(capacity_gb=0.001, read_bw=1000.0, write_bw=1000.0, tflops=1.0):
+    """Single GPU + small HBM for OOM tests."""
+    gpu = Compute(name="gpu0", tflops={"bf16": tflops})
+    hbm = Memory(name="hbm", capacity_gb=capacity_gb)
+    hw = HardwareGraph()
+    hw.add_node(gpu)
+    hw.add_node(hbm)
+    hw.add_edge(FabricEdge(name="hbm_link", src=gpu, dst=hbm,
+                           src_to_dst_bandwidth_gbs=write_bw,
+                           dst_to_src_bandwidth_gbs=read_bw,
+                           is_full_duplex=False))
+    return hw, gpu, hbm
+
+
+class TestOOM:
+    def test_no_overflow(self):
+        hw, gpu, hbm = _hw(read_bw=1000.0, write_bw=1000.0, tflops=1.0)
+        t_in = Tensor("bf16", (4,))
+        k = SyntheticKernel(flops_val=0.0, inputs={"x": t_in})
+        g = ComputeGraph()
+        g.add_kernel(k)
+        p = Placement(hardware=hw)
+        p.set_kernel_device(k, gpu)
+        result = _sim(g, p, hw)
+        assert hbm in result.peak_memory
+        assert result.peak_memory[hbm] == t_in.size_bytes
+
+    def test_oom_raises(self):
+        hw, gpu, hbm = _hw_small(capacity_gb=0.000001)  # 1000 bytes
+        # output = 10000 bf16 elements = 20000 bytes > 1000
+        t_in = Tensor("bf16", (1,))
+        t_out = Tensor("bf16", (10000,))
+        k = SyntheticKernel(flops_val=0.0, inputs={"x": t_in},
+                            outputs={"y": t_out})
+        g = ComputeGraph()
+        g.add_kernel(k)
+        p = Placement(hardware=hw)
+        p.set_kernel_device(k, gpu)
+        with pytest.raises(OOMError) as exc_info:
+            _sim(g, p, hw)
+        err = exc_info.value
+        assert err.memory is hbm
+        assert err.used_bytes > err.capacity_bytes
+        assert err.trigger_kernel is k
+        assert len(err.alive_tensors) > 0
+
+    def test_weight_counted_in_peak(self):
+        hw, gpu, hbm = _hw(read_bw=1000.0, write_bw=1000.0, tflops=1.0)
+        t_w = Tensor("fp32", (1000,))  # 4000 bytes
+        t_in = Tensor("bf16", (1,))
+        k = SyntheticKernel(flops_val=0.0, inputs={"x": t_in},
+                            weights={"W": t_w})
+        g = ComputeGraph()
+        g.add_kernel(k)
+        p = Placement(hardware=hw)
+        p.set_kernel_device(k, gpu)
+        result = _sim(g, p, hw)
+        assert result.peak_memory[hbm] >= t_w.size_bytes
+
+    def test_output_freed_after_consumer(self):
+        hw, gpu, hbm = _hw(read_bw=1000.0, write_bw=1000.0, tflops=1.0)
+        # k1 → k2 → k3: k1's output freed after k2 completes
+        t1_out = Tensor("bf16", (500,))  # 1000 bytes
+        t2_in = Tensor("bf16", (500,))
+        t2_out = Tensor("bf16", (500,))
+        t3_in = Tensor("bf16", (500,))
+        k1 = SyntheticKernel(flops_val=1e6, outputs={"y": t1_out})
+        k2 = SyntheticKernel(flops_val=1e6, inputs={"x": t2_in},
+                             outputs={"y": t2_out})
+        k3 = SyntheticKernel(flops_val=1e6, inputs={"x": t3_in})
+        g = ComputeGraph()
+        g.add_kernel(k1)
+        g.add_kernel(k2)
+        g.add_kernel(k3)
+        g.add_data_edge(k1, k2, {"y": "x"})
+        g.add_data_edge(k2, k3, {"y": "x"})
+        p = Placement(hardware=hw, graph=g)
+        p.set_kernel_device(k1, gpu)
+        p.set_kernel_device(k2, gpu)
+        p.set_kernel_device(k3, gpu)
+        result = _sim(g, p, hw)
+        # Peak should be 2 * 1000 (k1.out + k2.out alive simultaneously)
+        # not 3 * 1000 (all three alive at once)
+        assert result.peak_memory[hbm] == pytest.approx(2000.0)
+
+    def test_root_input_freed_after_kernel(self):
+        hw, gpu, hbm = _hw(read_bw=1000.0, write_bw=1000.0, tflops=1.0)
+        # k1 (root, has input) → k2: k1's input freed after k1 completes
+        t1_in = Tensor("bf16", (2000,))  # 4000 bytes
+        t1_out = Tensor("bf16", (1,))    # 2 bytes
+        t2_in = Tensor("bf16", (1,))
+        k1 = SyntheticKernel(flops_val=1e6, inputs={"x": t1_in},
+                             outputs={"y": t1_out})
+        k2 = SyntheticKernel(flops_val=1e6, inputs={"x": t2_in})
+        g = ComputeGraph()
+        g.add_kernel(k1)
+        g.add_kernel(k2)
+        g.add_data_edge(k1, k2, {"y": "x"})
+        p = Placement(hardware=hw, graph=g)
+        p.set_kernel_device(k1, gpu)
+        p.set_kernel_device(k2, gpu)
+        result = _sim(g, p, hw)
+        # Peak = t1_in (4000) + t1_out (2) at the start of k1
+        # After k1 completes: t1_in freed, only t1_out (2) alive
+        assert result.peak_memory[hbm] == pytest.approx(4002.0)

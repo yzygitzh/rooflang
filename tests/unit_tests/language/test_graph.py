@@ -391,6 +391,238 @@ class TestSplitKernel:
                            k, 2)
 
 
+# ── Mutation: dedup ──────────────────────────────────────────────────
+
+
+class TestDedup:
+    @staticmethod
+    def _dedup_class(kernel_list):
+        survivor = Kernel(
+            inputs=dict(kernel_list[0].inputs),
+            outputs={k: Tensor(v.dtype, v.shape)
+                     for k, v in kernel_list[0].outputs.items()},
+        )
+        n_outs = len(kernel_list)
+        post = Kernel(
+            inputs={k: Tensor(v.dtype, v.shape)
+                    for k, v in survivor.outputs.items()},
+            outputs={f"o{i}": Tensor("bf16", (4, 4)) for i in range(n_outs)},
+        )
+        return survivor, post
+
+    def test_basic(self):
+        g = ComputeGraph()
+        k1 = make_kernel(outs=["y"])
+        k2 = make_kernel(outs=["y"])
+        s1 = make_kernel(ins=["x"])
+        s2 = make_kernel(ins=["x"])
+        g.add_kernel(k1)
+        g.add_kernel(k2)
+        g.add_kernel(s1)
+        g.add_kernel(s2)
+        g.add_data_edge(k1, s1, {"y": "x"})
+        g.add_data_edge(k2, s2, {"y": "x"})
+
+        survivor, post = g.dedup(self._dedup_class, [k1, k2])
+        assert k1 not in g.kernels
+        assert k2 not in g.kernels
+        assert survivor in g.kernels
+        assert post in g.kernels
+        assert g._out_edges(survivor)[0].dst is post
+        post_outs = g._out_edges(post)
+        dsts = {e.dst for e in post_outs}
+        assert dsts == {s1, s2}
+
+    def test_with_broadcast_predecessor(self):
+        g = ComputeGraph()
+        from rooflang.language.kernels.comm import Broadcast as BcastKernel
+        bcast = BcastKernel(bytes_per_rank=64.0, world=2)
+        bcast.inputs = {"x": Tensor("bf16", (4, 4))}
+        bcast.outputs = {"o1": Tensor("bf16", (4, 4)),
+                         "o2": Tensor("bf16", (4, 4))}
+        pred = make_kernel(outs=["x"])
+        k1 = make_kernel(ins=["x"], outs=["z"])
+        k2 = make_kernel(ins=["x"], outs=["z"])
+        s1 = make_kernel(ins=["w"])
+        s2 = make_kernel(ins=["w"])
+        g.add_kernel(pred)
+        g.add_kernel(bcast)
+        g.add_kernel(k1)
+        g.add_kernel(k2)
+        g.add_kernel(s1)
+        g.add_kernel(s2)
+        g.add_data_edge(pred, bcast, {"x": "x"})
+        g.add_data_edge(bcast, k1, {"o1": "x"})
+        g.add_data_edge(bcast, k2, {"o2": "x"})
+        g.add_data_edge(k1, s1, {"z": "w"})
+        g.add_data_edge(k2, s2, {"z": "w"})
+
+        survivor, post = g.dedup(self._dedup_class, [k1, k2])
+        assert bcast not in g.kernels
+        assert survivor in g.kernels
+        assert g._in_edges(survivor)[0].src is pred
+
+    def test_less_than_2_raises(self):
+        g = ComputeGraph()
+        k = make_kernel(outs=["y"])
+        g.add_kernel(k)
+        with pytest.raises(ValueError, match="at least 2"):
+            g.dedup(self._dedup_class, [k])
+
+    def test_side_effect_raises(self):
+        g = ComputeGraph()
+        k1 = make_kernel(outs=["y"], side_effect=True)
+        k2 = make_kernel(outs=["y"])
+        g.add_kernel(k1)
+        g.add_kernel(k2)
+        with pytest.raises(ValueError, match="side effect"):
+            g.dedup(self._dedup_class, [k1, k2])
+
+    def test_non_identical_raises(self):
+        g = ComputeGraph()
+        k1 = Kernel(outputs={"y": Tensor("bf16", (4, 4))})
+        k2 = Kernel(outputs={"y": Tensor("bf16", (8, 8))})
+        g.add_kernel(k1)
+        g.add_kernel(k2)
+        with pytest.raises(ValueError, match="not computationally identical"):
+            g.dedup(self._dedup_class, [k1, k2])
+
+    def test_mixed_root_non_root_raises(self):
+        g = ComputeGraph()
+        from rooflang.language.kernels.comm import Broadcast as BcastKernel
+        bcast = BcastKernel(bytes_per_rank=64.0, world=2)
+        bcast.outputs = {"o1": Tensor("bf16", (4, 4))}
+        k1 = make_kernel(ins=["x"], outs=["y"])
+        k2 = make_kernel(ins=["x"], outs=["y"])
+        g.add_kernel(bcast)
+        g.add_kernel(k1)
+        g.add_kernel(k2)
+        g.add_data_edge(bcast, k1, {"o1": "x"})
+        with pytest.raises(ValueError, match="mixed root"):
+            g.dedup(self._dedup_class, [k1, k2])
+
+    def test_different_broadcast_raises(self):
+        g = ComputeGraph()
+        from rooflang.language.kernels.comm import Broadcast as BcastKernel
+        b1 = BcastKernel(bytes_per_rank=64.0, world=2)
+        b1.outputs = {"o1": Tensor("bf16", (4, 4))}
+        b2 = BcastKernel(bytes_per_rank=64.0, world=2)
+        b2.outputs = {"o1": Tensor("bf16", (4, 4))}
+        k1 = make_kernel(ins=["x"], outs=["y"])
+        k2 = make_kernel(ins=["x"], outs=["y"])
+        g.add_kernel(b1)
+        g.add_kernel(b2)
+        g.add_kernel(k1)
+        g.add_kernel(k2)
+        g.add_data_edge(b1, k1, {"o1": "x"})
+        g.add_data_edge(b2, k2, {"o1": "x"})
+        with pytest.raises(ValueError, match="different Broadcast"):
+            g.dedup(self._dedup_class, [k1, k2])
+
+    def test_invalid_predecessor_raises(self):
+        g = ComputeGraph()
+        pred = make_kernel(outs=["y1", "y2"])
+        k1 = make_kernel(ins=["x"], outs=["z"])
+        k2 = make_kernel(ins=["x"], outs=["z"])
+        g.add_kernel(pred)
+        g.add_kernel(k1)
+        g.add_kernel(k2)
+        g.add_data_edge(pred, k1, {"y1": "x"})
+        g.add_data_edge(pred, k2, {"y2": "x"})
+        with pytest.raises(ValueError, match="single Broadcast predecessor"):
+            g.dedup(self._dedup_class, [k1, k2])
+
+
+# ── Mutation: dup ────────────────────────────────────────────────────
+
+
+class TestDup:
+    def test_basic(self):
+        g = ComputeGraph()
+        from rooflang.language.kernels.comm import Broadcast as BcastKernel
+        pred = make_kernel(outs=["y"])
+        k = make_kernel(ins=["x"], outs=["z"])
+        bcast = BcastKernel(bytes_per_rank=64.0, world=2)
+        bcast.inputs = {"z": Tensor("bf16", (4, 4))}
+        bcast.outputs = {"o1": Tensor("bf16", (4, 4)),
+                         "o2": Tensor("bf16", (4, 4))}
+        s1 = make_kernel(ins=["w"])
+        s2 = make_kernel(ins=["w"])
+        g.add_kernel(pred)
+        g.add_kernel(k)
+        g.add_kernel(bcast)
+        g.add_kernel(s1)
+        g.add_kernel(s2)
+        g.add_data_edge(pred, k, {"y": "x"})
+        g.add_data_edge(k, bcast, {"z": "z"})
+        g.add_data_edge(bcast, s1, {"o1": "w"})
+        g.add_data_edge(bcast, s2, {"o2": "w"})
+
+        def dup_class(kernel, n):
+            pre = Kernel(
+                inputs=dict(kernel.inputs),
+                outputs={f"o{i}_{j}": Tensor("bf16", (4, 4))
+                         for i in range(n) for j in kernel.inputs},
+            )
+            copies = [make_kernel(ins=list(kernel.inputs),
+                                  outs=list(kernel.outputs))
+                      for _ in range(n)]
+            return pre, copies
+
+        pre, copies = g.dup(dup_class, k)
+        assert k not in g.kernels
+        assert bcast not in g.kernels
+        assert pre in g.kernels
+        assert all(c in g.kernels for c in copies)
+        assert len(copies) == 2
+        assert g._in_edges(pre)[0].src is pred
+        for c, s in zip(copies, [s1, s2]):
+            assert g._out_edges(c)[0].dst is s
+
+    def test_side_effect_raises(self):
+        g = ComputeGraph()
+        k = make_kernel(outs=["z"], side_effect=True)
+        g.add_kernel(k)
+        with pytest.raises(ValueError, match="side effect"):
+            g.dup(lambda ker, n: None, k)
+
+    def test_no_broadcast_successor_raises(self):
+        g = ComputeGraph()
+        k = make_kernel(outs=["z"])
+        succ = make_kernel(ins=["w"])
+        g.add_kernel(k)
+        g.add_kernel(succ)
+        g.add_data_edge(k, succ, {"z": "w"})
+        with pytest.raises(ValueError, match="must be a Broadcast"):
+            g.dup(lambda ker, n: None, k)
+
+    def test_wrong_copy_count_raises(self):
+        g = ComputeGraph()
+        from rooflang.language.kernels.comm import Broadcast as BcastKernel
+        k = make_kernel(ins=["x"], outs=["z"])
+        bcast = BcastKernel(bytes_per_rank=64.0, world=2)
+        bcast.inputs = {"z": Tensor("bf16", (4, 4))}
+        bcast.outputs = {"o1": Tensor("bf16", (4, 4)),
+                         "o2": Tensor("bf16", (4, 4))}
+        s1 = make_kernel(ins=["w"])
+        s2 = make_kernel(ins=["w"])
+        g.add_kernel(k)
+        g.add_kernel(bcast)
+        g.add_kernel(s1)
+        g.add_kernel(s2)
+        g.add_data_edge(k, bcast, {"z": "z"})
+        g.add_data_edge(bcast, s1, {"o1": "w"})
+        g.add_data_edge(bcast, s2, {"o2": "w"})
+
+        def bad_dup(kernel, n):
+            pre = make_kernel(ins=["x"], outs=["o0_x"])
+            copies = [make_kernel(ins=["x"], outs=["z"])]
+            return pre, copies
+
+        with pytest.raises(ValueError, match="expected 2"):
+            g.dup(bad_dup, k)
+
+
 # ── Query: topological_sort ───────────────────────────────────────────
 
 

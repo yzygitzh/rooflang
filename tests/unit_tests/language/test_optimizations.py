@@ -190,3 +190,122 @@ class TestEliminateDead:
         p.set_kernel_device(succ1, gpu)
         optimize_comms(g, p)
         assert comm in g.kernels
+
+
+# ── Guard clause tests (_fuse_pairs skips) ───────────────────────────
+
+
+class TestFusePairsGuards:
+    def test_collector_multi_out_edges_no_fuse(self):
+        g = ComputeGraph()
+        gpus = [Compute(name=f"gpu{i}") for i in range(2)]
+        preds = [Kernel(outputs={"y": SHARD}) for _ in range(2)]
+        r = Reduce(bytes_per_rank=128.0, world=2, dtype="bf16")
+        r.inputs = {"x0": SHARD, "x1": SHARD}
+        r.outputs = {"z": SHARD, "z2": SHARD}
+        b = Broadcast(bytes_per_rank=128.0, world=2)
+        b.inputs = {"z": SHARD}
+        b.outputs = {"y0": SHARD, "y1": SHARD}
+        extra = Kernel(inputs={"q": SHARD})
+        succs = [Kernel(inputs={"a": SHARD}) for _ in range(2)]
+        for k in preds + [r, b, extra] + succs:
+            g.add_kernel(k)
+        for i, p in enumerate(preds):
+            g.add_data_edge(p, r, {"y": f"x{i}"})
+        g.add_data_edge(r, b, {"z": "z"})
+        g.add_data_edge(r, extra, {"z2": "q"})
+        for i, s in enumerate(succs):
+            g.add_data_edge(b, s, {f"y{i}": "a"})
+        p = Placement()
+        for i, pred in enumerate(preds):
+            p.set_kernel_device(pred, gpus[i])
+        for i, s in enumerate(succs):
+            p.set_kernel_device(s, gpus[i])
+        p.set_kernel_device(extra, gpus[0])
+        optimize_comms(g, p)
+        assert r in g.kernels
+        assert b in g.kernels
+
+    def test_succ_multi_in_edges_no_fuse(self):
+        g = ComputeGraph()
+        gpus = [Compute(name=f"gpu{i}") for i in range(2)]
+        preds = [Kernel(outputs={"y": SHARD}) for _ in range(2)]
+        r = Reduce(bytes_per_rank=128.0, world=2, dtype="bf16")
+        r.inputs = {"x0": SHARD, "x1": SHARD}
+        r.outputs = {"z": SHARD}
+        b = Broadcast(bytes_per_rank=128.0, world=2)
+        b.inputs = {"z": SHARD, "q": SHARD}
+        b.outputs = {"y0": SHARD, "y1": SHARD}
+        extra = Kernel(outputs={"q": SHARD})
+        succs = [Kernel(inputs={"a": SHARD}) for _ in range(2)]
+        for k in preds + [r, b, extra] + succs:
+            g.add_kernel(k)
+        for i, p in enumerate(preds):
+            g.add_data_edge(p, r, {"y": f"x{i}"})
+        g.add_data_edge(r, b, {"z": "z"})
+        g.add_data_edge(extra, b, {"q": "q"})
+        for i, s in enumerate(succs):
+            g.add_data_edge(b, s, {f"y{i}": "a"})
+        p = Placement()
+        for i, pred in enumerate(preds):
+            p.set_kernel_device(pred, gpus[i])
+        for i, s in enumerate(succs):
+            p.set_kernel_device(s, gpus[i])
+        p.set_kernel_device(extra, gpus[0])
+        optimize_comms(g, p)
+        assert r in g.kernels
+        assert b in g.kernels
+
+    def test_world_mismatch_no_fuse(self):
+        g = ComputeGraph()
+        gpus = [Compute(name=f"gpu{i}") for i in range(2)]
+        preds = [Kernel(outputs={"y": SHARD}) for _ in range(2)]
+        r = Reduce(bytes_per_rank=128.0, world=2, dtype="bf16")
+        r.inputs = {"x0": SHARD, "x1": SHARD}
+        r.outputs = {"z": SHARD}
+        b = Broadcast(bytes_per_rank=128.0, world=4)
+        b.inputs = {"z": SHARD}
+        b.outputs = {"y0": SHARD, "y1": SHARD}
+        succs = [Kernel(inputs={"a": SHARD}) for _ in range(2)]
+        for k in preds + [r, b] + succs:
+            g.add_kernel(k)
+        for i, p in enumerate(preds):
+            g.add_data_edge(p, r, {"y": f"x{i}"})
+        g.add_data_edge(r, b, {"z": "z"})
+        for i, s in enumerate(succs):
+            g.add_data_edge(b, s, {f"y{i}": "a"})
+        p = Placement()
+        for i, pred in enumerate(preds):
+            p.set_kernel_device(pred, gpus[i])
+        for i, s in enumerate(succs):
+            p.set_kernel_device(s, gpus[i])
+        optimize_comms(g, p)
+        assert r in g.kernels
+        assert b in g.kernels
+
+    def test_pred_succ_length_mismatch_no_fuse(self):
+        g = ComputeGraph()
+        gpus = [Compute(name=f"gpu{i}") for i in range(3)]
+        preds = [Kernel(outputs={"y": SHARD}) for _ in range(3)]
+        r = Reduce(bytes_per_rank=128.0, world=3, dtype="bf16")
+        r.inputs = {f"x{i}": SHARD for i in range(3)}
+        r.outputs = {"z": SHARD}
+        b = Broadcast(bytes_per_rank=128.0, world=3)
+        b.inputs = {"z": SHARD}
+        b.outputs = {"y0": SHARD, "y1": SHARD}
+        succs = [Kernel(inputs={"a": SHARD}) for _ in range(2)]
+        for k in preds + [r, b] + succs:
+            g.add_kernel(k)
+        for i, p in enumerate(preds):
+            g.add_data_edge(p, r, {"y": f"x{i}"})
+        g.add_data_edge(r, b, {"z": "z"})
+        for i, s in enumerate(succs):
+            g.add_data_edge(b, s, {f"y{i}": "a"})
+        p = Placement()
+        for i, pred in enumerate(preds):
+            p.set_kernel_device(pred, gpus[i])
+        for i, s in enumerate(succs):
+            p.set_kernel_device(s, gpus[i])
+        optimize_comms(g, p)
+        assert r in g.kernels
+        assert b in g.kernels

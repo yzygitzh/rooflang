@@ -50,6 +50,17 @@ class TestKernelToDict:
     def test_no_side_effect_excluded(self):
         assert "has_side_effect" not in Kernel().to_dict()
 
+    def test_weights_and_outputs_included(self):
+        k = Kernel(
+            weights={"W": Tensor("bf16", (8, 8))},
+            outputs={"y": Tensor("fp32", (4,))},
+        )
+        d = k.to_dict()
+        assert "weights" in d
+        assert d["weights"] == {"W": {"dtype": "bf16", "shape": (8, 8)}}
+        assert "outputs" in d
+        assert d["outputs"] == {"y": {"dtype": "fp32", "shape": (4,)}}
+
 
 # ── Shared base for all kernel subclass tests ────────────────────────
 

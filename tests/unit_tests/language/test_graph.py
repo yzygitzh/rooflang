@@ -98,6 +98,24 @@ class TestAddDataEdge:
         with pytest.raises(ValueError):
             g.add_data_edge(a, b, {})
 
+    def test_invalid_output_key_raises(self):
+        g = ComputeGraph()
+        a = make_kernel(outs=["y"])
+        b = make_kernel(ins=["x"])
+        g.add_kernel(a)
+        g.add_kernel(b)
+        with pytest.raises(ValueError, match="not in src.outputs"):
+            g.add_data_edge(a, b, {"bad": "x"})
+
+    def test_invalid_input_key_raises(self):
+        g = ComputeGraph()
+        a = make_kernel(outs=["y"])
+        b = make_kernel(ins=["x"])
+        g.add_kernel(a)
+        g.add_kernel(b)
+        with pytest.raises(ValueError, match="not in dst.inputs"):
+            g.add_data_edge(a, b, {"y": "bad"})
+
     def test_merge_existing_edge(self):
         g = ComputeGraph()
         a = make_kernel(outs=["y1", "y2"])
@@ -165,6 +183,14 @@ class TestRemoveControlEdge:
         g.add_kernel(b)
         g.add_data_edge(a, b, {"y": "x"})
         with pytest.raises(ValueError):
+            g.remove_control_edge(a, b)
+
+    def test_no_edge_raises(self):
+        g = ComputeGraph()
+        a, b = make_kernel(), make_kernel()
+        g.add_kernel(a)
+        g.add_kernel(b)
+        with pytest.raises(ValueError, match="No edge"):
             g.remove_control_edge(a, b)
 
 
@@ -303,6 +329,25 @@ class TestFuseKernels:
         g.add_kernel(a)
         with pytest.raises(ValueError):
             g.fuse_kernels(lambda kl: make_kernel(), [a])
+
+    def test_external_predecessor_rewired(self):
+        g = ComputeGraph()
+        a = make_kernel(outs=["y"])
+        b = make_kernel(ins=["x"], outs=["z"])
+        c = make_kernel(ins=["w"], outs=["q"])
+        d = make_kernel(ins=["p"])
+        g.add_kernel(a)
+        g.add_kernel(b)
+        g.add_kernel(c)
+        g.add_kernel(d)
+        g.add_data_edge(a, b, {"y": "x"})
+        g.add_data_edge(b, c, {"z": "w"})
+        g.add_data_edge(c, d, {"q": "p"})
+
+        fused = g.fuse_kernels(
+            lambda kl: make_kernel(ins=["x"], outs=["q"]), [b, c])
+        assert g._in_edges(fused)[0].src is a
+        assert g._out_edges(fused)[0].dst is d
 
     def test_not_in_graph_raises(self):
         g = ComputeGraph()
@@ -703,4 +748,25 @@ class TestValidate:
         g.add_kernel(b)
         g.add_data_edge(a, b, {"y": "x1"})
         with pytest.raises(ValueError, match="not connected"):
+            g.validate()
+
+    def test_output_not_connected_raises(self):
+        g = ComputeGraph()
+        a = make_kernel(outs=["y1", "y2"])
+        b = make_kernel(ins=["x"])
+        g.add_kernel(a)
+        g.add_kernel(b)
+        g.add_data_edge(a, b, {"y1": "x"})
+        with pytest.raises(ValueError, match="not connected"):
+            g.validate()
+
+    def test_input_multi_connected_raises(self):
+        g = ComputeGraph()
+        a = make_kernel(outs=["y1", "y2"])
+        b = make_kernel(ins=["x"])
+        g.add_kernel(a)
+        g.add_kernel(b)
+        g.add_data_edge(a, b, {"y1": "x"})
+        g.add_data_edge(a, b, {"y2": "x"})
+        with pytest.raises(ValueError, match="connected to multiple"):
             g.validate()

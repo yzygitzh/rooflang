@@ -216,3 +216,57 @@ class TestFindAggregateLatency:
                                dst_to_src_bandwidth_gbs=500.0,
                                is_full_duplex=True, alpha_us=2.0))
         assert hw.find_aggregate_latency([a, b, c]) == pytest.approx(3.0)
+
+
+# ── HardwareGraph edge errors ────────────────────────────────────────
+
+
+class TestHardwareGraphAddEdge:
+    def test_src_not_in_graph_raises(self):
+        hw = HardwareGraph()
+        g0 = Compute(name="g0")
+        g1 = Compute(name="g1")
+        hw.add_node(g1)
+        with pytest.raises(ValueError, match="Node not in graph"):
+            hw.add_edge(FabricEdge(name="f", src=g0, dst=g1,
+                                   src_to_dst_bandwidth_gbs=1.0,
+                                   dst_to_src_bandwidth_gbs=1.0,
+                                   is_full_duplex=False))
+
+    def test_dst_not_in_graph_raises(self):
+        hw = HardwareGraph()
+        g0 = Compute(name="g0")
+        g1 = Compute(name="g1")
+        hw.add_node(g0)
+        with pytest.raises(ValueError, match="Node not in graph"):
+            hw.add_edge(FabricEdge(name="f", src=g0, dst=g1,
+                                   src_to_dst_bandwidth_gbs=1.0,
+                                   dst_to_src_bandwidth_gbs=1.0,
+                                   is_full_duplex=False))
+
+    def test_multi_fabric_picks_best(self):
+        hw = HardwareGraph()
+        g0 = Compute(name="g0")
+        hbm = Memory(name="hbm", capacity_gb=80.0)
+        hw.add_node(g0)
+        hw.add_node(hbm)
+        hw.add_edge(FabricEdge(name="slow", src=g0, dst=hbm,
+                               src_to_dst_bandwidth_gbs=1.0,
+                               dst_to_src_bandwidth_gbs=1.0,
+                               is_full_duplex=False))
+        hw.add_edge(FabricEdge(name="fast", src=g0, dst=hbm,
+                               src_to_dst_bandwidth_gbs=10.0,
+                               dst_to_src_bandwidth_gbs=10.0,
+                               is_full_duplex=False))
+        fab = hw.find_fabric(g0, hbm)
+        assert fab.name == "fast"
+
+
+class TestHardwareGraphFindFabric:
+    def test_node_not_in_graph_raises(self):
+        hw = HardwareGraph()
+        g0 = Compute(name="g0")
+        g1 = Compute(name="g1")
+        hw.add_node(g0)
+        with pytest.raises(ValueError, match="No path"):
+            hw.find_fabric(g0, g1)

@@ -8,7 +8,9 @@ do not require placement — their cost is attributed to adjacent compute kernel
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, FrozenSet
+from typing import TYPE_CHECKING, Dict, FrozenSet, Optional
+
+from rooflang.language.graph import HardwareGraph
 
 if TYPE_CHECKING:
     from rooflang.language.graph import ComputeGraph
@@ -37,16 +39,33 @@ class Placement:
     Communication kernels are exempt.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, hardware: Optional[HardwareGraph] = None) -> None:
+        self._hardware = hardware
         self._mapping: Dict[Kernel, DeviceAssignment] = {}
 
     def set(self, kernel: Kernel, device: Compute, stream: int = 0,
             resource_cap: float = 1.0) -> None:
-        """Assign a kernel to a single device/stream."""
+        """Assign a kernel to a single device/stream.
+
+        Automatically sets tensor.location to the device's local memory
+        for any tensor where location is still None (requires hardware).
+        """
         if resource_cap <= 0.0 or resource_cap > 1.0:
             raise ValueError(
                 f"resource_cap must be in (0, 1], got {resource_cap}")
         self._mapping[kernel] = DeviceAssignment(device, stream, resource_cap)
+        if self._hardware is None:
+            return
+        mem = self._hardware.find_local_memory(device)
+        for t in kernel.inputs.values():
+            if t.location is None:
+                t.location = mem
+        for t in kernel.weights.values():
+            if t.location is None:
+                t.location = mem
+        for t in kernel.outputs.values():
+            if t.location is None:
+                t.location = mem
 
     def get(self, kernel: Kernel) -> DeviceAssignment:
         """Get placement for a kernel. Raises KeyError if not placed."""

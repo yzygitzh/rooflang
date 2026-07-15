@@ -1,8 +1,18 @@
-"""DeepSeek V4 Pro inference simulation — 8k prefill on B300 TP=8."""
+"""DeepSeek V4 Pro inference simulation — 8k prefill on B300 TP=8.
+
+Parallelism is expressed through data dependencies, kernel copies, and device
+placement. No explicit CommKernels — cross-device data edges naturally model
+communication at NVLink bandwidth via the placement memory-tracking mechanism.
+
+Chained TP splits (wq_b → sparse_attn → wo_a → wo_b) keep data local on each
+GPU (control edges between same-GPU copies). Only the final row-split gather
+(after wo_b) incurs cross-device reads, modeled via data edges from remote
+copies to the gather kernel on GPU0.
+"""
 
 from rooflang.language.graph import ComputeGraph
-from rooflang.language.kernels.comm import AllReduce, AllToAll, Broadcast, Gather
 from rooflang.language.kernels.forward import Gemm, RMSNorm, SparseAttn
+from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.placement import Placement
 from rooflang.language.tensor import Tensor
 from rooflang.language.utils import dtype_bytes
@@ -47,69 +57,6 @@ def make_norm(M, dim, dtype="bf16"):
     return k
 
 
-# ── Split classes ───────────────────────────────────────────────────────
-
-def column_split(kernel, n):
-    shard_n = kernel.N // n
-    prev = Broadcast(bytes_per_rank=0, world=n)
-    prev.outputs = {f"o{i}": Tensor(kernel.a_dtype, (kernel.M * kernel.K,))
-                    for i in range(n)}
-    copies = []
-    for _ in range(n):
-        c = Gemm(kernel.M, shard_n, kernel.K, kernel.w_dtype,
-                 kernel.a_dtype, kernel.out_dtype)
-        c.inputs = {"x": Tensor(kernel.a_dtype, (kernel.M * kernel.K,))}
-        c.weights = {"w": Tensor(kernel.w_dtype, (kernel.K * shard_n,))}
-        c.outputs = {"y": Tensor(kernel.out_dtype, (kernel.M * shard_n,))}
-        copies.append(c)
-    next_ = Gather(bytes_per_rank=0, world=n)
-    next_.inputs = {f"i{i}": Tensor(kernel.out_dtype, (kernel.M * shard_n,))
-                    for i in range(n)}
-    return prev, copies, next_
-
-
-def row_split_allreduce(kernel, n):
-    shard_k = kernel.K // n
-    prev = Broadcast(bytes_per_rank=0, world=n)
-    prev.outputs = {f"o{i}": Tensor(kernel.a_dtype, (kernel.M * shard_k,))
-                    for i in range(n)}
-    copies = []
-    for _ in range(n):
-        c = Gemm(kernel.M, kernel.N, shard_k, kernel.w_dtype,
-                 kernel.a_dtype, kernel.out_dtype)
-        c.inputs = {"x": Tensor(kernel.a_dtype, (kernel.M * shard_k,))}
-        c.weights = {"w": Tensor(kernel.w_dtype, (shard_k * kernel.N,))}
-        c.outputs = {"y": Tensor(kernel.out_dtype, (kernel.M * kernel.N,))}
-        copies.append(c)
-    ar_bytes = kernel.M * kernel.N * dtype_bytes(kernel.out_dtype)
-    next_ = AllReduce(bytes_per_rank=ar_bytes, world=n, dtype=kernel.out_dtype)
-    next_.inputs = {f"i{i}": Tensor(kernel.out_dtype, (kernel.M * kernel.N,))
-                    for i in range(n)}
-    return prev, copies, next_
-
-
-def head_split(kernel, n):
-    shard_h = kernel.H // n
-    in_elems = (kernel.B * shard_h * kernel.S_q * kernel.Hd
-                + 2 * kernel.B * kernel.H_kv * kernel.S_q
-                * kernel.k_sel * kernel.Hd)
-    out_elems = kernel.B * shard_h * kernel.S_q * kernel.Hd
-    prev = Broadcast(bytes_per_rank=0, world=n)
-    prev.outputs = {f"o{i}": Tensor(kernel.dtype_, (in_elems,))
-                    for i in range(n)}
-    copies = []
-    for _ in range(n):
-        c = SparseAttn(kernel.B, shard_h, kernel.H_kv, kernel.S_q,
-                       kernel.k_sel, kernel.Hd, kernel.dtype_)
-        c.inputs = {"x": Tensor(kernel.dtype_, (in_elems,))}
-        c.outputs = {"y": Tensor(kernel.dtype_, (out_elems,))}
-        copies.append(c)
-    next_ = Gather(bytes_per_rank=0, world=n)
-    next_.inputs = {f"i{i}": Tensor(kernel.dtype_, (out_elems,))
-                    for i in range(n)}
-    return prev, copies, next_
-
-
 # ── Build prefill graph ─────────────────────────────────────────────────
 
 def build_prefill(hw, gpus):
@@ -122,20 +69,11 @@ def build_prefill(hw, gpus):
         p.set_kernel_device(kernel, gpu)
         return kernel
 
-    def split_tp(kernel, split_fn, after=None):
-        g.add_kernel(kernel)
-        prev_c, copies, next_c = g.split_kernel(split_fn, kernel, TP)
-        for i, c in enumerate(copies):
-            p.set_kernel_device(c, gpus[i])
-        if after is not None:
-            g.add_control_edge(after, prev_c)
-        return next_c
-
     prev = None
     for layer_id in range(N_LAYERS):
         ratio = COMPRESS_RATIOS[layer_id]
 
-        # ── Attention ───────────────────────────────────────────────
+        # ── Attention (GPU0 sequential) ────────────────────────────
         attn_norm = place(make_norm(M, D))
         wq_a = place(make_gemm(M, Q_LORA, D, "fp8", "fp8"))
         q_norm = place(make_norm(M, Q_LORA))
@@ -148,12 +86,19 @@ def build_prefill(hw, gpus):
         for i in range(len(seq) - 1):
             g.add_control_edge(seq[i], seq[i + 1])
 
-        # wq_b: ColumnParallel split on N
-        wq_b_end = split_tp(
-            Gemm(M, H * HD, Q_LORA, "fp8", "fp8"), column_split, after=q_norm)
+        # ── TP copies (chained locally per GPU) ────────────────────
+        # wq_b: column split on N
+        shard_n_wqb = H * HD // TP
+        wq_b_copies = []
+        for i in range(TP):
+            c = Gemm(M, shard_n_wqb, Q_LORA, "fp8", "fp8")
+            c.inputs = {"x": Tensor("fp8", (M * Q_LORA,))}
+            c.weights = {"w": Tensor("fp8", (Q_LORA * shard_n_wqb,))}
+            wq_b_copies.append(place(c, gpus[i]))
+            g.add_control_edge(q_norm, c)
 
-        # KV path (sequential after wq_b split for V1 simplicity)
-        g.add_control_edge(wq_b_end, wkv)
+        # KV path (sequential after wq_b for ordering)
+        g.add_control_edge(wq_b_copies[0], wkv)
         g.add_control_edge(wkv, kv_norm)
 
         # Compressor
@@ -170,52 +115,94 @@ def build_prefill(hw, gpus):
             k_sel = WINDOW
 
         # Sparse attention: head split
-        sa_end = split_tp(
-            SparseAttn(1, H, 1, M, k_sel, HD), head_split, after=sa_after)
+        shard_h = H // TP
+        in_elems = (1 * shard_h * M * HD
+                    + 2 * 1 * 1 * M * k_sel * HD)
+        out_elems = 1 * shard_h * M * HD
+        sa_copies = []
+        for i in range(TP):
+            c = SparseAttn(1, shard_h, 1, M, k_sel, HD)
+            c.inputs = {"x": Tensor("bf16", (in_elems,))}
+            sa_copies.append(place(c, gpus[i]))
+            g.add_control_edge(wq_b_copies[i], c)
+            g.add_control_edge(sa_after, c)
 
-        # Output projection
-        wo_a_end = split_tp(
-            Gemm(M, O_GROUPS * O_LORA, H * HD // O_GROUPS, "bf16", "bf16"),
-            column_split, after=sa_end)
-        wo_b_end = split_tp(
-            Gemm(M, D, O_GROUPS * O_LORA, "fp8", "fp8"),
-            row_split_allreduce, after=wo_a_end)
+        # wo_a: column split
+        wo_a_K = H * HD // O_GROUPS
+        wo_a_N = O_GROUPS * O_LORA
+        shard_n_woa = wo_a_N // TP
+        wo_a_copies = []
+        for i in range(TP):
+            c = Gemm(M, shard_n_woa, wo_a_K, "bf16", "bf16")
+            c.inputs = {"x": Tensor("bf16", (M * wo_a_K,))}
+            c.weights = {"w": Tensor("bf16", (wo_a_K * shard_n_woa,))}
+            wo_a_copies.append(place(c, gpus[i]))
+            g.add_control_edge(sa_copies[i], c)
+
+        # wo_b: row split — gather at the end via data edges
+        wo_b_K = O_GROUPS * O_LORA
+        shard_k_wob = wo_b_K // TP
+        wo_b_copies = []
+        for i in range(TP):
+            c = Gemm(M, D, shard_k_wob, "fp8", "fp8")
+            c.inputs = {"x": Tensor("fp8", (M * shard_k_wob,))}
+            c.weights = {"w": Tensor("fp8", (shard_k_wob * D,))}
+            c.outputs = {"y": Tensor("bf16", (M * D,))}
+            wo_b_copies.append(place(c, gpus[i]))
+            g.add_control_edge(wo_a_copies[i], c)
+
+        # Gather after wo_b: reads from all GPUs → models AllReduce cost
+        wo_b_gather = Kernel(
+            inputs={f"i{i}": Tensor("bf16", (M * D,)) for i in range(TP)})
+        place(wo_b_gather)
+        for i in range(TP):
+            g.add_data_edge(wo_b_copies[i], wo_b_gather, {"y": f"i{i}"})
 
         # ── FFN / MoE ──────────────────────────────────────────────
         ffn_norm = place(make_norm(M, D))
         gate = place(make_gemm(M, N_EXPERTS, D, "fp32", "bf16", "fp32"))
-        g.add_control_edge(wo_b_end, ffn_norm)
+        g.add_control_edge(wo_b_gather, ffn_norm)
         g.add_control_edge(ffn_norm, gate)
 
-        # AllToAll dispatch + combine
-        dispatch = AllToAll(M * D * dtype_bytes("bf16"), EP)
-        combine = AllToAll(M * D * dtype_bytes("bf16"), EP)
-        g.add_kernel(dispatch)
-        g.add_kernel(combine)
+        # Dispatch bridge: scatters token batches to each GPU
+        M_e = M * TOPK // N_LOCAL_EXPERTS
+        dispatch = Kernel(
+            outputs={f"o{i}": Tensor("fp8", (M_e * D,)) for i in range(TP)})
+        place(dispatch)
         g.add_control_edge(gate, dispatch)
 
+        # Combine bridge: gathers expert results from all GPUs
+        combine = Kernel(
+            inputs={f"i{i}": Tensor("bf16", (M_e * D,)) for i in range(TP)},
+            outputs={"y": Tensor("fp8", (M * D,))})
+        place(combine)
+
         # Experts: 48 per GPU × 8 GPUs
-        M_e = M * TOPK // N_LOCAL_EXPERTS
         for gpu_id in range(TP):
-            exp_prev = dispatch
+            exp_prev = None
             for eid in range(N_LOCAL_EXPERTS):
                 w1 = place(make_gemm(M_e, MOE_INTER, D, "fp4", "fp8"),
                            gpus[gpu_id])
                 w3 = place(make_gemm(M_e, MOE_INTER, D, "fp4", "fp8"),
                            gpus[gpu_id])
-                w2 = place(make_gemm(M_e, D, MOE_INTER, "fp4", "fp8"),
-                           gpus[gpu_id])
-                g.add_control_edge(exp_prev, w1)
+                w2 = make_gemm(M_e, D, MOE_INTER, "fp4", "fp8")
+                if eid == N_LOCAL_EXPERTS - 1:
+                    w2.outputs = {"y": Tensor("bf16", (M_e * D,))}
+                place(w2, gpus[gpu_id])
+                if eid == 0:
+                    g.add_data_edge(dispatch, w1, {f"o{gpu_id}": "x"})
+                else:
+                    g.add_control_edge(exp_prev, w1)
                 g.add_control_edge(w1, w3)
                 g.add_control_edge(w3, w2)
                 exp_prev = w2
-            g.add_control_edge(exp_prev, combine)
+            g.add_data_edge(exp_prev, combine, {"y": f"i{gpu_id}"})
 
-        # Shared expert (replicated on GPU0)
+        # Shared expert
         sw1 = place(make_gemm(M, MOE_INTER, D, "fp8", "fp8"))
         sw3 = place(make_gemm(M, MOE_INTER, D, "fp8", "fp8"))
         sw2 = place(make_gemm(M, D, MOE_INTER, "fp8", "fp8"))
-        g.add_control_edge(combine, sw1)
+        g.add_data_edge(combine, sw1, {"y": "x"})
         g.add_control_edge(sw1, sw3)
         g.add_control_edge(sw3, sw2)
         prev = sw2

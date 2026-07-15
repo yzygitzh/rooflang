@@ -178,8 +178,8 @@ class Simulator:
                 if mem is not None:
                     self._mem_usage[mem] += t.size_bytes
                     self._alive[mem].add((t, "weight"))
-            has_data_preds = bool(self._graph._in_edges(kernel))
-            if not has_data_preds:
+            is_root = not list(self._graph._dag.predecessors(kernel))
+            if is_root:
                 inputs_for_kernel = []
                 for t in kernel.inputs.values():
                     mem = self._placement.get_tensor_memory(t)

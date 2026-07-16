@@ -165,12 +165,14 @@ class Simulator:
         self._out_refcount: Dict[Tensor, int] = defaultdict(int)
         self._root_inputs: Dict[Kernel, List[Tensor]] = {}
         self._alive: Dict[Memory, Set[Tuple[Tensor, str]]] = defaultdict(set)
+        self._passthrough = self._build_passthrough()
 
         for kernel in self._graph.kernels:
             for edge in self._graph._out_edges(kernel):
                 for out_name in edge.mapping:
                     t = kernel.outputs[out_name]
-                    self._out_refcount[t] += 1
+                    for real_t in self._passthrough.get(t, [t]):
+                        self._out_refcount[real_t] += 1
 
         for kernel in self._graph.kernels:
             for t in kernel.weights.values():
@@ -285,8 +287,26 @@ class Simulator:
 
     # ── Memory tracking ────────────────────────────────────────────
 
+    def _build_passthrough(self) -> Dict[Tensor, list]:
+        """Map CommKernel outputs → upstream source tensors (inplace)."""
+        pt: Dict[Tensor, list] = {}
+        for kernel in self._graph.kernels:
+            if kernel._requires_placement:
+                continue
+            all_sources = []
+            for edge in self._graph._in_edges(kernel):
+                for out_name, _ in edge.mapping.items():
+                    upstream_t = edge.src.outputs[out_name]
+                    all_sources.extend(pt.get(upstream_t, [upstream_t]))
+            if all_sources:
+                for t in kernel.outputs.values():
+                    pt[t] = all_sources
+        return pt
+
     def _allocate_outputs(self, kernel: Kernel) -> None:
         for t in kernel.outputs.values():
+            if t in self._passthrough:
+                continue
             mem = self._placement.get_tensor_memory(t)
             if mem is None:
                 continue
@@ -300,12 +320,13 @@ class Simulator:
         for edge in self._graph._in_edges(kernel):
             for out_name in edge.mapping:
                 src_t = edge.src.outputs[out_name]
-                self._out_refcount[src_t] -= 1
-                if self._out_refcount[src_t] == 0:
-                    mem = self._placement.get_tensor_memory(src_t)
-                    if mem is not None:
-                        self._mem_usage[mem] -= src_t.size_bytes
-                        self._alive[mem].discard((src_t, "output"))
+                for real_t in self._passthrough.get(src_t, [src_t]):
+                    self._out_refcount[real_t] -= 1
+                    if self._out_refcount[real_t] == 0:
+                        mem = self._placement.get_tensor_memory(real_t)
+                        if mem is not None:
+                            self._mem_usage[mem] -= real_t.size_bytes
+                            self._alive[mem].discard((real_t, "output"))
         if kernel in self._root_inputs:
             for t in self._root_inputs[kernel]:
                 mem = self._placement.get_tensor_memory(t)

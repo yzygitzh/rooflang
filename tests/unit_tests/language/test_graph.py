@@ -481,7 +481,7 @@ class TestDedup:
     def test_with_broadcast_predecessor(self):
         g = ComputeGraph()
         from rooflang.language.kernels.comm import Broadcast as BcastKernel
-        bcast = BcastKernel(bytes_per_rank=64.0, world=2)
+        bcast = BcastKernel(total_bytes=64.0, world=2)
         bcast.inputs = {"x": Tensor("bf16", (4, 4))}
         bcast.outputs = {"o1": Tensor("bf16", (4, 4)),
                          "o2": Tensor("bf16", (4, 4))}
@@ -535,7 +535,7 @@ class TestDedup:
     def test_mixed_root_non_root_raises(self):
         g = ComputeGraph()
         from rooflang.language.kernels.comm import Broadcast as BcastKernel
-        bcast = BcastKernel(bytes_per_rank=64.0, world=2)
+        bcast = BcastKernel(total_bytes=64.0, world=2)
         bcast.outputs = {"o1": Tensor("bf16", (4, 4))}
         k1 = make_kernel(ins=["x"], outs=["y"])
         k2 = make_kernel(ins=["x"], outs=["y"])
@@ -549,9 +549,9 @@ class TestDedup:
     def test_different_broadcast_raises(self):
         g = ComputeGraph()
         from rooflang.language.kernels.comm import Broadcast as BcastKernel
-        b1 = BcastKernel(bytes_per_rank=64.0, world=2)
+        b1 = BcastKernel(total_bytes=64.0, world=2)
         b1.outputs = {"o1": Tensor("bf16", (4, 4))}
-        b2 = BcastKernel(bytes_per_rank=64.0, world=2)
+        b2 = BcastKernel(total_bytes=64.0, world=2)
         b2.outputs = {"o1": Tensor("bf16", (4, 4))}
         k1 = make_kernel(ins=["x"], outs=["y"])
         k2 = make_kernel(ins=["x"], outs=["y"])
@@ -587,7 +587,7 @@ class TestDup:
         from rooflang.language.kernels.comm import Broadcast as BcastKernel
         pred = make_kernel(outs=["y"])
         k = make_kernel(ins=["x"], outs=["z"])
-        bcast = BcastKernel(bytes_per_rank=64.0, world=2)
+        bcast = BcastKernel(total_bytes=64.0, world=2)
         bcast.inputs = {"z": Tensor("bf16", (4, 4))}
         bcast.outputs = {"o1": Tensor("bf16", (4, 4)),
                          "o2": Tensor("bf16", (4, 4))}
@@ -645,7 +645,7 @@ class TestDup:
         g = ComputeGraph()
         from rooflang.language.kernels.comm import Broadcast as BcastKernel
         k = make_kernel(ins=["x"], outs=["z"])
-        bcast = BcastKernel(bytes_per_rank=64.0, world=2)
+        bcast = BcastKernel(total_bytes=64.0, world=2)
         bcast.inputs = {"z": Tensor("bf16", (4, 4))}
         bcast.outputs = {"o1": Tensor("bf16", (4, 4)),
                          "o2": Tensor("bf16", (4, 4))}

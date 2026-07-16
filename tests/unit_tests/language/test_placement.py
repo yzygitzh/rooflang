@@ -160,7 +160,7 @@ class TestPlacementValidate:
         p = Placement(hardware=hw)
         g = ComputeGraph()
         k = Kernel(outputs={"y": Tensor("bf16", (4,))})
-        ar = AllReduce(bytes_per_rank=1024.0, world=4, dtype="bf16")
+        ar = AllReduce(total_bytes=1024.0, world=4, dtype="bf16")
         g.add_kernel(k)
         g.add_kernel(ar)
         p.set_kernel_device(k, gpu)

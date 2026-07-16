@@ -27,7 +27,7 @@ def column_split(kernel, n):
     """
     shard_n = kernel.N // n
     input_bytes = kernel.M * kernel.K * dtype_bytes("bf16")
-    prev = Broadcast(bytes_per_rank=input_bytes, world=n)
+    prev = Broadcast(total_bytes=input_bytes, world=n)
     prev.inputs = dict(kernel.inputs)
     prev.outputs = {f"o{i}": Tensor("bf16", (kernel.M * kernel.K,))
                     for i in range(n)}
@@ -40,7 +40,7 @@ def column_split(kernel, n):
         c.outputs = {"y": Tensor("bf16", (kernel.M * shard_n,))}
         copies.append(c)
     output_bytes = kernel.M * kernel.N * dtype_bytes("bf16")
-    next_ = Gather(bytes_per_rank=output_bytes, world=n)
+    next_ = Gather(total_bytes=output_bytes, world=n)
     next_.inputs = {f"i{i}": Tensor("bf16", (kernel.M * shard_n,))
                     for i in range(n)}
     next_.outputs = dict(kernel.outputs)
@@ -55,7 +55,7 @@ def row_split(kernel, n):
     """
     shard_k = kernel.K // n
     input_bytes = kernel.M * kernel.K * dtype_bytes("bf16")
-    prev = Scatter(bytes_per_rank=input_bytes, world=n)
+    prev = Scatter(total_bytes=input_bytes, world=n)
     prev.inputs = dict(kernel.inputs)
     prev.outputs = {f"o{i}": Tensor("bf16", (kernel.M * shard_k,))
                     for i in range(n)}
@@ -68,7 +68,7 @@ def row_split(kernel, n):
         c.outputs = {"y": Tensor("bf16", (kernel.M * kernel.N,))}
         copies.append(c)
     reduce_bytes = kernel.M * kernel.N * dtype_bytes("bf16")
-    next_ = Reduce(bytes_per_rank=reduce_bytes, world=n)
+    next_ = Reduce(total_bytes=reduce_bytes, world=n)
     next_.inputs = {f"i{i}": Tensor("bf16", (kernel.M * kernel.N,))
                     for i in range(n)}
     next_.outputs = dict(kernel.outputs)
@@ -87,7 +87,7 @@ def head_split(kernel, n):
     in_elems = q_elems + kv_elems
     out_elems = kernel.B * shard_h * kernel.S_q * kernel.Hd
     in_bytes = kernel.B * kernel.H * kernel.S_q * kernel.Hd * dtype_bytes(kernel.dtype_)
-    prev = Scatter(bytes_per_rank=in_bytes, world=n)
+    prev = Scatter(total_bytes=in_bytes, world=n)
     prev.inputs = dict(kernel.inputs)
     prev.outputs = {f"o{i}": Tensor(kernel.dtype_, (in_elems,))
                     for i in range(n)}
@@ -99,7 +99,7 @@ def head_split(kernel, n):
         c.outputs = {"y": Tensor(kernel.dtype_, (out_elems,))}
         copies.append(c)
     out_bytes = kernel.B * kernel.H * kernel.S_q * kernel.Hd * dtype_bytes(kernel.dtype_)
-    next_ = Gather(bytes_per_rank=out_bytes, world=n)
+    next_ = Gather(total_bytes=out_bytes, world=n)
     next_.inputs = {f"i{i}": Tensor(kernel.dtype_, (out_elems,))
                     for i in range(n)}
     next_.outputs = dict(kernel.outputs)

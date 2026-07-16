@@ -61,21 +61,21 @@ def _create_collective(collector: Kernel, distributor: Kernel) -> Kernel | None:
 
     Returns None for Gather+Scatter same-dim (identity case).
     """
-    bpr = collector.bytes_per_rank
+    bpr = collector.total_bytes
     world = collector.world
 
     if isinstance(collector, Reduce) and isinstance(distributor, Broadcast):
         dtype = getattr(collector, "dtype_", "bf16")
-        return AllReduce(bytes_per_rank=bpr, world=world, dtype=dtype)
+        return AllReduce(total_bytes=bpr, world=world, dtype=dtype)
     elif isinstance(collector, Reduce) and isinstance(distributor, Scatter):
         dtype = getattr(collector, "dtype_", "bf16")
-        return ReduceScatter(bytes_per_rank=bpr, world=world, dtype=dtype)
+        return ReduceScatter(total_bytes=bpr, world=world, dtype=dtype)
     elif isinstance(collector, Gather) and isinstance(distributor, Broadcast):
-        return AllGather(bytes_per_rank=bpr, world=world)
+        return AllGather(total_bytes=bpr, world=world)
     elif isinstance(collector, Gather) and isinstance(distributor, Scatter):
         if collector.dim == distributor.dim:
             return None
-        return AllToAll(bytes_per_rank=bpr, world=world)
+        return AllToAll(total_bytes=bpr, world=world)
     raise ValueError(f"Unexpected pair: {type(collector)}, {type(distributor)}")
 
 

@@ -239,7 +239,7 @@ class TestBwdSparseAttn(TestKernelBase):
 
 class TestAllReduce(TestKernelBase):
     __test__ = True
-    kernel = AllReduce(bytes_per_rank=1024.0, world=4, dtype="bf16")
+    kernel = AllReduce(total_bytes=1024.0, world=4, dtype="bf16")
     expected_flops = (3 / 4) * (1024.0 / 2.0)
     expected_input_bytes = 1024.0
     expected_weight_bytes = 0.0
@@ -249,7 +249,7 @@ class TestAllReduce(TestKernelBase):
 
 class TestReduceScatter(TestKernelBase):
     __test__ = True
-    kernel = ReduceScatter(bytes_per_rank=1024.0, world=4, dtype="bf16")
+    kernel = ReduceScatter(total_bytes=1024.0, world=4, dtype="bf16")
     expected_flops = (3 / 4) * (1024.0 / 2.0)
     expected_input_bytes = 1024.0
     expected_weight_bytes = 0.0
@@ -259,7 +259,7 @@ class TestReduceScatter(TestKernelBase):
 
 class TestAllGather(TestKernelBase):
     __test__ = True
-    kernel = AllGather(bytes_per_rank=1024.0, world=4)
+    kernel = AllGather(total_bytes=1024.0, world=4)
     expected_flops = 0.0
     expected_input_bytes = 1024.0 / 4
     expected_weight_bytes = 0.0
@@ -269,7 +269,7 @@ class TestAllGather(TestKernelBase):
 
 class TestAllToAll(TestKernelBase):
     __test__ = True
-    kernel = AllToAll(bytes_per_rank=1024.0, world=4)
+    kernel = AllToAll(total_bytes=1024.0, world=4)
     expected_flops = 0.0
     expected_input_bytes = 1024.0
     expected_weight_bytes = 0.0
@@ -279,7 +279,7 @@ class TestAllToAll(TestKernelBase):
 
 class TestBroadcast(TestKernelBase):
     __test__ = True
-    kernel = Broadcast(bytes_per_rank=1024.0, world=4)
+    kernel = Broadcast(total_bytes=1024.0, world=4)
     expected_flops = 0.0
     expected_input_bytes = 1024.0
     expected_weight_bytes = 0.0
@@ -289,7 +289,7 @@ class TestBroadcast(TestKernelBase):
 
 class TestScatter(TestKernelBase):
     __test__ = True
-    kernel = Scatter(bytes_per_rank=1024.0, world=4)
+    kernel = Scatter(total_bytes=1024.0, world=4)
     expected_flops = 0.0
     expected_input_bytes = 1024.0
     expected_weight_bytes = 0.0
@@ -299,7 +299,7 @@ class TestScatter(TestKernelBase):
 
 class TestGather(TestKernelBase):
     __test__ = True
-    kernel = Gather(bytes_per_rank=1024.0, world=4)
+    kernel = Gather(total_bytes=1024.0, world=4)
     expected_flops = 0.0
     expected_input_bytes = 1024.0 / 4
     expected_weight_bytes = 0.0
@@ -309,17 +309,17 @@ class TestGather(TestKernelBase):
 
 class TestReduce(TestKernelBase):
     __test__ = True
-    kernel = Reduce(bytes_per_rank=1024.0, world=4, dtype="bf16")
+    kernel = Reduce(total_bytes=1024.0, world=4, dtype="bf16")
     expected_flops = (3 / 4) * (1024.0 / 2.0)
     expected_input_bytes = 1024.0
     expected_weight_bytes = 0.0
     expected_output_bytes = 1024.0
-    expected_transferred_bytes = (3 / 4) * 1024.0
+    expected_transferred_bytes = 1024.0
 
 
 class TestSend(TestKernelBase):
     __test__ = True
-    kernel = Send(bytes_total=512.0)
+    kernel = Send(total_bytes=512.0)
     expected_flops = 0.0
     expected_input_bytes = 512.0
     expected_weight_bytes = 0.0
@@ -329,7 +329,7 @@ class TestSend(TestKernelBase):
 
 class TestRecv(TestKernelBase):
     __test__ = True
-    kernel = Recv(bytes_total=512.0)
+    kernel = Recv(total_bytes=512.0)
     expected_flops = 0.0
     expected_input_bytes = 0.0
     expected_weight_bytes = 0.0

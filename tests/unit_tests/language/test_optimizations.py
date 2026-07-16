@@ -54,8 +54,8 @@ def _build_chain(collector, distributor, n, same_devices=True):
 
 class TestFuseWorld4:
     def test_reduce_broadcast_to_allreduce(self):
-        r = Reduce(bytes_per_rank=32, world=4, dtype="bf16")
-        b = Broadcast(bytes_per_rank=32, world=4)
+        r = Reduce(total_bytes=32, world=4, dtype="bf16")
+        b = Broadcast(total_bytes=32, world=4)
         g, p, preds, succs = _build_chain(r, b, n=4)
         optimize_comms(g, p)
         comms = g.kernels - set(preds) - set(succs)
@@ -63,8 +63,8 @@ class TestFuseWorld4:
         assert isinstance(next(iter(comms)), AllReduce)
 
     def test_reduce_scatter_to_reducescatter(self):
-        r = Reduce(bytes_per_rank=32, world=4, dtype="bf16")
-        s = Scatter(bytes_per_rank=32, world=4, dim=1)
+        r = Reduce(total_bytes=32, world=4, dtype="bf16")
+        s = Scatter(total_bytes=32, world=4, dim=1)
         g, p, preds, succs = _build_chain(r, s, n=4)
         optimize_comms(g, p)
         comms = g.kernels - set(preds) - set(succs)
@@ -72,8 +72,8 @@ class TestFuseWorld4:
         assert isinstance(next(iter(comms)), ReduceScatter)
 
     def test_gather_broadcast_to_allgather(self):
-        ga = Gather(bytes_per_rank=128, world=4, dim=0)
-        b = Broadcast(bytes_per_rank=128, world=4)
+        ga = Gather(total_bytes=128, world=4, dim=0)
+        b = Broadcast(total_bytes=128, world=4)
         g, p, preds, succs = _build_chain(ga, b, n=4)
         optimize_comms(g, p)
         comms = g.kernels - set(preds) - set(succs)
@@ -81,8 +81,8 @@ class TestFuseWorld4:
         assert isinstance(next(iter(comms)), AllGather)
 
     def test_gather_scatter_diff_dim_to_alltoall(self):
-        ga = Gather(bytes_per_rank=128, world=4, dim=0)
-        s = Scatter(bytes_per_rank=128, world=4, dim=1)
+        ga = Gather(total_bytes=128, world=4, dim=0)
+        s = Scatter(total_bytes=128, world=4, dim=1)
         g, p, preds, succs = _build_chain(ga, s, n=4)
         optimize_comms(g, p)
         comms = g.kernels - set(preds) - set(succs)
@@ -92,23 +92,23 @@ class TestFuseWorld4:
 
 class TestFuseWorld1Eliminated:
     def test_reduce_broadcast_world1_eliminated(self):
-        r = Reduce(bytes_per_rank=32, world=1, dtype="bf16")
-        b = Broadcast(bytes_per_rank=32, world=1)
+        r = Reduce(total_bytes=32, world=1, dtype="bf16")
+        b = Broadcast(total_bytes=32, world=1)
         g, p, preds, succs = _build_chain(r, b, n=1)
         optimize_comms(g, p)
         assert g.kernels == frozenset(preds + succs)
         assert g._out_edges(preds[0])[0].dst is succs[0]
 
     def test_gather_scatter_same_dim_world1_eliminated(self):
-        ga = Gather(bytes_per_rank=32, world=1, dim=0)
-        s = Scatter(bytes_per_rank=32, world=1, dim=0)
+        ga = Gather(total_bytes=32, world=1, dim=0)
+        s = Scatter(total_bytes=32, world=1, dim=0)
         g, p, preds, succs = _build_chain(ga, s, n=1)
         optimize_comms(g, p)
         assert g.kernels == frozenset(preds + succs)
 
     def test_gather_broadcast_world1_eliminated(self):
-        ga = Gather(bytes_per_rank=32, world=1, dim=0)
-        b = Broadcast(bytes_per_rank=32, world=1)
+        ga = Gather(total_bytes=32, world=1, dim=0)
+        b = Broadcast(total_bytes=32, world=1)
         g, p, preds, succs = _build_chain(ga, b, n=1)
         optimize_comms(g, p)
         assert g.kernels == frozenset(preds + succs)
@@ -116,8 +116,8 @@ class TestFuseWorld1Eliminated:
 
 class TestBypass:
     def test_gather_scatter_same_dim_bypass(self):
-        ga = Gather(bytes_per_rank=128, world=4, dim=0)
-        s = Scatter(bytes_per_rank=128, world=4, dim=0)
+        ga = Gather(total_bytes=128, world=4, dim=0)
+        s = Scatter(total_bytes=128, world=4, dim=0)
         g, p, preds, succs = _build_chain(ga, s, n=1)
         optimize_comms(g, p)
         assert ga not in g.kernels
@@ -127,8 +127,8 @@ class TestBypass:
 
 class TestNoFusionDiffDevices:
     def test_diff_devices_no_fusion(self):
-        r = Reduce(bytes_per_rank=32, world=4, dtype="bf16")
-        b = Broadcast(bytes_per_rank=32, world=4)
+        r = Reduce(total_bytes=32, world=4, dtype="bf16")
+        b = Broadcast(total_bytes=32, world=4)
         g, p, preds, succs = _build_chain(r, b, n=4, same_devices=False)
         optimize_comms(g, p)
         assert r in g.kernels
@@ -137,16 +137,16 @@ class TestNoFusionDiffDevices:
 
 class TestEliminateDead:
     @pytest.mark.parametrize("comm_cls,kwargs", [
-        (Scatter, dict(bytes_per_rank=128, world=4, dim=0)),
-        (Broadcast, dict(bytes_per_rank=32, world=4)),
-        (Gather, dict(bytes_per_rank=128, world=4, dim=0)),
-        (Reduce, dict(bytes_per_rank=32, world=4, dtype="bf16")),
-        (AllReduce, dict(bytes_per_rank=32, world=4, dtype="bf16")),
-        (AllGather, dict(bytes_per_rank=128, world=4)),
-        (ReduceScatter, dict(bytes_per_rank=32, world=4, dtype="bf16")),
-        (AllToAll, dict(bytes_per_rank=128, world=4)),
-        (Send, dict(bytes_total=32)),
-        (Recv, dict(bytes_total=32)),
+        (Scatter, dict(total_bytes=128, world=4, dim=0)),
+        (Broadcast, dict(total_bytes=32, world=4)),
+        (Gather, dict(total_bytes=128, world=4, dim=0)),
+        (Reduce, dict(total_bytes=32, world=4, dtype="bf16")),
+        (AllReduce, dict(total_bytes=32, world=4, dtype="bf16")),
+        (AllGather, dict(total_bytes=128, world=4)),
+        (ReduceScatter, dict(total_bytes=32, world=4, dtype="bf16")),
+        (AllToAll, dict(total_bytes=128, world=4)),
+        (Send, dict(total_bytes=32)),
+        (Recv, dict(total_bytes=32)),
     ])
     def test_single_edge_eliminated(self, comm_cls, kwargs):
         g = ComputeGraph()
@@ -172,7 +172,7 @@ class TestEliminateDead:
         g = ComputeGraph()
         gpu = Compute(name="gpu0")
         pred = Kernel(outputs={"y": SHARD})
-        comm = Scatter(bytes_per_rank=128, world=4, dim=0)
+        comm = Scatter(total_bytes=128, world=4, dim=0)
         comm.inputs = {"x": SHARD}
         comm.outputs = {"y0": SHARD, "y1": SHARD}
         succ0 = Kernel(inputs={"a": SHARD})
@@ -200,10 +200,10 @@ class TestFusePairsGuards:
         g = ComputeGraph()
         gpus = [Compute(name=f"gpu{i}") for i in range(2)]
         preds = [Kernel(outputs={"y": SHARD}) for _ in range(2)]
-        r = Reduce(bytes_per_rank=128.0, world=2, dtype="bf16")
+        r = Reduce(total_bytes=128.0, world=2, dtype="bf16")
         r.inputs = {"x0": SHARD, "x1": SHARD}
         r.outputs = {"z": SHARD, "z2": SHARD}
-        b = Broadcast(bytes_per_rank=128.0, world=2)
+        b = Broadcast(total_bytes=128.0, world=2)
         b.inputs = {"z": SHARD}
         b.outputs = {"y0": SHARD, "y1": SHARD}
         extra = Kernel(inputs={"q": SHARD})
@@ -230,10 +230,10 @@ class TestFusePairsGuards:
         g = ComputeGraph()
         gpus = [Compute(name=f"gpu{i}") for i in range(2)]
         preds = [Kernel(outputs={"y": SHARD}) for _ in range(2)]
-        r = Reduce(bytes_per_rank=128.0, world=2, dtype="bf16")
+        r = Reduce(total_bytes=128.0, world=2, dtype="bf16")
         r.inputs = {"x0": SHARD, "x1": SHARD}
         r.outputs = {"z": SHARD}
-        b = Broadcast(bytes_per_rank=128.0, world=2)
+        b = Broadcast(total_bytes=128.0, world=2)
         b.inputs = {"z": SHARD, "q": SHARD}
         b.outputs = {"y0": SHARD, "y1": SHARD}
         extra = Kernel(outputs={"q": SHARD})
@@ -260,10 +260,10 @@ class TestFusePairsGuards:
         g = ComputeGraph()
         gpus = [Compute(name=f"gpu{i}") for i in range(2)]
         preds = [Kernel(outputs={"y": SHARD}) for _ in range(2)]
-        r = Reduce(bytes_per_rank=128.0, world=2, dtype="bf16")
+        r = Reduce(total_bytes=128.0, world=2, dtype="bf16")
         r.inputs = {"x0": SHARD, "x1": SHARD}
         r.outputs = {"z": SHARD}
-        b = Broadcast(bytes_per_rank=128.0, world=4)
+        b = Broadcast(total_bytes=128.0, world=4)
         b.inputs = {"z": SHARD}
         b.outputs = {"y0": SHARD, "y1": SHARD}
         succs = [Kernel(inputs={"a": SHARD}) for _ in range(2)]
@@ -287,10 +287,10 @@ class TestFusePairsGuards:
         g = ComputeGraph()
         gpus = [Compute(name=f"gpu{i}") for i in range(3)]
         preds = [Kernel(outputs={"y": SHARD}) for _ in range(3)]
-        r = Reduce(bytes_per_rank=128.0, world=3, dtype="bf16")
+        r = Reduce(total_bytes=128.0, world=3, dtype="bf16")
         r.inputs = {f"x{i}": SHARD for i in range(3)}
         r.outputs = {"z": SHARD}
-        b = Broadcast(bytes_per_rank=128.0, world=3)
+        b = Broadcast(total_bytes=128.0, world=3)
         b.inputs = {"z": SHARD}
         b.outputs = {"y0": SHARD, "y1": SHARD}
         succs = [Kernel(inputs={"a": SHARD}) for _ in range(2)]

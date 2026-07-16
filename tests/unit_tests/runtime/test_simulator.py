@@ -274,7 +274,7 @@ class TestAlphaSeparation:
         t_out2 = Tensor("bf16", (1,))
         k_succ = SyntheticKernel(flops_val=0.0, inputs={"a": Tensor("bf16", (1,))})
 
-        ar = AllReduce(bytes_per_rank=100000.0, world=2, dtype="bf16")
+        ar = AllReduce(total_bytes=100000.0, world=2, dtype="bf16")
         ar.inputs = {"x": Tensor("bf16", (1,))}
         ar.outputs = {"y": Tensor("bf16", (1,))}
 

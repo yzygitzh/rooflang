@@ -32,6 +32,9 @@ def export_trace(result: SimulationResult, path: str) -> None:
         input_bw = kernel.input_bytes / (dur_s * 1e9) if dur_s > 0 else 0.0
         weight_bw = kernel.weight_bytes / (dur_s * 1e9) if dur_s > 0 else 0.0
         output_bw = kernel.output_bytes / (dur_s * 1e9) if dur_s > 0 else 0.0
+        inputs = {k: list(t.shape) for k, t in kernel.inputs.items()}
+        weights = {k: list(t.shape) for k, t in kernel.weights.items()}
+        outputs = {k: list(t.shape) for k, t in kernel.outputs.items()}
         events.append({
             "name": type(kernel).__name__,
             "cat": entry.bound.value,
@@ -50,6 +53,9 @@ def export_trace(result: SimulationResult, path: str) -> None:
                 "output_bandwidth_gbs": output_bw,
                 "mfu": mfu,
                 "bound": entry.bound.value,
+                "inputs": inputs,
+                "weights": weights,
+                "outputs": outputs,
             },
         })
 

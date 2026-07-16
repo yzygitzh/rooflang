@@ -77,12 +77,12 @@ class RunningKernel:
     __slots__ = ("kernel", "device", "stream", "resource_cap",
                  "compute_time", "memory_time",
                  "network_alpha", "network_transfer_time",
-                 "fabric_edges", "start_us",
+                 "fabric_edges", "participants", "start_us",
                  "cp", "mp", "tp", "alpha_remaining",
                  "seg_start", "dev_share", "net_share")
 
     def __init__(self, kernel, device, stream, cap, ct, mt,
-                 alpha, xfer, fabs, t0):
+                 alpha, xfer, fabs, parts, t0):
         self.kernel = kernel
         self.device = device
         self.stream = stream
@@ -92,6 +92,7 @@ class RunningKernel:
         self.network_alpha = alpha
         self.network_transfer_time = xfer
         self.fabric_edges = fabs
+        self.participants = parts
         self.start_us = t0
         self.cp = self.mp = self.tp = 0.0
         self.alpha_remaining = alpha
@@ -223,8 +224,14 @@ class Simulator:
                 self._completed.add(kernel)
                 self._kernel_end[kernel] = now
                 self._stream_end[(dev, stream)] = now
-                self._trace.append(TraceEntry(
-                    kernel, dev, stream, rk.start_us, now, rk.bound()))
+                bound = rk.bound()
+                if isinstance(kernel, CommKernel) and len(rk.participants) > 1:
+                    for part_dev in rk.participants:
+                        self._trace.append(TraceEntry(
+                            kernel, part_dev, stream, rk.start_us, now, bound))
+                else:
+                    self._trace.append(TraceEntry(
+                        kernel, dev, stream, rk.start_us, now, bound))
                 self._complete_kernel_memory(kernel)
                 self._finish_kernel(rk, now)
                 for succ in self._graph._dag.successors(kernel):
@@ -252,7 +259,7 @@ class Simulator:
         dev, stream, cap, parts = self._resolve(kernel)
         ct, mt, alpha, xfer, fabs = self._base_times(kernel, dev, parts)
         rk = RunningKernel(kernel, dev, stream, cap, ct, mt,
-                           alpha, xfer, fabs, now)
+                           alpha, xfer, fabs, parts, now)
         key = (dev, stream)
         self._stream_active[key] = rk
         self._on_dev.setdefault(dev, []).append(rk)

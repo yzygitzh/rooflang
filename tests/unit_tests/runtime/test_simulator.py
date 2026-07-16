@@ -290,9 +290,9 @@ class TestAlphaSeparation:
         p.set_kernel_device(k_succ, gpu1)
 
         result = _sim(g, p, hw)
-        # Find the AllReduce trace entry
+        # Find the AllReduce trace entries (one per participant)
         ar_entry = [e for e in result.trace if e.kernel is ar]
-        assert len(ar_entry) == 1
+        assert len(ar_entry) == 2
         ar_time = ar_entry[0].end_us - ar_entry[0].start_us
         # alpha=5, xfer≈1 → total ≈ 6 us
         assert ar_time == pytest.approx(6.0, rel=0.1)

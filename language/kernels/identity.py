@@ -1,14 +1,49 @@
-"""Identity kernels — explicit data movement between memory tiers."""
+"""Identity kernels — zero-cost structural nodes and data movement."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict
 
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.tensor import Tensor
 
 if TYPE_CHECKING:
     from rooflang.language.hardware.component import Memory
+
+
+class Spawn(Kernel):
+    """One-to-many data dependency placeholder with zero cost.
+
+    Used by split_kernel prev_comm when no actual communication is needed
+    (e.g., input already replicated/sharded from a prior operation).
+    The simulator treats this as an instant pass-through.
+    """
+
+    _requires_placement = False
+
+    def __init__(self, world: int):
+        self.world = world
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        return 0.0
+
+    @property
+    def transferred_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def input_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        return 0.0
 
 
 class Move(Kernel):

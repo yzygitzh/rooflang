@@ -11,9 +11,10 @@ from typing import List
 
 from rooflang.language.graph import ComputeGraph
 from rooflang.language.hardware.component import Compute
-from rooflang.language.kernels.comm import Broadcast
 from rooflang.language.kernels.forward import Gemm, RMSNorm, SparseAttn
+from rooflang.language.kernels.identity import Spawn
 from rooflang.language.kernels.kernel import Kernel
+from rooflang.language.optimization.split import column_split, head_split, row_split
 from rooflang.language.placement import Placement
 from rooflang.language.tensor import Tensor
 from rooflang.language.utils import dtype_bytes
@@ -59,74 +60,6 @@ def make_norm(M, dim):
     k.outputs = {"y": Tensor("bf16", (M * dim,))}
     return k
 
-
-# ── Split functions ────────────────────────────────────────────────────
-
-def column_split(kernel, n):
-    shard_n = kernel.N // n
-    prev = Broadcast(bytes_per_rank=0, world=n)
-    prev.inputs = dict(kernel.inputs)
-    prev.outputs = {f"o{i}": Tensor("bf16", (kernel.M * kernel.K,))
-                    for i in range(n)}
-    copies = []
-    for _ in range(n):
-        c = Gemm(kernel.M, shard_n, kernel.K, kernel.w_dtype,
-                 kernel.a_dtype, kernel.out_dtype)
-        c.inputs = {"x": Tensor("bf16", (kernel.M * kernel.K,))}
-        c.weights = {"w": Tensor(kernel.w_dtype, (kernel.K * shard_n,))}
-        c.outputs = {"y": Tensor("bf16", (kernel.M * shard_n,))}
-        copies.append(c)
-    next_ = Broadcast(bytes_per_rank=0, world=n)
-    next_.inputs = {f"i{i}": Tensor("bf16", (kernel.M * shard_n,))
-                    for i in range(n)}
-    next_.outputs = dict(kernel.outputs)
-    return prev, copies, next_
-
-
-def row_split(kernel, n):
-    shard_k = kernel.K // n
-    prev = Broadcast(bytes_per_rank=0, world=n)
-    prev.inputs = dict(kernel.inputs)
-    prev.outputs = {f"o{i}": Tensor("bf16", (kernel.M * shard_k,))
-                    for i in range(n)}
-    copies = []
-    for _ in range(n):
-        c = Gemm(kernel.M, kernel.N, shard_k, kernel.w_dtype,
-                 kernel.a_dtype, kernel.out_dtype)
-        c.inputs = {"x": Tensor("bf16", (kernel.M * shard_k,))}
-        c.weights = {"w": Tensor(kernel.w_dtype, (shard_k * kernel.N,))}
-        c.outputs = {"y": Tensor("bf16", (kernel.M * kernel.N,))}
-        copies.append(c)
-    ar_bytes = 2 * (n - 1) / n * kernel.M * kernel.N * dtype_bytes("bf16")
-    next_ = Broadcast(bytes_per_rank=ar_bytes, world=n)
-    next_.inputs = {f"i{i}": Tensor("bf16", (kernel.M * kernel.N,))
-                    for i in range(n)}
-    next_.outputs = dict(kernel.outputs)
-    return prev, copies, next_
-
-
-def head_split(kernel, n):
-    shard_h = kernel.H // n
-    q_elems = kernel.B * shard_h * kernel.S_q * kernel.Hd
-    kv_elems = 2 * kernel.B * kernel.H_kv * kernel.S_q * kernel.k_sel * kernel.Hd
-    in_elems = q_elems + kv_elems
-    out_elems = kernel.B * shard_h * kernel.S_q * kernel.Hd
-    prev = Broadcast(bytes_per_rank=0, world=n)
-    prev.inputs = dict(kernel.inputs)
-    prev.outputs = {f"o{i}": Tensor(kernel.dtype_, (in_elems,))
-                    for i in range(n)}
-    copies = []
-    for _ in range(n):
-        c = SparseAttn(kernel.B, shard_h, kernel.H_kv, kernel.S_q,
-                       kernel.k_sel, kernel.Hd, kernel.dtype_)
-        c.inputs = {"x": Tensor(kernel.dtype_, (in_elems,))}
-        c.outputs = {"y": Tensor(kernel.dtype_, (out_elems,))}
-        copies.append(c)
-    next_ = Broadcast(bytes_per_rank=0, world=n)
-    next_.inputs = {f"i{i}": Tensor(kernel.dtype_, (out_elems,))
-                    for i in range(n)}
-    next_.outputs = dict(kernel.outputs)
-    return prev, copies, next_
 
 
 # ── Per-layer metadata for optimization phase ───────────────────────────
@@ -179,7 +112,7 @@ def declare_model():
 
         # Residual fan-out: bridge feeds both attn_norm and comp
         if prev_out is not None:
-            bridge = Broadcast(bytes_per_rank=0, world=2)
+            bridge = Spawn(world=2)
             bridge.inputs = {"x": Tensor("bf16", (M * D,))}
             bridge.outputs = {"y": Tensor("bf16", (M * D,)),
                               "y2": Tensor("bf16", (M * D,))}

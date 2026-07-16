@@ -107,6 +107,11 @@ def _fuse_pairs(graph: ComputeGraph, placement: Placement) -> bool:
             collective = _create_collective(kernel, successor)
 
             if collective is None:
+                # Identity case — verify shard shapes match before bypass
+                collector_shard = next(iter(kernel.inputs.values())).shape
+                distributor_shard = next(iter(successor.outputs.values())).shape
+                if collector_shard != distributor_shard:
+                    continue
                 _bypass_pair(graph, kernel, successor)
             else:
                 _replace_pair(graph, kernel, successor, collective)
@@ -140,24 +145,20 @@ def _bypass_pair(
 ) -> None:
     """Eliminate a Gather+Scatter same-dim pair (identity — no comm needed).
 
-    Wires each predecessor directly to the corresponding successor.
+    Wires each predecessor directly to the corresponding successor by rank
+    index: the positional index of the Gather input port maps to the same
+    positional index of the Scatter output port.
     """
     in_edges = graph._in_edges(collector)
     out_edges = graph._out_edges(distributor)
 
     collector_in_keys = list(collector.inputs.keys())
-    collector_out_keys = list(collector.outputs.keys())
-    distributor_in_keys = list(distributor.inputs.keys())
     distributor_out_keys = list(distributor.outputs.keys())
 
     for ie in in_edges:
         for src_out, coll_in in ie.mapping.items():
-            idx = collector_in_keys.index(coll_in)
-            coll_out = collector_out_keys[idx]
-            dist_in_key = distributor_in_keys[
-                collector_out_keys.index(coll_out)]
-            dist_in_idx = distributor_in_keys.index(dist_in_key)
-            dist_out = distributor_out_keys[dist_in_idx]
+            rank_idx = collector_in_keys.index(coll_in)
+            dist_out = distributor_out_keys[rank_idx]
             for oe in out_edges:
                 if dist_out in oe.mapping:
                     graph.add_data_edge(ie.src, oe.dst,

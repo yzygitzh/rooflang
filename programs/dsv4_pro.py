@@ -14,6 +14,7 @@ from rooflang.language.hardware.component import Compute
 from rooflang.language.kernels.forward import Gemm, RMSNorm, SparseAttn
 from rooflang.language.kernels.identity import Spawn
 from rooflang.language.kernels.kernel import Kernel
+from rooflang.language.optimization.comm import optimize_comms
 from rooflang.language.optimization.split import column_split, head_split, row_split
 from rooflang.language.placement import Placement
 from rooflang.language.tensor import Tensor
@@ -303,8 +304,6 @@ def optimize_model(g, layers, hw):
         L._wo_a_copies = wo_a_copies
         L._wo_b_copies = wo_b_copies
 
-    g.validate()
-
     # ── Placement ─────────────────────────────────────────────────
     p = Placement(hardware=hw, graph=g)
 
@@ -333,6 +332,9 @@ def optimize_model(g, layers, hw):
         for k in [L.combine, L.sw_up, L.sw_down]:
             p.set_kernel_device(k, gpus[0])
 
+    optimize_comms(g, p)
+
+    g.validate()
     p.validate(g)
     return g, p
 

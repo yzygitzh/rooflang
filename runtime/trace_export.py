@@ -62,11 +62,28 @@ def export_trace(result: SimulationResult, path: str) -> None:
     peak_memory = [{"name": mem.name, "bytes": bytes_val}
                    for mem, bytes_val in result.peak_memory.items()]
 
+    total_s = result.total_time_us / 1e6 if result.total_time_us > 0 else 0.0
+    device_flops: Dict[str, float] = {}
+    for entry in result.trace:
+        device_flops[entry.device.name] = (
+            device_flops.get(entry.device.name, 0.0) + entry.kernel.flops)
+    gpu_stats = []
+    for dev in sorted(devices, key=lambda d: d.name):
+        flops = device_flops.get(dev.name, 0.0)
+        peak = max(dev.tflops.values(), default=0.0) * 1e12
+        mfu = flops / (peak * total_s) if peak > 0 and total_s > 0 else 0.0
+        gpu_stats.append({
+            "name": dev.name,
+            "total_flops": flops,
+            "mfu": mfu,
+        })
+
     output = {
         "traceEvents": events,
         "otherData": {
             "total_time_us": result.total_time_us,
             "peak_memory": peak_memory,
+            "gpu_stats": gpu_stats,
         },
     }
 

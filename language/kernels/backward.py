@@ -264,3 +264,80 @@ class SparseAttn(Kernel):
         b = dtype_bytes(self.dtype_)
         return (self.B * self.H * self.S_q * self.Hd
                 + 2 * self.B * self.H_kv * self.S_q * self.k_sel * self.Hd) * b
+
+
+class StridedGemmDX(Kernel):
+    """Backward dX for StridedGemm: dX = dY · W^T.
+
+    flops = 2·M·N·K.
+    bytes:
+        input_bytes  = out_elems · sizeof(out_dtype)        (read dY)
+        weight_bytes = K·N · sizeof(w_dtype) + scale        (read W)
+        output_bytes = in_elems · sizeof(a_dtype)           (write dX)
+    """
+
+    def __init__(self, M: int, N: int, K: int,
+                 w_dtype: str, a_dtype: str = "bf16", out_dtype: str = "bf16",
+                 *, in_elems: int = 0, out_elems: int = 0):
+        self.M, self.N, self.K = M, N, K
+        self.w_dtype, self.a_dtype, self.out_dtype = w_dtype, a_dtype, out_dtype
+        self._in_elems = in_elems if in_elems else M * K
+        self._out_elems = out_elems if out_elems else M * N
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        return 2.0 * self.M * self.N * self.K
+
+    @property
+    def input_bytes(self) -> float:
+        return self._out_elems * dtype_bytes(self.out_dtype)
+
+    @property
+    def weight_bytes(self) -> float:
+        return (self.K * self.N * dtype_bytes(self.w_dtype)
+                + gemm_scale_bytes(self.N, self.K, self.w_dtype))
+
+    @property
+    def output_bytes(self) -> float:
+        return self._in_elems * dtype_bytes(self.a_dtype)
+
+
+class StridedGemmDW(Kernel):
+    """Backward dW for StridedGemm: dW = X^T · dY.
+
+    flops = 2·M·N·K.
+    bytes:
+        input_bytes  = out_elems · sizeof(out_dtype) + in_elems · sizeof(a_dtype)
+                       (read dY + X)
+        weight_bytes = 0
+        output_bytes = K·N · sizeof(grad_dtype)             (write dW)
+    """
+
+    def __init__(self, M: int, N: int, K: int,
+                 w_dtype: str, a_dtype: str = "bf16", out_dtype: str = "bf16",
+                 grad_dtype: str = "fp32",
+                 *, in_elems: int = 0, out_elems: int = 0):
+        self.M, self.N, self.K = M, N, K
+        self.w_dtype, self.a_dtype, self.out_dtype = w_dtype, a_dtype, out_dtype
+        self.grad_dtype = grad_dtype
+        self._in_elems = in_elems if in_elems else M * K
+        self._out_elems = out_elems if out_elems else M * N
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        return 2.0 * self.M * self.N * self.K
+
+    @property
+    def input_bytes(self) -> float:
+        return (self._out_elems * dtype_bytes(self.out_dtype)
+                + self._in_elems * dtype_bytes(self.a_dtype))
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        return self.K * self.N * dtype_bytes(self.grad_dtype)

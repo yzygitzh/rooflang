@@ -455,6 +455,25 @@ class ComputeGraph:
                     raise ValueError(
                         f"Inputs {missing} of {kernel} are not connected")
 
+        for kernel in self._dag.nodes:
+            if not kernel._requires_placement:
+                continue
+            tensor_in = sum(t.size_bytes for t in kernel.inputs.values())
+            tensor_w = sum(t.size_bytes for t in kernel.weights.values())
+            tensor_out = sum(t.size_bytes for t in kernel.outputs.values())
+            if kernel.inputs and kernel.input_bytes != tensor_in:
+                raise ValueError(
+                    f"{type(kernel).__name__}: input_bytes property "
+                    f"({kernel.input_bytes}) != tensor sum ({tensor_in})")
+            if kernel.weights and kernel.weight_bytes != tensor_w:
+                raise ValueError(
+                    f"{type(kernel).__name__}: weight_bytes property "
+                    f"({kernel.weight_bytes}) != tensor sum ({tensor_w})")
+            if kernel.outputs and kernel.output_bytes != tensor_out:
+                raise ValueError(
+                    f"{type(kernel).__name__}: output_bytes property "
+                    f"({kernel.output_bytes}) != tensor sum ({tensor_out})")
+
     # ── Internals ─────────────────────────────────────────────────────
 
     def _in_edges(self, kernel: Kernel) -> List[DataEdge]:

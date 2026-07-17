@@ -16,7 +16,7 @@ from rooflang.language.kernels.comm import Broadcast, Gather, Reduce, Scatter
 from rooflang.language.kernels.identity import Spawn
 from rooflang.language.kernels.forward import Gemm, SparseAttn
 from rooflang.language.tensor import Tensor
-from rooflang.language.utils import dtype_bytes
+from rooflang.language.utils import dtype_bytes, gemm_scale_bytes
 
 
 def column_split(kernel, n):
@@ -37,6 +37,9 @@ def column_split(kernel, n):
                  kernel.a_dtype, kernel.out_dtype)
         c.inputs = {"x": Tensor("bf16", (kernel.M * kernel.K,))}
         c.weights = {"w": Tensor(kernel.w_dtype, (kernel.K * shard_n,))}
+        scale_bytes = gemm_scale_bytes(shard_n, kernel.K, kernel.w_dtype)
+        if scale_bytes > 0:
+            c.weights["s"] = Tensor("ue8m0", (int(scale_bytes),))
         c.outputs = {"y": Tensor("bf16", (kernel.M * shard_n,))}
         copies.append(c)
     output_bytes = kernel.M * kernel.N * dtype_bytes("bf16")
@@ -65,6 +68,9 @@ def row_split(kernel, n):
                  kernel.a_dtype, kernel.out_dtype)
         c.inputs = {"x": Tensor("bf16", (kernel.M * shard_k,))}
         c.weights = {"w": Tensor(kernel.w_dtype, (shard_k * kernel.N,))}
+        scale_bytes = gemm_scale_bytes(kernel.N, shard_k, kernel.w_dtype)
+        if scale_bytes > 0:
+            c.weights["s"] = Tensor("ue8m0", (int(scale_bytes),))
         c.outputs = {"y": Tensor("bf16", (kernel.M * kernel.N,))}
         copies.append(c)
     reduce_bytes = kernel.M * kernel.N * dtype_bytes("bf16")
@@ -83,7 +89,7 @@ def head_split(kernel, n):
     """
     shard_h = kernel.H // n
     q_elems = kernel.B * shard_h * kernel.S_q * kernel.Hd
-    kv_elems = 2 * kernel.B * kernel.H_kv * kernel.S_q * kernel.k_sel * kernel.Hd
+    kv_elems = kernel.kv_factor * kernel.B * kernel.H_kv * kernel.S_kv * kernel.Hd
     in_elems = q_elems + kv_elems
     out_elems = kernel.B * shard_h * kernel.S_q * kernel.Hd
     in_bytes = kernel.B * kernel.H * kernel.S_q * kernel.Hd * dtype_bytes(kernel.dtype_)
@@ -94,7 +100,8 @@ def head_split(kernel, n):
     copies = []
     for _ in range(n):
         c = SparseAttn(kernel.B, shard_h, kernel.H_kv, kernel.S_q,
-                       kernel.k_sel, kernel.Hd, kernel.dtype_)
+                       kernel.k_sel, kernel.S_kv, kernel.Hd, kernel.dtype_,
+                       kernel.kv_factor)
         c.inputs = {"x": Tensor(kernel.dtype_, (in_elems,))}
         c.outputs = {"y": Tensor(kernel.dtype_, (out_elems,))}
         copies.append(c)

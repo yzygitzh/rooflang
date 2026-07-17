@@ -179,22 +179,66 @@ class Attn(Kernel):
         return self.B * self.H * self.S_q * self.Hd * dtype_bytes(self.dtype_)
 
 
+class StridedGemm(Kernel):
+    """Gemm-like kernel where I/O shapes differ from standard M*K / M*N.
+
+    Used for grouped linears (input != M*K), fused gated projections
+    (output != M*N), or strided writes (output rows != M).
+    Flops still follow 2*M*N*K.
+
+    bytes:
+        input_bytes  = in_elems · sizeof(a_dtype)
+        weight_bytes = K·N · sizeof(w_dtype) + scale
+        output_bytes = out_elems · sizeof(out_dtype)
+    """
+
+    def __init__(self, M: int, N: int, K: int,
+                 w_dtype: str, a_dtype: str = "bf16", out_dtype: str = "bf16",
+                 *, in_elems: int = 0, out_elems: int = 0):
+        self.M, self.N, self.K = M, N, K
+        self.w_dtype, self.a_dtype, self.out_dtype = w_dtype, a_dtype, out_dtype
+        self._in_elems = in_elems if in_elems else M * K
+        self._out_elems = out_elems if out_elems else M * N
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        return 2.0 * self.M * self.N * self.K
+
+    @property
+    def input_bytes(self) -> float:
+        return self._in_elems * dtype_bytes(self.a_dtype)
+
+    @property
+    def weight_bytes(self) -> float:
+        return (self.K * self.N * dtype_bytes(self.w_dtype)
+                + gemm_scale_bytes(self.N, self.K, self.w_dtype))
+
+    @property
+    def output_bytes(self) -> float:
+        return self._out_elems * dtype_bytes(self.out_dtype)
+
+
 class SparseAttn(Kernel):
     """Sparse attention: each query attends to k_sel selected K/V tokens.
 
     flops = 4·B·H·S_q·k_sel·Hd.
-    bytes:
-        input_bytes  = (B·H·S_q·Hd + 2·B·H_kv·S_q·k_sel·Hd) · sizeof(dtype)
+    bytes (flash-tiled, KV cache read once from HBM):
+        input_bytes  = (B·H·S_q·Hd + kv_factor·B·H_kv·S_kv·Hd) · sizeof(dtype)
         weight_bytes = 0
         output_bytes = B·H·S_q·Hd · sizeof(dtype)
+
+    kv_factor=2 for standard MHA (separate K/V caches);
+    kv_factor=1 for MLA (shared latent read once from HBM).
     """
 
     def __init__(self, B: int, H: int, H_kv: int,
-                 S_q: int, k_sel: int, Hd: int,
-                 dtype: str = "bf16"):
+                 S_q: int, k_sel: int, S_kv: int, Hd: int,
+                 dtype: str = "bf16", kv_factor: int = 2):
         self.B, self.H, self.H_kv = B, H, H_kv
-        self.S_q, self.k_sel, self.Hd = S_q, k_sel, Hd
+        self.S_q, self.k_sel, self.S_kv, self.Hd = S_q, k_sel, S_kv, Hd
         self.dtype_ = dtype
+        self.kv_factor = kv_factor
         super().__init__()
 
     @property
@@ -205,7 +249,7 @@ class SparseAttn(Kernel):
     def input_bytes(self) -> float:
         b = dtype_bytes(self.dtype_)
         return (self.B * self.H * self.S_q * self.Hd
-                + 2 * self.B * self.H_kv * self.S_q * self.k_sel * self.Hd) * b
+                + self.kv_factor * self.B * self.H_kv * self.S_kv * self.Hd) * b
 
     @property
     def weight_bytes(self) -> float:

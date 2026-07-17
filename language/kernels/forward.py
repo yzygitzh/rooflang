@@ -12,6 +12,42 @@ from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.utils import dtype_bytes, gemm_scale_bytes
 
 
+class Embedding(Kernel):
+    """Token embedding lookup: gather M rows from a V×D table.
+
+    flops = 0 (pure gather, no arithmetic).
+    bytes:
+        input_bytes  = M · sizeof(idx_dtype)        (token indices)
+        weight_bytes = M · D · sizeof(w_dtype)      (gathered rows from table)
+        output_bytes = M · D · sizeof(out_dtype)
+    """
+
+    def __init__(self, M: int, V: int, D: int,
+                 w_dtype: str = "bf16", idx_dtype: str = "int32",
+                 out_dtype: str = "bf16"):
+        self.M, self.V, self.D = M, V, D
+        self.w_dtype = w_dtype
+        self.idx_dtype = idx_dtype
+        self.out_dtype = out_dtype
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        return 0.0
+
+    @property
+    def input_bytes(self) -> float:
+        return self.M * dtype_bytes(self.idx_dtype)
+
+    @property
+    def weight_bytes(self) -> float:
+        return self.M * self.D * dtype_bytes(self.w_dtype)
+
+    @property
+    def output_bytes(self) -> float:
+        return self.M * self.D * dtype_bytes(self.out_dtype)
+
+
 class Gemm(Kernel):
     """Dense GEMM C(M,N) = A(M,K) · B(K,N).
 

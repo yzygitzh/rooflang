@@ -12,7 +12,8 @@ from typing import List
 from rooflang.language.graph import ComputeGraph
 from rooflang.language.hardware.component import Compute
 from rooflang.language.kernels.forward import (
-    Gemm, RMSNorm, SparseAttn, StridedGemm, TokenCombine, TokenDispatch,
+    Embedding, Gemm, RMSNorm, SparseAttn, StridedGemm, TokenCombine,
+    TokenDispatch,
 )
 from rooflang.language.kernels.identity import Concat, Spawn
 from rooflang.language.kernels.kernel import Kernel
@@ -42,6 +43,7 @@ INDEX_TOPK = 1024
 TP = 8
 EP = 8
 N_LOCAL_EXPERTS = N_EXPERTS // EP
+V = 129280
 BATCH = 1
 S_PREFILL = 8192
 COMPRESS_RATIOS = [128, 128] + [v for _ in range(29) for v in (4, 128)] + [4]
@@ -117,7 +119,14 @@ def declare_model():
     M = BATCH * S  # total tokens (all Gemm/Norm/MoE use M)
     layers = []
 
-    prev_out = None
+    # Embedding lookup
+    emb = Embedding(M, V, D)
+    emb.inputs = {"idx": Tensor("int32", (M,))}
+    emb.weights = {"emb": Tensor("bf16", (M, D))}
+    emb.outputs = {"y": Tensor("bf16", (M, D))}
+    g.add_kernel(emb)
+
+    prev_out = emb
 
     for layer_id in range(N_LAYERS):
         ratio = COMPRESS_RATIOS[layer_id]
@@ -310,14 +319,14 @@ def declare_model():
         layers.append(L)
 
     g.validate()
-    return g, layers
+    return g, layers, emb
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # B. Optimization Phase
 # ═══════════════════════════════════════════════════════════════════════
 
-def optimize_model(g, layers, hw):
+def optimize_model(g, layers, hw, emb=None):
     """Apply split_kernel for TP, add control edges, and place."""
     gpus = sorted(
         [c for c in hw.nodes if isinstance(c, Compute)
@@ -355,6 +364,9 @@ def optimize_model(g, layers, hw):
 
     # ── Placement ─────────────────────────────────────────────────
     p = Placement(hardware=hw, graph=g)
+
+    if emb is not None:
+        p.set_kernel_device(emb, gpus[0])
 
     for L in layers:
         # Non-split kernels → GPU0 (place in topological order)
@@ -403,10 +415,10 @@ def simulate(g, p, hw):
 def main():
     # A. Declaration
     hw = B300ClusterA(n_nodes=1)
-    g, layers = declare_model()
+    g, layers, emb = declare_model()
 
     # B. Optimization
-    g, p = optimize_model(g, layers, hw)
+    g, p = optimize_model(g, layers, hw, emb)
 
     # C. Simulation
     result = simulate(g, p, hw)

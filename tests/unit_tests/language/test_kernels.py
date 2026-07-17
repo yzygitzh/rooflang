@@ -2,7 +2,7 @@
 
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.kernels.forward import (
-    Gemm, RMSNorm, LayerNorm, RoPE, Attn, SparseAttn,
+    Embedding, Gemm, RMSNorm, LayerNorm, RoPE, Attn, SparseAttn,
     TokenDispatch, TokenCombine,
 )
 from rooflang.language.kernels import backward
@@ -102,6 +102,15 @@ class TestKernelBase:
 # ── Forward kernels ──────────────────────────────────────────────────
 
 
+class TestEmbedding(TestKernelBase):
+    __test__ = True
+    kernel = Embedding(M=8192, V=129280, D=7168, w_dtype="bf16")
+    expected_flops = 0.0
+    expected_input_bytes = 8192 * 4.0
+    expected_weight_bytes = 8192 * 7168 * 2.0
+    expected_output_bytes = 8192 * 7168 * 2.0
+
+
 class TestGemm(TestKernelBase):
     __test__ = True
     kernel = Gemm(M=32, N=64, K=128, w_dtype="bf16", a_dtype="bf16")
@@ -165,6 +174,15 @@ class TestSparseAttn(TestKernelBase):
 
 
 # ── Backward kernels ─────────────────────────────────────────────────
+
+
+class TestBwdEmbedding(TestKernelBase):
+    __test__ = True
+    kernel = backward.Embedding(M=8192, V=129280, D=7168)
+    expected_flops = 8192.0 * 7168
+    expected_input_bytes = 8192 * 7168 * 2.0 + 8192 * 4.0
+    expected_weight_bytes = 0.0
+    expected_output_bytes = 8192 * 7168 * 4.0
 
 
 class TestGemmDX(TestKernelBase):

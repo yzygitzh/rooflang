@@ -20,6 +20,44 @@ from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.utils import dtype_bytes, gemm_scale_bytes
 
 
+class Embedding(Kernel):
+    """Embedding backward: scatter-add gradients to M rows of the table.
+
+    flops = M·D (one add per gathered element).
+    bytes:
+        input_bytes  = M·D·sizeof(a_dtype) + M·sizeof(idx_dtype)
+                       (upstream gradient + saved token indices)
+        weight_bytes = 0
+        output_bytes = M·D·sizeof(grad_dtype)  (scattered gradient rows)
+    """
+
+    def __init__(self, M: int, V: int, D: int,
+                 a_dtype: str = "bf16", idx_dtype: str = "int32",
+                 grad_dtype: str = "fp32"):
+        self.M, self.V, self.D = M, V, D
+        self.a_dtype = a_dtype
+        self.idx_dtype = idx_dtype
+        self.grad_dtype = grad_dtype
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        return float(self.M * self.D)
+
+    @property
+    def input_bytes(self) -> float:
+        return (self.M * self.D * dtype_bytes(self.a_dtype)
+                + self.M * dtype_bytes(self.idx_dtype))
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        return self.M * self.D * dtype_bytes(self.grad_dtype)
+
+
 class GemmDX(Kernel):
     """dX(M,K) = dY(M,N) · W(N,K).
 

@@ -4,7 +4,8 @@
 def dtype_bytes(dtype: str) -> float:
     """Bytes-per-element by compute or storage dtype."""
     table = {"fp4": 0.5, "fp8": 1.0, "ue8m0": 1.0,
-             "bf16": 2.0, "fp16": 2.0, "fp32": 4.0}
+             "bf16": 2.0, "fp16": 2.0, "fp32": 4.0,
+             "int32": 4.0, "int64": 8.0}
     if dtype not in table:
         raise ValueError(f"unknown dtype: {dtype}")
     return table[dtype]

@@ -42,6 +42,7 @@ INDEX_TOPK = 1024
 TP = 8
 EP = 8
 N_LOCAL_EXPERTS = N_EXPERTS // EP
+BATCH = 1
 S_PREFILL = 8192
 COMPRESS_RATIOS = [128, 128] + [v for _ in range(29) for v in (4, 128)] + [4]
 
@@ -112,7 +113,8 @@ class LayerMeta:
 def declare_model():
     """Build logical compute graph using only add_kernel and add_data_edge."""
     g = ComputeGraph()
-    M = S_PREFILL
+    S = S_PREFILL
+    M = BATCH * S  # total tokens (all Gemm/Norm/MoE use M)
     layers = []
 
     prev_out = None
@@ -175,33 +177,35 @@ def declare_model():
         # Compressor (reads from residual via bridge, or root at layer 0)
         if ratio in (128, 4):
             coff = 1 if ratio == 128 else 2
-            comp_out_elems = M // ratio * KV_DIM
+            S_comp = S // ratio  # compressed seq len per sequence
+            M_comp = BATCH * S_comp  # total compressed tokens
+            comp_out_elems = M_comp * KV_DIM
             comp = StridedGemm(M, KV_DIM * coff, D, "fp32", "bf16",
                                in_elems=M * D, out_elems=comp_out_elems)
             comp.inputs = {"x": Tensor("bf16", (M, D))}
             comp.weights = {"w": Tensor("fp32", (D, KV_DIM * coff))}
-            comp.outputs = {"y": Tensor("bf16", (M // ratio, KV_DIM))}
+            comp.outputs = {"y": Tensor("bf16", (M_comp, KV_DIM))}
             g.add_kernel(comp)
             if L.bridge is not None:
                 g.add_data_edge(L.bridge, comp, {"y2": "x"})
             L.comp = comp
 
-            comp_norm = make_norm(M // ratio, KV_DIM)
+            comp_norm = make_norm(M_comp, KV_DIM)
             g.add_kernel(comp_norm)
             g.add_data_edge(comp, comp_norm, {"y": "x"})
             L.comp_norm = comp_norm
 
-        # Sparse attention
+        # Sparse attention (per-sequence dimensions)
         k_sel = WINDOW
         if ratio == 128:
-            k_sel = WINDOW + M // 128
+            k_sel = WINDOW + S // 128
         elif ratio == 4:
             k_sel = WINDOW + INDEX_TOPK
 
-        S_kv = M + M // ratio
-        sa = SparseAttn(1, H, 1, M, k_sel, S_kv, HD, "bf16", kv_factor=1)
+        S_kv = S + S // ratio
+        sa = SparseAttn(BATCH, H, 1, S, k_sel, S_kv, HD, "bf16", kv_factor=1)
         sa.inputs = {"q": Tensor("bf16", (M, H * HD)),
-                     "kv": Tensor("bf16", (S_kv, HD))}
+                     "kv": Tensor("bf16", (BATCH * S_kv, HD))}
         sa.outputs = {"y": Tensor("bf16", (M, H * HD))}
         g.add_kernel(sa)
         g.add_data_edge(wq_b, sa, {"y": "q"})
@@ -209,8 +213,8 @@ def declare_model():
         # KV cache = concat(window_kv, compressed_kv)
         kv_concat = Concat()
         kv_concat.inputs = {"a": Tensor("bf16", (M, KV_DIM)),
-                            "b": Tensor("bf16", (M // ratio, KV_DIM))}
-        kv_concat.outputs = {"y": Tensor("bf16", (S_kv, KV_DIM))}
+                            "b": Tensor("bf16", (M_comp, KV_DIM))}
+        kv_concat.outputs = {"y": Tensor("bf16", (BATCH * S_kv, KV_DIM))}
         g.add_kernel(kv_concat)
         g.add_data_edge(kv_norm, kv_concat, {"y": "a"})
         g.add_data_edge(comp_norm, kv_concat, {"y": "b"})

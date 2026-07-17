@@ -313,6 +313,12 @@ def optimize_model(g, layers, hw):
 
     # ── Graph transforms ──────────────────────────────────────────
     for L in layers:
+        # Row-split non-TP kernels (wq_a, wkv, comp)
+        _, wq_a_copies, _ = g.split_kernel(row_split, L.wq_a, TP)
+        _, wkv_copies, _ = g.split_kernel(row_split, L.wkv, TP)
+        if L.comp is not None:
+            _, comp_copies, _ = g.split_kernel(row_split, L.comp, TP)
+
         # TP splits
         _, wq_b_copies, _ = g.split_kernel(column_split, L.wq_b, TP)
         _, sa_copies, _ = g.split_kernel(head_split, L.sa, TP)
@@ -320,6 +326,9 @@ def optimize_model(g, layers, hw):
         _, wo_b_copies, _ = g.split_kernel(row_split, L.wo_b, TP)
 
         # Store copies for placement
+        L._wq_a_copies = wq_a_copies
+        L._wkv_copies = wkv_copies
+        L._comp_copies = comp_copies if L.comp is not None else []
         L._wq_b_copies = wq_b_copies
         L._sa_copies = sa_copies
         L._wo_a_copies = wo_a_copies
@@ -330,16 +339,15 @@ def optimize_model(g, layers, hw):
 
     for L in layers:
         # Non-split kernels → GPU0 (place in topological order)
-        for k in [L.attn_norm, L.wq_a, L.q_norm, L.wkv, L.kv_norm,
+        for k in [L.attn_norm, L.q_norm, L.kv_norm,
                   L.ffn_norm, L.gate, L.dispatch]:
             p.set_kernel_device(k, gpus[0])
-        if L.comp is not None:
-            p.set_kernel_device(L.comp, gpus[0])
         if L.comp_norm is not None:
             p.set_kernel_device(L.comp_norm, gpus[0])
 
         # TP copies → GPU0-7
-        for copies in [L._wq_b_copies, L._sa_copies,
+        for copies in [L._wq_a_copies, L._wkv_copies, L._comp_copies,
+                       L._wq_b_copies, L._sa_copies,
                        L._wo_a_copies, L._wo_b_copies]:
             for i, c in enumerate(copies):
                 p.set_kernel_device(c, gpus[i])

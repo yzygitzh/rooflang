@@ -114,16 +114,30 @@ def row_split(kernel, n):
     out_dtype = out_tensor.dtype
     out_shape = out_tensor.shape
     copies = []
-    for _ in range(n):
-        c = Gemm(kernel.M, kernel.N, shard_k, kernel.w_dtype,
-                 kernel.a_dtype, kernel.out_dtype)
-        c.inputs = {"x": Tensor(in_dtype, shard_in_shape)}
-        c.weights = {"w": Tensor(kernel.w_dtype, (shard_k, kernel.N))}
-        scale_bytes = gemm_scale_bytes(kernel.N, shard_k, kernel.w_dtype)
-        if scale_bytes > 0:
-            c.weights["s"] = Tensor("ue8m0", (int(scale_bytes),))
-        c.outputs = {"y": Tensor(out_dtype, out_shape)}
-        copies.append(c)
+    if isinstance(kernel, StridedGemm):
+        for _ in range(n):
+            c = StridedGemm(kernel.M, kernel.N, shard_k, kernel.w_dtype,
+                            kernel.a_dtype, kernel.out_dtype,
+                            in_elems=kernel._in_elems // n,
+                            out_elems=kernel._out_elems)
+            c.inputs = {"x": Tensor(in_dtype, shard_in_shape)}
+            c.weights = {"w": Tensor(kernel.w_dtype, (shard_k, kernel.N))}
+            scale_bytes = gemm_scale_bytes(kernel.N, shard_k, kernel.w_dtype)
+            if scale_bytes > 0:
+                c.weights["s"] = Tensor("ue8m0", (int(scale_bytes),))
+            c.outputs = {"y": Tensor(out_dtype, out_shape)}
+            copies.append(c)
+    else:
+        for _ in range(n):
+            c = Gemm(kernel.M, kernel.N, shard_k, kernel.w_dtype,
+                     kernel.a_dtype, kernel.out_dtype)
+            c.inputs = {"x": Tensor(in_dtype, shard_in_shape)}
+            c.weights = {"w": Tensor(kernel.w_dtype, (shard_k, kernel.N))}
+            scale_bytes = gemm_scale_bytes(kernel.N, shard_k, kernel.w_dtype)
+            if scale_bytes > 0:
+                c.weights["s"] = Tensor("ue8m0", (int(scale_bytes),))
+            c.outputs = {"y": Tensor(out_dtype, out_shape)}
+            copies.append(c)
 
     # next_comms: Reduce partial sums
     out_bytes = out_tensor.size_bytes

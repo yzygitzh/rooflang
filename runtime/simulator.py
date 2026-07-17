@@ -159,6 +159,7 @@ class Simulator:
         self._eq: list = []
         self._stream_active: Dict[Tuple[Compute, int], RunningKernel] = {}
         self._stream_pending: Dict[Tuple[Compute, int], List[Kernel]] = {}
+        self._multi_stream_waiting: List[Tuple[float, Kernel]] = []
 
         # ── Memory tracking init ────────────────────────────────────
         self._mem_usage: Dict[Memory, float] = defaultdict(float)
@@ -255,13 +256,30 @@ class Simulator:
 
     # ── Kernel lifecycle ────────────────────────────────────────────
 
+    def _is_multi_stream_comm(self, kernel: Kernel, parts) -> bool:
+        """True when a collective comm blocks ALL participant streams."""
+        return isinstance(kernel, CommKernel) and len(parts) > 1
+
     def _start_kernel(self, kernel: Kernel, now: float):
         dev, stream, cap, parts = self._resolve(kernel)
+
+        # Collective comm blocks ALL participant streams
+        if self._is_multi_stream_comm(kernel, parts):
+            for p_dev in parts:
+                if (p_dev, stream) in self._stream_active:
+                    self._multi_stream_waiting.append((now, kernel))
+                    return
+
         ct, mt, alpha, xfer, fabs = self._base_times(kernel, dev, parts)
         rk = RunningKernel(kernel, dev, stream, cap, ct, mt,
                            alpha, xfer, fabs, parts, now)
         key = (dev, stream)
         self._stream_active[key] = rk
+        if self._is_multi_stream_comm(kernel, parts):
+            for p_dev in parts:
+                p_key = (p_dev, stream)
+                if p_key != key:
+                    self._stream_active[p_key] = rk
         self._on_dev.setdefault(dev, []).append(rk)
         for fab in fabs:
             self._on_fab.setdefault(fab, []).append(rk)
@@ -274,6 +292,18 @@ class Simulator:
     def _finish_kernel(self, rk: RunningKernel, now: float):
         key = (rk.device, rk.stream)
         del self._stream_active[key]
+
+        # Clear all participant streams for multi-sender comm
+        extra_keys = []
+        if self._is_multi_stream_comm(rk.kernel, rk.participants):
+            for p_dev in rk.participants:
+                p_key = (p_dev, rk.stream)
+                if p_key != key:
+                    if self._stream_active.get(p_key) is rk:
+                        del self._stream_active[p_key]
+                    extra_keys.append(p_key)
+                self._stream_end[p_key] = now
+
         self._on_dev[rk.device].remove(rk)
         for fab in rk.fabric_edges:
             self._on_fab[fab].remove(rk)
@@ -284,13 +314,33 @@ class Simulator:
             if self._on_fab.get(fab):
                 self._recompute_shares(self._on_fab[fab][0])
         self._resched_peers(rk)
-        # Schedule next pending kernel on this stream
+        # Schedule next pending kernel on primary stream
         pending = self._stream_pending.get(key, [])
         while pending:
             next_k = pending.pop(0)
             if next_k not in self._completed:
                 self._push(now, "start", next_k, rk.device, rk.stream)
                 break
+        # Schedule next pending on extra participant streams
+        for p_key in extra_keys:
+            pending = self._stream_pending.get(p_key, [])
+            while pending:
+                next_k = pending.pop(0)
+                if next_k not in self._completed:
+                    self._push(now, "start", next_k, p_key[0], rk.stream)
+                    break
+        # Retry multi-stream-waiting comms
+        still_waiting = []
+        for (earliest, k) in self._multi_stream_waiting:
+            if k in self._completed:
+                continue
+            _, s, _, parts = self._resolve(k)
+            if all((p, s) not in self._stream_active for p in parts):
+                d, s2, _, _ = self._resolve(k)
+                self._push(max(earliest, now), "start", k, d, s2)
+            else:
+                still_waiting.append((earliest, k))
+        self._multi_stream_waiting = still_waiting
 
     # ── Memory tracking ────────────────────────────────────────────
 

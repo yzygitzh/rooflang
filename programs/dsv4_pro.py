@@ -48,32 +48,32 @@ COMPRESS_RATIOS = [128, 128] + [v for _ in range(29) for v in (4, 128)] + [4]
 
 def make_gemm(M, N, K, w_dtype, a_dtype="bf16", out_dtype="bf16"):
     k = Gemm(M, N, K, w_dtype, a_dtype, out_dtype)
-    k.inputs = {"x": Tensor(a_dtype, (M * K,))}
-    k.weights = {"w": Tensor(w_dtype, (K * N,))}
+    k.inputs = {"x": Tensor(a_dtype, (M, K))}
+    k.weights = {"w": Tensor(w_dtype, (K, N))}
     scale_bytes = gemm_scale_bytes(N, K, w_dtype)
     if scale_bytes > 0:
         k.weights["s"] = Tensor("ue8m0", (int(scale_bytes),))
-    k.outputs = {"y": Tensor(out_dtype, (M * N,))}
+    k.outputs = {"y": Tensor(out_dtype, (M, N))}
     return k
 
 
 def make_norm(M, dim):
     k = RMSNorm(M, dim, "bf16")
-    k.inputs = {"x": Tensor("bf16", (M * dim,))}
+    k.inputs = {"x": Tensor("bf16", (M, dim))}
     k.weights = {"g": Tensor("bf16", (dim,))}
-    k.outputs = {"y": Tensor("bf16", (M * dim,))}
+    k.outputs = {"y": Tensor("bf16", (M, dim))}
     return k
 
 
 def make_gated_up(M, N, K, w_dtype, a_dtype="bf16", out_dtype="bf16"):
     """SwiGLU fused gate+up: 2·M·(2N)·K flops, writes M·N output."""
     k = StridedGemm(M, 2 * N, K, w_dtype, a_dtype, out_dtype, out_elems=M * N)
-    k.inputs = {"x": Tensor(a_dtype, (M * K,))}
-    k.weights = {"w": Tensor(w_dtype, (2 * K * N,))}
+    k.inputs = {"x": Tensor(a_dtype, (M, K))}
+    k.weights = {"w": Tensor(w_dtype, (K, 2 * N))}
     scale_bytes = gemm_scale_bytes(2 * N, K, w_dtype)
     if scale_bytes > 0:
         k.weights["s"] = Tensor("ue8m0", (int(scale_bytes),))
-    k.outputs = {"y": Tensor(out_dtype, (M * N,))}
+    k.outputs = {"y": Tensor(out_dtype, (M, N))}
     return k
 
 
@@ -126,18 +126,18 @@ def declare_model():
 
         # Fan-out after norm: Q path + KV path
         attn_fan = Spawn(world=2)
-        attn_fan.inputs = {"x": Tensor("bf16", (M * D,))}
-        attn_fan.outputs = {"y": Tensor("bf16", (M * D,)),
-                            "y2": Tensor("bf16", (M * D,))}
+        attn_fan.inputs = {"x": Tensor("bf16", (M, D))}
+        attn_fan.outputs = {"y": Tensor("bf16", (M, D)),
+                            "y2": Tensor("bf16", (M, D))}
         g.add_kernel(attn_fan)
         g.add_data_edge(attn_norm, attn_fan, {"y": "x"})
 
         # Residual fan-out: bridge feeds both attn_norm and comp
         if prev_out is not None:
             bridge = Spawn(world=2)
-            bridge.inputs = {"x": Tensor("bf16", (M * D,))}
-            bridge.outputs = {"y": Tensor("bf16", (M * D,)),
-                              "y2": Tensor("bf16", (M * D,))}
+            bridge.inputs = {"x": Tensor("bf16", (M, D))}
+            bridge.outputs = {"y": Tensor("bf16", (M, D)),
+                              "y2": Tensor("bf16", (M, D))}
             g.add_kernel(bridge)
             g.add_data_edge(prev_out, bridge, {"y": "x"})
             g.add_data_edge(bridge, attn_norm, {"y": "x"})
@@ -176,9 +176,9 @@ def declare_model():
             comp_out_elems = M // ratio * KV_DIM
             comp = StridedGemm(M, KV_DIM * coff, D, "fp32", "bf16",
                                in_elems=M * D, out_elems=comp_out_elems)
-            comp.inputs = {"x": Tensor("bf16", (M * D,))}
-            comp.weights = {"w": Tensor("fp32", (D * KV_DIM * coff,))}
-            comp.outputs = {"y": Tensor("bf16", (comp_out_elems,))}
+            comp.inputs = {"x": Tensor("bf16", (M, D))}
+            comp.weights = {"w": Tensor("fp32", (D, KV_DIM * coff))}
+            comp.outputs = {"y": Tensor("bf16", (M // ratio, KV_DIM))}
             g.add_kernel(comp)
             if L.bridge is not None:
                 g.add_data_edge(L.bridge, comp, {"y2": "x"})
@@ -198,19 +198,17 @@ def declare_model():
 
         S_kv = M + M // ratio
         sa = SparseAttn(1, H, 1, M, k_sel, S_kv, HD, "bf16", kv_factor=1)
-        q_elems = 1 * H * M * HD
-        kv_elems = 1 * 1 * S_kv * HD
-        sa.inputs = {"q": Tensor("bf16", (q_elems,)),
-                     "kv": Tensor("bf16", (kv_elems,))}
-        sa.outputs = {"y": Tensor("bf16", (q_elems,))}
+        sa.inputs = {"q": Tensor("bf16", (M, H * HD)),
+                     "kv": Tensor("bf16", (S_kv, HD))}
+        sa.outputs = {"y": Tensor("bf16", (M, H * HD))}
         g.add_kernel(sa)
         g.add_data_edge(wq_b, sa, {"y": "q"})
 
         # KV cache = concat(window_kv, compressed_kv)
         kv_concat = Concat()
-        kv_concat.inputs = {"a": Tensor("bf16", (M * KV_DIM,)),
-                            "b": Tensor("bf16", (M // ratio * KV_DIM,))}
-        kv_concat.outputs = {"y": Tensor("bf16", (S_kv * KV_DIM,))}
+        kv_concat.inputs = {"a": Tensor("bf16", (M, KV_DIM)),
+                            "b": Tensor("bf16", (M // ratio, KV_DIM))}
+        kv_concat.outputs = {"y": Tensor("bf16", (S_kv, KV_DIM))}
         g.add_kernel(kv_concat)
         g.add_data_edge(kv_norm, kv_concat, {"y": "a"})
         g.add_data_edge(comp_norm, kv_concat, {"y": "b"})
@@ -220,10 +218,10 @@ def declare_model():
         # Output projection (grouped linear: O_GROUPS independent Gemms)
         wo_a = StridedGemm(M, O_GROUPS * O_LORA, H * HD // O_GROUPS,
                            "bf16", "bf16", in_elems=M * H * HD)
-        wo_a.inputs = {"x": Tensor("bf16", (M * H * HD,))}
+        wo_a.inputs = {"x": Tensor("bf16", (M, H * HD))}
         wo_a.weights = {"w": Tensor("bf16",
-                        (H * HD // O_GROUPS * O_GROUPS * O_LORA,))}
-        wo_a.outputs = {"y": Tensor("bf16", (M * O_GROUPS * O_LORA,))}
+                        (H * HD // O_GROUPS, O_GROUPS * O_LORA))}
+        wo_a.outputs = {"y": Tensor("bf16", (M, O_GROUPS * O_LORA))}
         g.add_kernel(wo_a)
         g.add_data_edge(sa, wo_a, {"y": "x"})
         L.wo_a = wo_a
@@ -247,16 +245,16 @@ def declare_model():
         # Dispatch bridge
         M_e = M * TOPK // N_LOCAL_EXPERTS
         dispatch = Kernel(
-            inputs={"routing": Tensor("fp32", (M * N_EXPERTS,))},
-            outputs={f"o{i}": Tensor("bf16", (M_e * D,)) for i in range(TP)})
+            inputs={"routing": Tensor("fp32", (M, N_EXPERTS))},
+            outputs={f"o{i}": Tensor("bf16", (M_e, D)) for i in range(TP)})
         g.add_kernel(dispatch)
         g.add_data_edge(gate, dispatch, {"y": "routing"})
         L.dispatch = dispatch
 
         # Combine bridge
         combine = Kernel(
-            inputs={f"i{i}": Tensor("bf16", (M_e * D,)) for i in range(TP)},
-            outputs={"y": Tensor("bf16", (M * D,))})
+            inputs={f"i{i}": Tensor("bf16", (M_e, D)) for i in range(TP)},
+            outputs={"y": Tensor("bf16", (M, D))})
         g.add_kernel(combine)
         L.combine = combine
 

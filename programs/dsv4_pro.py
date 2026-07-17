@@ -334,6 +334,10 @@ def optimize_model(g, layers, hw):
         _, wo_a_copies, _ = g.split_kernel(column_split, L.wo_a, TP)
         _, wo_b_copies, _ = g.split_kernel(row_split, L.wo_b, TP)
 
+        # Shared expert TP: column-split sw_up, row-split sw_down
+        _, sw_up_copies, _ = g.split_kernel(column_split, L.sw_up, TP)
+        _, sw_down_copies, _ = g.split_kernel(row_split, L.sw_down, TP)
+
         # Store copies for placement
         L._wq_a_copies = wq_a_copies
         L._wkv_copies = wkv_copies
@@ -342,6 +346,8 @@ def optimize_model(g, layers, hw):
         L._sa_copies = sa_copies
         L._wo_a_copies = wo_a_copies
         L._wo_b_copies = wo_b_copies
+        L._sw_up_copies = sw_up_copies
+        L._sw_down_copies = sw_down_copies
 
     # ── Placement ─────────────────────────────────────────────────
     p = Placement(hardware=hw, graph=g)
@@ -357,7 +363,8 @@ def optimize_model(g, layers, hw):
         # TP copies → GPU0-7
         for copies in [L._wq_a_copies, L._wkv_copies, L._comp_copies,
                        L._wq_b_copies, L._sa_copies,
-                       L._wo_a_copies, L._wo_b_copies]:
+                       L._wo_a_copies, L._wo_b_copies,
+                       L._sw_up_copies, L._sw_down_copies]:
             for i, c in enumerate(copies):
                 p.set_kernel_device(c, gpus[i])
 
@@ -367,8 +374,7 @@ def optimize_model(g, layers, hw):
                 p.set_kernel_device(k, gpus[gpu_id])
 
         # Post-expert kernels → GPU0
-        for k in [L.combine, L.sw_up, L.sw_down]:
-            p.set_kernel_device(k, gpus[0])
+        p.set_kernel_device(L.combine, gpus[0])
 
     optimize_comms(g, p)
 

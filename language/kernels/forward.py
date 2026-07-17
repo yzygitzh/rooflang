@@ -258,3 +258,74 @@ class SparseAttn(Kernel):
     @property
     def output_bytes(self) -> float:
         return self.B * self.H * self.S_q * self.Hd * dtype_bytes(self.dtype_)
+
+
+class TokenDispatch(Kernel):
+    """MoE token dispatch: softmax routing + topk selection + token scatter.
+
+    flops = 5·M·N_experts (softmax: max + sub + exp + sum + div per row).
+    bytes:
+        input_bytes  = M·D·sizeof(a_dtype) + M·N_experts·4
+        output_bytes = M·topk·D·sizeof(a_dtype)
+    """
+
+    def __init__(self, M: int, D: int, N_experts: int, topk: int,
+                 a_dtype: str = "bf16"):
+        self.M, self.D = M, D
+        self.N_experts = N_experts
+        self.topk = topk
+        self.a_dtype = a_dtype
+        self.M_e = M * topk // N_experts
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        return 5.0 * self.M * self.N_experts
+
+    @property
+    def input_bytes(self) -> float:
+        return (self.M * self.D * dtype_bytes(self.a_dtype)
+                + self.M * self.N_experts * dtype_bytes("fp32"))
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        return self.M * self.topk * self.D * dtype_bytes(self.a_dtype)
+
+
+class TokenCombine(Kernel):
+    """MoE token combine: weighted sum of expert outputs.
+
+    flops = 2·M·topk·D (multiply by routing weight + accumulate).
+    bytes:
+        input_bytes  = M·topk·D·sizeof(a_dtype)
+        output_bytes = M·D·sizeof(a_dtype)
+    """
+
+    def __init__(self, M: int, D: int, N_experts: int, topk: int,
+                 a_dtype: str = "bf16"):
+        self.M, self.D = M, D
+        self.N_experts = N_experts
+        self.topk = topk
+        self.a_dtype = a_dtype
+        self.M_e = M * topk // N_experts
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        return 2.0 * self.M * self.topk * self.D
+
+    @property
+    def input_bytes(self) -> float:
+        return self.M * self.topk * self.D * dtype_bytes(self.a_dtype)
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        return self.M * self.D * dtype_bytes(self.a_dtype)

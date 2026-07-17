@@ -11,7 +11,9 @@ from typing import List
 
 from rooflang.language.graph import ComputeGraph
 from rooflang.language.hardware.component import Compute
-from rooflang.language.kernels.forward import Gemm, RMSNorm, SparseAttn, StridedGemm
+from rooflang.language.kernels.forward import (
+    Gemm, RMSNorm, SparseAttn, StridedGemm, TokenCombine, TokenDispatch,
+)
 from rooflang.language.kernels.identity import Concat, Spawn
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.optimization.comm import optimize_comms
@@ -237,49 +239,56 @@ def declare_model():
         g.add_data_edge(wo_b, ffn_norm, {"y": "x"})
         L.ffn_norm = ffn_norm
 
+        # FFN fan-out: gate needs routing scores, dispatch needs hidden states
+        ffn_fan = Spawn(world=2)
+        ffn_fan.inputs = {"x": Tensor("bf16", (M, D))}
+        ffn_fan.outputs = {"y": Tensor("bf16", (M, D)),
+                           "y2": Tensor("bf16", (M, D))}
+        g.add_kernel(ffn_fan)
+        g.add_data_edge(ffn_norm, ffn_fan, {"y": "x"})
+
         gate = make_gemm(M, N_EXPERTS, D, "fp32", "bf16", "fp32")
         g.add_kernel(gate)
-        g.add_data_edge(ffn_norm, gate, {"y": "x"})
+        g.add_data_edge(ffn_fan, gate, {"y": "x"})
         L.gate = gate
 
-        # Dispatch bridge
-        M_e = M * TOPK // N_LOCAL_EXPERTS
-        dispatch = Kernel(
-            inputs={"routing": Tensor("fp32", (M, N_EXPERTS))},
-            outputs={f"o{i}": Tensor("bf16", (M_e, D)) for i in range(TP)})
+        # Dispatch: softmax routing + token scatter to experts
+        M_e = M * TOPK // N_EXPERTS
+        dispatch = TokenDispatch(M, D, N_EXPERTS, TOPK)
+        dispatch.inputs = {"x": Tensor("bf16", (M, D)),
+                           "routing": Tensor("fp32", (M, N_EXPERTS))}
+        dispatch.outputs = {f"o{i}": Tensor("bf16", (M_e, D))
+                            for i in range(N_EXPERTS)}
         g.add_kernel(dispatch)
         g.add_data_edge(gate, dispatch, {"y": "routing"})
+        g.add_data_edge(ffn_fan, dispatch, {"y2": "x"})
         L.dispatch = dispatch
 
-        # Combine bridge
-        combine = Kernel(
-            inputs={f"i{i}": Tensor("bf16", (M_e, D)) for i in range(TP)},
-            outputs={"y": Tensor("bf16", (M, D))})
+        # Combine: weighted sum of expert outputs
+        combine = TokenCombine(M, D, N_EXPERTS, TOPK)
+        combine.inputs = {f"i{i}": Tensor("bf16", (M_e, D))
+                          for i in range(N_EXPERTS)}
+        combine.outputs = {"y": Tensor("bf16", (M, D))}
         g.add_kernel(combine)
         L.combine = combine
 
-        # Expert chains per GPU (up_proj + down_proj per expert, chained)
+        # Expert kernels per GPU (up_proj + down_proj per expert, independent)
         L.experts = []
         for gpu_id in range(TP):
             gpu_experts = []
-            exp_prev = None
             for eid in range(N_LOCAL_EXPERTS):
+                global_eid = gpu_id * N_LOCAL_EXPERTS + eid
                 up = make_gated_up(M_e, MOE_INTER, D, "fp4", "bf16")
                 g.add_kernel(up)
 
                 down = make_gemm(M_e, D, MOE_INTER, "fp4", "bf16")
                 g.add_kernel(down)
                 g.add_data_edge(up, down, {"y": "x"})
-
-                if eid == 0:
-                    g.add_data_edge(dispatch, up, {f"o{gpu_id}": "x"})
-                else:
-                    g.add_data_edge(exp_prev, up, {"y": "x"})
+                g.add_data_edge(dispatch, up, {f"o{global_eid}": "x"})
+                g.add_data_edge(down, combine, {"y": f"i{global_eid}"})
 
                 gpu_experts.extend([up, down])
-                exp_prev = down
 
-            g.add_data_edge(exp_prev, combine, {"y": f"i{gpu_id}"})
             L.experts.append(gpu_experts)
 
         # Shared expert

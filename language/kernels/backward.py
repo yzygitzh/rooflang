@@ -266,6 +266,86 @@ class SparseAttn(Kernel):
                 + 2 * self.B * self.H_kv * self.S_q * self.k_sel * self.Hd) * b
 
 
+class TokenDispatch(Kernel):
+    """TokenDispatch backward: gather scattered gradients + softmax backward.
+
+    flops = M·topk·D (gather-reduce for d_x) + 4·M·N_experts (softmax bwd).
+    bytes:
+        input_bytes  = M·topk·D·sizeof(a_dtype) + M·topk·4 + M·N_experts·4
+                       (d_scattered + d_routing_weights + saved routing_probs)
+        output_bytes = M·D·sizeof(a_dtype) + M·N_experts·4
+                       (d_x + d_routing_logits)
+    """
+
+    def __init__(self, M: int, D: int, N_experts: int, topk: int,
+                 a_dtype: str = "bf16"):
+        self.M, self.D = M, D
+        self.N_experts = N_experts
+        self.topk = topk
+        self.a_dtype = a_dtype
+        self.M_e = M * topk // N_experts
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        return self.M * self.topk * self.D + 4.0 * self.M * self.N_experts
+
+    @property
+    def input_bytes(self) -> float:
+        return (self.M * self.topk * self.D * dtype_bytes(self.a_dtype)
+                + self.M * self.topk * dtype_bytes("fp32")
+                + self.M * self.N_experts * dtype_bytes("fp32"))
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        return (self.M * self.D * dtype_bytes(self.a_dtype)
+                + self.M * self.N_experts * dtype_bytes("fp32"))
+
+
+class TokenCombine(Kernel):
+    """TokenCombine backward: scale d_y by routing weights + compute d_routing.
+
+    flops = 3·M·topk·D (scale for d_expert_outs + dot for d_routing_weights).
+    bytes:
+        input_bytes  = M·D·sizeof(a_dtype) + M·topk·D·sizeof(a_dtype) + M·topk·4
+                       (d_y + saved expert_outputs + saved routing_weights)
+        output_bytes = M·topk·D·sizeof(a_dtype) + M·topk·4
+                       (d_expert_outputs + d_routing_weights)
+    """
+
+    def __init__(self, M: int, D: int, N_experts: int, topk: int,
+                 a_dtype: str = "bf16"):
+        self.M, self.D = M, D
+        self.N_experts = N_experts
+        self.topk = topk
+        self.a_dtype = a_dtype
+        self.M_e = M * topk // N_experts
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        return 3.0 * self.M * self.topk * self.D
+
+    @property
+    def input_bytes(self) -> float:
+        return (self.M * self.D * dtype_bytes(self.a_dtype)
+                + self.M * self.topk * self.D * dtype_bytes(self.a_dtype)
+                + self.M * self.topk * dtype_bytes("fp32"))
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        return (self.M * self.topk * self.D * dtype_bytes(self.a_dtype)
+                + self.M * self.topk * dtype_bytes("fp32"))
+
+
 class StridedGemmDX(Kernel):
     """Backward dX for StridedGemm: dX = dY · W^T.
 

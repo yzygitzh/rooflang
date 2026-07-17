@@ -6,6 +6,7 @@ from rooflang.language.graph import ComputeGraph, FabricEdge, HardwareGraph
 from rooflang.language.hardware.component import Compute, Memory
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.kernels.comm import AllReduce
+from rooflang.language.kernels.identity import Move
 from rooflang.language.placement import Placement
 from rooflang.language.tensor import Tensor
 from rooflang.runtime.simulator import Bound, OOMError, Simulator
@@ -485,3 +486,146 @@ class TestOOM:
         # Peak = t1_in (4000) + t1_out (2) at the start of k1
         # After k1 completes: t1_in freed, only t1_out (2) alive
         assert result.peak_memory[hbm] == pytest.approx(4002.0)
+
+
+# ── Cross-device fabric sharing ──────────────────────────────────────
+
+
+def _hw_multi_gpu(n_gpus=2, hbm_bw=1000.0, link_bw=100.0, tflops=1000.0):
+    """N GPUs connected through a switch. HBM local BW >> link BW."""
+    hw = HardwareGraph()
+    switch = Compute(name="switch")
+    hw.add_node(switch)
+    gpus = []
+    hbms = []
+    for i in range(n_gpus):
+        gpu = Compute(name=f"gpu{i}", tflops={"bf16": tflops})
+        hbm = Memory(name=f"hbm{i}", capacity_gb=80.0)
+        hw.add_node(gpu)
+        hw.add_node(hbm)
+        hw.add_edge(FabricEdge(name=f"hbm{i}", src=gpu, dst=hbm,
+                               src_to_dst_bandwidth_gbs=hbm_bw,
+                               dst_to_src_bandwidth_gbs=hbm_bw,
+                               is_full_duplex=False))
+        hw.add_edge(FabricEdge(name=f"link{i}", src=gpu, dst=switch,
+                               src_to_dst_bandwidth_gbs=link_bw,
+                               dst_to_src_bandwidth_gbs=link_bw,
+                               is_full_duplex=True))
+        gpus.append(gpu)
+        hbms.append(hbm)
+    return hw, gpus, hbms
+
+
+class TestCrossDeviceFabric:
+    def test_remote_read_uses_link_bandwidth(self):
+        """Kernel on GPU1 reading tensor from GPU0 uses link BW, not HBM BW."""
+        hw, gpus, hbms = _hw_multi_gpu(n_gpus=2, hbm_bw=1000.0,
+                                       link_bw=100.0, tflops=1000.0)
+        # k1 on GPU0: produces 100KB output (trivial compute)
+        t1_out = Tensor("bf16", (50000,))  # 100,000 bytes
+        k1 = SyntheticKernel(flops_val=0.0, outputs={"y": t1_out})
+        # k2 on GPU1: reads k1's output (remote), no local I/O
+        t2_in = Tensor("bf16", (50000,))
+        k2 = SyntheticKernel(flops_val=0.0, inputs={"x": t2_in})
+
+        g = ComputeGraph()
+        g.add_kernel(k1)
+        g.add_kernel(k2)
+        g.add_data_edge(k1, k2, {"y": "x"})
+        p = Placement(hardware=hw, graph=g)
+        p.set_kernel_device(k1, gpus[0])
+        p.set_kernel_device(k2, gpus[1])
+        result = _sim(g, p, hw)
+
+        # k1: write 100KB at 1000 GB/s = 100000/(1000*1e3) = 0.1 us
+        # k2: remote read 100KB at link 100 GB/s = 100000/(100*1e3) = 1.0 us
+        # Total = k1 + k2 = 1.1 us
+        assert result.total_time_us == pytest.approx(1.1, rel=1e-3)
+
+    def test_parallel_remote_reads_share_fabric(self):
+        """Two kernels on different GPUs reading same remote share link BW."""
+        hw, gpus, hbms = _hw_multi_gpu(n_gpus=3, hbm_bw=1000.0,
+                                       link_bw=100.0, tflops=1000.0)
+        # k1 on GPU0 produces two outputs
+        t1_a = Tensor("bf16", (50000,))  # 100KB
+        t1_b = Tensor("bf16", (50000,))  # 100KB
+        k1 = SyntheticKernel(flops_val=0.0,
+                             outputs={"a": t1_a, "b": t1_b})
+        # k2 on GPU1, k3 on GPU2: each reads one output from GPU0
+        t2_in = Tensor("bf16", (50000,))
+        t3_in = Tensor("bf16", (50000,))
+        k2 = SyntheticKernel(flops_val=0.0, inputs={"x": t2_in})
+        k3 = SyntheticKernel(flops_val=0.0, inputs={"x": t3_in})
+
+        g = ComputeGraph()
+        g.add_kernel(k1)
+        g.add_kernel(k2)
+        g.add_kernel(k3)
+        g.add_data_edge(k1, k2, {"a": "x"})
+        g.add_data_edge(k1, k3, {"b": "x"})
+        p = Placement(hardware=hw, graph=g)
+        p.set_kernel_device(k1, gpus[0])
+        p.set_kernel_device(k2, gpus[1], stream=0)
+        p.set_kernel_device(k3, gpus[2], stream=0)
+        result = _sim(g, p, hw)
+
+        # k1: write 200KB at 1000 GB/s = 0.2 us
+        # k2 and k3 run in parallel, both read through GPU0↔switch (shared)
+        # Without sharing: each = 100KB / (100*1e3) = 1.0 us
+        # With sharing (GPU0↔switch has 2 users): net_share = 0.5 → 2.0 us each
+        # Total = k1(0.2) + max(k2, k3)(2.0) = 2.2 us
+        assert result.total_time_us == pytest.approx(2.2, rel=1e-2)
+
+    def test_remote_write_uses_link_bandwidth(self):
+        """Move kernel writing output to remote memory uses link BW."""
+        hw, gpus, hbms = _hw_multi_gpu(n_gpus=2, hbm_bw=1000.0,
+                                       link_bw=100.0, tflops=1000.0)
+        # Move on GPU0 writes output to HBM1 (remote)
+        t_src = Tensor("bf16", (50000,))  # 100KB
+        move = Move(t_src, dst_location=hbms[1])
+        g = ComputeGraph()
+        g.add_kernel(move)
+        p = Placement(hardware=hw, graph=g)
+        p.set_kernel_device(move, gpus[0])
+        result = _sim(g, p, hw)
+
+        # Read input locally: 100KB / (1000*1e3) = 0.1 us (mt)
+        # Write output remotely: 100KB / (100*1e3) = 1.0 us (xfer)
+        # Total = max(mt=0.1, xfer=1.0) = 1.0 us
+        assert result.total_time_us == pytest.approx(1.0, rel=1e-3)
+
+    def test_parallel_remote_writes_share_fabric(self):
+        """Two Move kernels writing to the same remote HBM share link BW."""
+        hw, gpus, hbms = _hw_multi_gpu(n_gpus=3, hbm_bw=1000.0,
+                                       link_bw=100.0, tflops=1000.0)
+        # k1 on GPU0 produces input for both moves
+        t1_a = Tensor("bf16", (50000,))  # 100KB
+        t1_b = Tensor("bf16", (50000,))  # 100KB
+        k1 = SyntheticKernel(flops_val=0.0,
+                             outputs={"a": t1_a, "b": t1_b})
+        # move1 on GPU1, move2 on GPU2: both write to HBM0 (remote)
+        t_src1 = Tensor("bf16", (50000,))
+        move1 = Move(t_src1, dst_location=hbms[0])
+        t_src2 = Tensor("bf16", (50000,))
+        move2 = Move(t_src2, dst_location=hbms[0])
+
+        g = ComputeGraph()
+        g.add_kernel(k1)
+        g.add_kernel(move1)
+        g.add_kernel(move2)
+        g.add_data_edge(k1, move1, {"a": "src"})
+        g.add_data_edge(k1, move2, {"b": "src"})
+        p = Placement(hardware=hw, graph=g)
+        p.set_kernel_device(k1, gpus[0])
+        p.set_kernel_device(move1, gpus[1])
+        p.set_kernel_device(move2, gpus[2])
+        result = _sim(g, p, hw)
+
+        # k1: write 200KB locally at 1000 GB/s = 0.2 us
+        # move1/move2 run in parallel on different GPUs:
+        #   Each reads 100KB remotely from HBM0: xfer_read = 100000/(100*1e3) = 1.0 us
+        #   Each writes 100KB remotely to HBM0: xfer_write = 100000/(100*1e3) = 1.0 us
+        #   Total xfer per move = 2.0 us without sharing
+        #   Both share GPU0↔switch (link0): net_share = 0.5 → 4.0 us each
+        # Total = k1(0.2) + max(move1, move2)(4.0) = 4.2 us
+        assert result.total_time_us == pytest.approx(4.2, rel=1e-2)

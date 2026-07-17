@@ -3,6 +3,7 @@
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.kernels.forward import (
     Gemm, RMSNorm, LayerNorm, RoPE, Attn, SparseAttn,
+    TokenDispatch, TokenCombine,
 )
 from rooflang.language.kernels import backward
 from rooflang.language.kernels.comm import (
@@ -373,3 +374,58 @@ class TestMove(TestKernelBase):
         m = Move(Tensor("fp32", (8, 16)), hbm)
         assert m.outputs["dst"].dtype == "fp32"
         assert m.outputs["dst"].shape == (8, 16)
+
+
+# ── MoE dispatch/combine kernels ────────────────────────────────────
+
+
+class TestTokenDispatch(TestKernelBase):
+    __test__ = True
+    kernel = TokenDispatch(M=8192, D=7168, N_experts=384, topk=6)
+    expected_flops = 5.0 * 8192 * 384
+    expected_input_bytes = 8192 * 7168 * 2.0 + 8192 * 384 * 4.0
+    expected_weight_bytes = 0.0
+    expected_output_bytes = 8192 * 6 * 7168 * 2.0
+
+    def test_m_e(self):
+        assert self.kernel.M_e == 8192 * 6 // 384
+
+
+class TestTokenCombine(TestKernelBase):
+    __test__ = True
+    kernel = TokenCombine(M=8192, D=7168, N_experts=384, topk=6)
+    expected_flops = 2.0 * 8192 * 6 * 7168
+    expected_input_bytes = 8192 * 6 * 7168 * 2.0
+    expected_weight_bytes = 0.0
+    expected_output_bytes = 8192 * 7168 * 2.0
+
+    def test_m_e(self):
+        assert self.kernel.M_e == 8192 * 6 // 384
+
+
+class TestBwdTokenDispatch(TestKernelBase):
+    __test__ = True
+    kernel = backward.TokenDispatch(M=8192, D=7168, N_experts=384, topk=6)
+    expected_flops = 8192 * 6 * 7168 + 4.0 * 8192 * 384
+    expected_input_bytes = (8192 * 6 * 7168 * 2.0
+                            + 8192 * 6 * 4.0
+                            + 8192 * 384 * 4.0)
+    expected_weight_bytes = 0.0
+    expected_output_bytes = 8192 * 7168 * 2.0 + 8192 * 384 * 4.0
+
+    def test_m_e(self):
+        assert self.kernel.M_e == 8192 * 6 // 384
+
+
+class TestBwdTokenCombine(TestKernelBase):
+    __test__ = True
+    kernel = backward.TokenCombine(M=8192, D=7168, N_experts=384, topk=6)
+    expected_flops = 3.0 * 8192 * 6 * 7168
+    expected_input_bytes = (8192 * 7168 * 2.0
+                            + 8192 * 6 * 7168 * 2.0
+                            + 8192 * 6 * 4.0)
+    expected_weight_bytes = 0.0
+    expected_output_bytes = 8192 * 6 * 7168 * 2.0 + 8192 * 6 * 4.0
+
+    def test_m_e(self):
+        assert self.kernel.M_e == 8192 * 6 // 384

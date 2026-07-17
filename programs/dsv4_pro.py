@@ -146,15 +146,14 @@ def declare_model():
         g.add_data_edge(attn_norm, attn_fan, {"y": "x"})
 
         # Residual fan-out: bridge feeds both attn_norm and comp
-        if prev_out is not None:
-            bridge = Spawn(world=2)
-            bridge.inputs = {"x": Tensor("bf16", (M, D))}
-            bridge.outputs = {"y": Tensor("bf16", (M, D)),
-                              "y2": Tensor("bf16", (M, D))}
-            g.add_kernel(bridge)
-            g.add_data_edge(prev_out, bridge, {"y": "x"})
-            g.add_data_edge(bridge, attn_norm, {"y": "x"})
-            L.bridge = bridge
+        bridge = Spawn(world=2)
+        bridge.inputs = {"x": Tensor("bf16", (M, D))}
+        bridge.outputs = {"y": Tensor("bf16", (M, D)),
+                          "y2": Tensor("bf16", (M, D))}
+        g.add_kernel(bridge)
+        g.add_data_edge(prev_out, bridge, {"y": "x"})
+        g.add_data_edge(bridge, attn_norm, {"y": "x"})
+        L.bridge = bridge
 
         # Q path
         wq_a = make_gemm(M, Q_LORA, D, "fp8")

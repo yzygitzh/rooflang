@@ -156,9 +156,9 @@ class TestAttn(TestKernelBase):
 
 class TestSparseAttn(TestKernelBase):
     __test__ = True
-    kernel = SparseAttn(B=2, H=8, H_kv=8, S_q=256, k_sel=64, Hd=64)
+    kernel = SparseAttn(B=2, H=8, H_kv=8, S_q=256, k_sel=64, S_kv=64, Hd=64)
     expected_flops = 4.0 * 2 * 8 * 256 * 64 * 64
-    expected_input_bytes = (2 * 8 * 256 * 64 + 2 * 2 * 8 * 256 * 64 * 64) * 2.0
+    expected_input_bytes = (2 * 8 * 256 * 64 + 2 * 2 * 8 * 64 * 64) * 2.0
     expected_weight_bytes = 0.0
     expected_output_bytes = 2 * 8 * 256 * 64 * 2.0
 

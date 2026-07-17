@@ -364,18 +364,18 @@ class TestFuseKernels:
 class TestSplitKernel:
     def _make_split_class(self):
         def split_class(kernel, n):
-            prev = make_kernel(
-                ins=list(kernel.inputs),
-                outs=[f"o{i}_{j}" for i in range(n) for j in kernel.inputs],
-            )
+            prev_comms = {}
+            for port in kernel.inputs:
+                k = make_kernel(ins=["x"], outs=[f"o{i}" for i in range(n)])
+                prev_comms[port] = k
             copies = [make_kernel(ins=list(kernel.inputs),
                                   outs=list(kernel.outputs))
                       for _ in range(n)]
-            next = make_kernel(
-                ins=[f"i{i}_{j}" for i in range(n) for j in kernel.outputs],
-                outs=list(kernel.outputs),
-            )
-            return prev, copies, next
+            next_comms = {}
+            for port in kernel.outputs:
+                k = make_kernel(ins=[f"i{i}" for i in range(n)], outs=["y"])
+                next_comms[port] = k
+            return prev_comms, copies, next_comms
         return split_class
 
     def test_basic(self):
@@ -389,11 +389,11 @@ class TestSplitKernel:
         g.add_data_edge(pred, k, {"y": "x"})
         g.add_data_edge(k, succ, {"z": "w"})
 
-        prev_comm, copies, next_comm = g.split_kernel(
+        prev_comms, copies, next_comms = g.split_kernel(
             self._make_split_class(), k, 2)
         assert k not in g.kernels
-        assert prev_comm in g.kernels
-        assert next_comm in g.kernels
+        assert prev_comms["x"] in g.kernels
+        assert next_comms["z"] in g.kernels
         assert all(c in g.kernels for c in copies)
         assert len(copies) == 2
 
@@ -408,10 +408,10 @@ class TestSplitKernel:
         g.add_data_edge(pred, k, {"y": "x"})
         g.add_data_edge(k, succ, {"z": "w"})
 
-        prev_comm, _, next_comm = g.split_kernel(
+        prev_comms, _, next_comms = g.split_kernel(
             self._make_split_class(), k, 2)
-        assert g._in_edges(prev_comm)[0].src is pred
-        assert g._out_edges(next_comm)[0].dst is succ
+        assert g._in_edges(prev_comms["x"])[0].src is pred
+        assert g._out_edges(next_comms["z"])[0].dst is succ
 
     def test_count_mismatch_raises(self):
         g = ComputeGraph()
@@ -419,21 +419,22 @@ class TestSplitKernel:
         g.add_kernel(k)
 
         def bad_split(kernel, n):
-            prev = make_kernel(ins=["x"], outs=["o0_x"])
+            prev_comms = {"x": make_kernel(ins=["x"], outs=["o0"])}
             copies = [make_kernel(ins=["x"], outs=["z"])]
-            next = make_kernel(ins=["i0_z"], outs=["z"])
-            return prev, copies, next
+            next_comms = {"z": make_kernel(ins=["i0"], outs=["y"])}
+            return prev_comms, copies, next_comms
 
         with pytest.raises(ValueError, match="expected 2"):
             g.split_kernel(bad_split, k, 2)
 
-    def test_none_comm_raises(self):
+    def test_empty_comms_raises(self):
         g = ComputeGraph()
         k = make_kernel(ins=["x"], outs=["z"])
         g.add_kernel(k)
-        with pytest.raises(AssertionError):
-            g.split_kernel(lambda ker, n: (None, [make_kernel()]*n, make_kernel()),
-                           k, 2)
+        with pytest.raises(ValueError, match="non-empty"):
+            g.split_kernel(
+                lambda ker, n: ({}, [make_kernel()] * n, {"z": make_kernel()}),
+                k, 2)
 
 
 # ── Mutation: dedup ──────────────────────────────────────────────────

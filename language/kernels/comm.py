@@ -24,8 +24,34 @@ class CommKernel(Kernel):
 
     Communication kernels do not require placement — their cost is
     derived from neighboring placed kernels in the simulator.
+
+    Port constraints (enforced by validate_ports):
+      Scatter/Broadcast: 1 input, world outputs
+      Gather/Reduce:     world inputs, 1 output
+      AllReduce/AllGather/ReduceScatter/AllToAll: world inputs, world outputs
     """
     _requires_placement = False
+    _single_input = False   # True → exactly 1 input port
+    _single_output = False  # True → exactly 1 output port
+
+    def validate_ports(self) -> None:
+        """Check port counts match the single-tensor constraint."""
+        if not hasattr(self, 'world'):
+            return
+        if self._single_input and len(self.inputs) != 1:
+            raise ValueError(
+                f"{type(self).__name__}: expected 1 input, got {len(self.inputs)}")
+        if not self._single_input and len(self.inputs) != self.world:
+            raise ValueError(
+                f"{type(self).__name__}: expected {self.world} inputs, "
+                f"got {len(self.inputs)}")
+        if self._single_output and len(self.outputs) != 1:
+            raise ValueError(
+                f"{type(self).__name__}: expected 1 output, got {len(self.outputs)}")
+        if not self._single_output and len(self.outputs) != self.world:
+            raise ValueError(
+                f"{type(self).__name__}: expected {self.world} outputs, "
+                f"got {len(self.outputs)}")
 
 
 class AllReduce(CommKernel):
@@ -34,6 +60,8 @@ class AllReduce(CommKernel):
     Two-phase (ReduceScatter + AllGather):
       transferred_bytes = 2 × (W-1)/W × total_bytes.
     """
+    _single_input = False
+    _single_output = False
 
     def __init__(self, total_bytes: float, world: int, dtype: str = "bf16"):
         self.total_bytes = total_bytes
@@ -68,6 +96,8 @@ class ReduceScatter(CommKernel):
 
     transferred_bytes = (W-1)/W × total_bytes.
     """
+    _single_input = False
+    _single_output = False
 
     def __init__(self, total_bytes: float, world: int, dtype: str = "bf16"):
         self.total_bytes = total_bytes
@@ -102,6 +132,8 @@ class AllGather(CommKernel):
 
     transferred_bytes = (W-1)/W × total_bytes.
     """
+    _single_input = False
+    _single_output = False
 
     def __init__(self, total_bytes: float, world: int):
         self.total_bytes = total_bytes
@@ -130,6 +162,8 @@ class AllToAll(CommKernel):
 
     transferred_bytes = (W-1)/W × total_bytes.
     """
+    _single_input = False
+    _single_output = False
 
     def __init__(self, total_bytes: float, world: int):
         self.total_bytes = total_bytes
@@ -159,6 +193,8 @@ class Broadcast(CommKernel):
     Bottleneck link (root's outgoing) carries the full tensor.
     transferred_bytes = total_bytes.
     """
+    _single_input = True
+    _single_output = False
 
     def __init__(self, total_bytes: float, world: int):
         self.total_bytes = total_bytes
@@ -187,6 +223,8 @@ class Scatter(CommKernel):
 
     transferred_bytes = (W-1)/W × total_bytes.
     """
+    _single_input = True
+    _single_output = False
 
     def __init__(self, total_bytes: float, world: int, dim: int = 0):
         self.total_bytes = total_bytes
@@ -216,6 +254,8 @@ class Gather(CommKernel):
 
     transferred_bytes = (W-1)/W × total_bytes.
     """
+    _single_input = False
+    _single_output = True
 
     def __init__(self, total_bytes: float, world: int, dim: int = 0):
         self.total_bytes = total_bytes
@@ -246,6 +286,8 @@ class Reduce(CommKernel):
     Bottleneck link (into root) carries the full tensor.
     transferred_bytes = total_bytes.
     """
+    _single_input = False
+    _single_output = True
 
     def __init__(self, total_bytes: float, world: int, dtype: str = "bf16"):
         self.total_bytes = total_bytes

@@ -317,13 +317,9 @@ def optimize_model(g, layers, hw):
     for L in layers:
         # TP splits
         _, wq_b_copies, _ = g.split_kernel(column_split, L.wq_b, TP)
-        sa_prev, sa_copies, _ = g.split_kernel(head_split, L.sa, TP)
+        _, sa_copies, _ = g.split_kernel(head_split, L.sa, TP)
         _, wo_a_copies, _ = g.split_kernel(column_split, L.wo_a, TP)
         _, wo_b_copies, _ = g.split_kernel(row_split, L.wo_b, TP)
-
-        # KV path ordering: attention waits for KV computation
-        kv_end = L.comp_norm if L.comp_norm else L.kv_norm
-        g.add_control_edge(kv_end, sa_prev)
 
         # Store copies for placement
         L._wq_b_copies = wq_b_copies

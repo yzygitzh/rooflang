@@ -14,7 +14,7 @@ from typing import Callable, Dict, FrozenSet, List, NamedTuple, Optional, Set
 
 import networkx as nx
 
-from rooflang.language.kernels.comm import Broadcast
+from rooflang.language.kernels.comm import Broadcast, CommKernel
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.hardware.component import Compute, HardwareComponent, Memory
 
@@ -199,54 +199,62 @@ class ComputeGraph:
         kernel: Kernel,
         n: int,
     ) -> tuple:
-        """Split a kernel into n copies with communication kernels.
+        """Split a kernel into n copies with per-port communication kernels.
 
         split_class: callable that takes (kernel, n) and returns
-        (prev_comm, kernels, next_comm) where:
-          - prev_comm: Kernel — communication before the split copies
-            (e.g., Scatter/Broadcast). Its outputs are ordered by copy:
-            first len(copy.inputs) entries feed copy_0, next feed copy_1, etc.
+        (prev_comms, kernels, next_comms) where:
+          - prev_comms: Dict[str, Kernel] — one comm kernel per input port.
+            Each has 1 input ("x") and n outputs ("o0".."o{n-1}").
+            Keyed by the original kernel's input port name.
           - kernels: List[Kernel] of length n — the split copies.
-          - next_comm: Kernel — communication after the split copies
-            (e.g., Gather/Reduce). Its inputs are ordered by copy:
-            first len(copy.outputs) entries receive from copy_0, etc.
+          - next_comms: Dict[str, Kernel] — one comm kernel per output port.
+            Each has n inputs ("i0".."i{n-1}") and 1 output ("y").
+            Keyed by the original kernel's output port name.
 
-        Returns (prev_comm, kernels, next_comm) — all already in the graph.
+        Returns (prev_comms, kernels, next_comms) — all already in the graph.
         """
         self._check_in_graph(kernel)
-        prev_comm, copies, next_comm = split_class(kernel, n)
+        prev_comms, copies, next_comms = split_class(kernel, n)
         if len(copies) != n:
             raise ValueError(
                 f"split_class returned {len(copies)} kernels, expected {n}")
-        assert prev_comm is not None, "split_class must return prev_comm"
-        assert next_comm is not None, "split_class must return next_comm"
+        if not prev_comms:
+            raise ValueError("split_class must return non-empty prev_comms")
+        if not next_comms:
+            raise ValueError("split_class must return non-empty next_comms")
 
         in_edges = self._in_edges(kernel)
         out_edges = self._out_edges(kernel)
 
-        self.add_kernel(prev_comm)
+        # Wire predecessors → prev_comms (each in_edge port maps to its comm)
+        for port_name, comm in prev_comms.items():
+            self.add_kernel(comm)
         for edge in in_edges:
-            self.add_data_edge(edge.src, prev_comm, edge.mapping)
+            for src_out, dst_in in edge.mapping.items():
+                comm = prev_comms[dst_in]
+                self.add_data_edge(edge.src, comm, {src_out: "x"})
 
-        prev_out_keys = list(prev_comm.outputs)
-        n_inputs_per_copy = len(copies[0].inputs)
+        # Wire prev_comms → copies
         for i, c in enumerate(copies):
             self.add_kernel(c)
-            chunk = prev_out_keys[i * n_inputs_per_copy:(i + 1) * n_inputs_per_copy]
-            self.add_data_edge(prev_comm, c, dict(zip(chunk, c.inputs)))
+            for port_name, comm in prev_comms.items():
+                self.add_data_edge(comm, c, {f"o{i}": port_name})
 
-        self.add_kernel(next_comm)
-        next_in_keys = list(next_comm.inputs)
-        n_outputs_per_copy = len(copies[0].outputs)
+        # Wire copies → next_comms
+        for port_name, comm in next_comms.items():
+            self.add_kernel(comm)
         for i, c in enumerate(copies):
-            chunk = next_in_keys[i * n_outputs_per_copy:(i + 1) * n_outputs_per_copy]
-            self.add_data_edge(c, next_comm, dict(zip(c.outputs, chunk)))
+            for port_name, comm in next_comms.items():
+                self.add_data_edge(c, comm, {port_name: f"i{i}"})
 
+        # Wire next_comms → successors
         for edge in out_edges:
-            self.add_data_edge(next_comm, edge.dst, edge.mapping)
+            for src_out, dst_in in edge.mapping.items():
+                comm = next_comms[src_out]
+                self.add_data_edge(comm, edge.dst, {"y": dst_in})
 
         self.remove_kernel(kernel)
-        return prev_comm, copies, next_comm
+        return prev_comms, copies, next_comms
 
     def dedup(
         self,
@@ -473,6 +481,10 @@ class ComputeGraph:
                 raise ValueError(
                     f"{type(kernel).__name__}: output_bytes property "
                     f"({kernel.output_bytes}) != tensor sum ({tensor_out})")
+
+        for kernel in self._dag.nodes:
+            if isinstance(kernel, CommKernel):
+                kernel.validate_ports()
 
     # ── Internals ─────────────────────────────────────────────────────
 

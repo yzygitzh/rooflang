@@ -247,7 +247,7 @@ def declare_model():
         g.add_kernel(ffn_fan)
         g.add_data_edge(ffn_norm, ffn_fan, {"y": "x"})
 
-        gate = make_gemm(M, N_EXPERTS, D, "fp32", "bf16", "fp32")
+        gate = make_gemm(M, N_EXPERTS, D, "bf16", "bf16", "fp32")
         g.add_kernel(gate)
         g.add_data_edge(ffn_fan, gate, {"y": "x"})
         L.gate = gate

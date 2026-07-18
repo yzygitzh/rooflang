@@ -102,7 +102,7 @@ def column_split(kernel, n):
             c.outputs = {"y": Tensor(kernel.out_dtype, shard_out_shape)}
             copies.append(c)
     else:
-        shard_out_shape = (kernel.M, shard_n)
+        shard_out_shape = _shard_shape(out_tensor.shape, n, dim=-1)
         for _ in range(n):
             c = Gemm(kernel.M, shard_n, kernel.K, kernel.w_dtype,
                      kernel.a_dtype, kernel.out_dtype)

@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List
 
-from rooflang.runtime.simulator import SimulationResult
+from rooflang.runtime.simulator import Simulator, SimulationResult
 
 
 def export_trace(result: SimulationResult, path: str) -> None:
@@ -27,7 +27,9 @@ def export_trace(result: SimulationResult, path: str) -> None:
         dur_us = entry.end_us - entry.start_us
         dur_s = dur_us / 1e6 if dur_us > 0 else 0.0
         kernel = entry.kernel
-        peak_flops = max(entry.device.tflops.values(), default=0.0) * 1e12
+        dtype = Simulator._infer_dtype(kernel)
+        peak_tflops = entry.device.tflops.get(dtype, 0.0)
+        peak_flops = peak_tflops * 1e12
         mfu = kernel.flops / (peak_flops * dur_s) if peak_flops > 0 and dur_s > 0 else 0.0
         input_bw = kernel.input_bytes / (dur_s * 1e9) if dur_s > 0 else 0.0
         weight_bw = kernel.weight_bytes / (dur_s * 1e9) if dur_s > 0 else 0.0
@@ -44,6 +46,8 @@ def export_trace(result: SimulationResult, path: str) -> None:
             "pid": entry.device.name,
             "tid": f"stream{entry.stream}",
             "args": {
+                "dtype": dtype,
+                "peak_tflops": peak_tflops,
                 "flops": kernel.flops,
                 "input_bytes": kernel.input_bytes,
                 "weight_bytes": kernel.weight_bytes,
@@ -63,18 +67,25 @@ def export_trace(result: SimulationResult, path: str) -> None:
                    for mem, bytes_val in result.peak_memory.items()]
 
     total_s = result.total_time_us / 1e6 if result.total_time_us > 0 else 0.0
-    device_flops: Dict[str, float] = {}
+    device_stats: Dict[str, Dict[str, float]] = {}
     for entry in result.trace:
-        device_flops[entry.device.name] = (
-            device_flops.get(entry.device.name, 0.0) + entry.kernel.flops)
+        dev_name = entry.device.name
+        if dev_name not in device_stats:
+            device_stats[dev_name] = {"flops": 0.0, "peak_dur": 0.0}
+        kernel = entry.kernel
+        dtype = Simulator._infer_dtype(kernel)
+        peak = entry.device.tflops.get(dtype, 0.0) * 1e12
+        dur_s = (entry.end_us - entry.start_us) / 1e6
+        device_stats[dev_name]["flops"] += kernel.flops
+        device_stats[dev_name]["peak_dur"] += peak * dur_s
+
     gpu_stats = []
     for dev in sorted(devices, key=lambda d: d.name):
-        flops = device_flops.get(dev.name, 0.0)
-        peak = max(dev.tflops.values(), default=0.0) * 1e12
-        mfu = flops / (peak * total_s) if peak > 0 and total_s > 0 else 0.0
+        stats = device_stats.get(dev.name, {"flops": 0.0, "peak_dur": 0.0})
+        mfu = stats["flops"] / stats["peak_dur"] if stats["peak_dur"] > 0 else 0.0
         gpu_stats.append({
             "name": dev.name,
-            "total_flops": flops,
+            "total_flops": stats["flops"],
             "mfu": mfu,
         })
 

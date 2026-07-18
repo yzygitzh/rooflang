@@ -71,22 +71,30 @@ def export_trace(result: SimulationResult, path: str) -> None:
     for entry in result.trace:
         dev_name = entry.device.name
         if dev_name not in device_stats:
-            device_stats[dev_name] = {"flops": 0.0, "peak_dur": 0.0}
+            device_stats[dev_name] = {"flops": 0.0, "peak_dur": 0.0,
+                                      "busy_s": 0.0}
         kernel = entry.kernel
         dtype = Simulator._infer_dtype(kernel)
         peak = entry.device.tflops.get(dtype, 0.0) * 1e12
         dur_s = (entry.end_us - entry.start_us) / 1e6
         device_stats[dev_name]["flops"] += kernel.flops
         device_stats[dev_name]["peak_dur"] += peak * dur_s
+        device_stats[dev_name]["busy_s"] += dur_s
 
     gpu_stats = []
     for dev in sorted(devices, key=lambda d: d.name):
-        stats = device_stats.get(dev.name, {"flops": 0.0, "peak_dur": 0.0})
-        mfu = stats["flops"] / stats["peak_dur"] if stats["peak_dur"] > 0 else 0.0
+        stats = device_stats.get(dev.name, {"flops": 0.0, "peak_dur": 0.0,
+                                            "busy_s": 0.0})
+        mfu_busy = (stats["flops"] / stats["peak_dur"]
+                    if stats["peak_dur"] > 0 else 0.0)
+        busy_ratio = stats["busy_s"] / total_s if total_s > 0 else 0.0
+        mfu = mfu_busy * busy_ratio
         gpu_stats.append({
             "name": dev.name,
             "total_flops": stats["flops"],
             "mfu": mfu,
+            "mfu_busy": mfu_busy,
+            "busy_ratio": busy_ratio,
         })
 
     output = {

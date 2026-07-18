@@ -11,7 +11,7 @@ from rooflang.language.kernels.comm import (
     Scatter, Gather, Reduce, Send, Recv,
 )
 from rooflang.language.kernels.optimizer import AdamWStep
-from rooflang.language.kernels.identity import Move
+from rooflang.language.kernels.identity import Concat, Move, Spawn
 from rooflang.language.hardware.component import Memory
 from rooflang.language.tensor import Tensor
 
@@ -465,3 +465,70 @@ class TestBwdTokenCombine(TestKernelBase):
 
     def test_m_e(self):
         assert self.kernel.M_e == 8192 * 6 // 384
+
+
+# ── Identity kernels (Spawn / Concat) ──────────────────────────────────
+
+
+class TestSpawn(TestKernelBase):
+    __test__ = True
+    kernel = Spawn(world=4)
+    expected_flops = 0.0
+    expected_input_bytes = 0.0
+    expected_weight_bytes = 0.0
+    expected_output_bytes = 0.0
+    expected_transferred_bytes = 0.0
+
+    def test_world(self):
+        assert self.kernel.world == 4
+
+    def test_requires_placement_false(self):
+        assert self.kernel._requires_placement is False
+
+
+class TestConcat(TestKernelBase):
+    __test__ = True
+    kernel = Concat()
+    expected_flops = 0.0
+    expected_input_bytes = 0.0
+    expected_weight_bytes = 0.0
+    expected_output_bytes = 0.0
+    expected_transferred_bytes = 0.0
+
+    def test_requires_placement_false(self):
+        assert self.kernel._requires_placement is False
+
+
+# ── Backward StridedGemm kernels ───────────────────────────────────────
+
+
+class TestStridedGemmDX(TestKernelBase):
+    __test__ = True
+    kernel = backward.StridedGemmDX(M=32, N=64, K=128, w_dtype="bf16",
+                                     a_dtype="bf16", out_dtype="bf16",
+                                     in_elems=32 * 128, out_elems=32 * 64)
+    expected_flops = 2.0 * 32 * 64 * 128
+    expected_input_bytes = 32 * 64 * 2.0       # out_elems * sizeof(out_dtype)
+    expected_weight_bytes = 128 * 64 * 2.0     # K*N * sizeof(w_dtype)
+    expected_output_bytes = 32 * 128 * 2.0     # in_elems * sizeof(a_dtype)
+
+    def test_default_elems(self):
+        k = backward.StridedGemmDX(M=32, N=64, K=128, w_dtype="bf16")
+        assert k._in_elems == 32 * 128
+        assert k._out_elems == 32 * 64
+
+
+class TestStridedGemmDW(TestKernelBase):
+    __test__ = True
+    kernel = backward.StridedGemmDW(M=32, N=64, K=128, w_dtype="bf16",
+                                     a_dtype="bf16", out_dtype="bf16",
+                                     in_elems=32 * 128, out_elems=32 * 64)
+    expected_flops = 2.0 * 32 * 64 * 128
+    expected_input_bytes = 32 * 64 * 2.0 + 32 * 128 * 2.0  # out_elems*out + in_elems*a
+    expected_weight_bytes = 0.0
+    expected_output_bytes = 128 * 64 * 4.0     # K*N * sizeof(grad_dtype=fp32)
+
+    def test_default_elems(self):
+        k = backward.StridedGemmDW(M=32, N=64, K=128, w_dtype="bf16")
+        assert k._in_elems == 32 * 128
+        assert k._out_elems == 32 * 64

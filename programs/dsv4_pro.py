@@ -103,6 +103,7 @@ class LayerMeta:
     kv_norm: Kernel = None
     comp: Kernel = None
     comp_norm: Kernel = None
+    kv_concat: Kernel = None
     sa: Kernel = None
     wo_a: Kernel = None
     wo_b: Kernel = None
@@ -242,6 +243,7 @@ def declare_model():
         g.add_data_edge(kv_norm, kv_concat, {"y": "a"})
         g.add_data_edge(comp_norm, kv_concat, {"y": "b"})
         g.add_data_edge(kv_concat, sa, {"y": "kv"})
+        L.kv_concat = kv_concat
         L.sa = sa
 
         # Output projection (grouped linear: O_GROUPS independent Gemms)
@@ -365,22 +367,21 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
         _, L._wq_a_copies, _ = g.split_kernel(batch_split, L.wq_a, TP)
         _, L._q_norm_copies, _ = g.split_kernel(batch_split, L.q_norm, TP)
         _, L._wq_b_copies, _ = g.split_kernel(batch_split, L.wq_b, TP)
+        _, L._wkv_copies, _ = g.split_kernel(batch_split, L.wkv, TP)
+        _, L._kv_norm_copies, _ = g.split_kernel(batch_split, L.kv_norm, TP)
+        _, L._kv_concat_copies, _ = g.split_kernel(
+            batch_split, L.kv_concat, TP)
+        _, L._sa_copies, _ = g.split_kernel(batch_split, L.sa, TP)
+        _, L._wo_a_copies, _ = g.split_kernel(batch_split, L.wo_a, TP)
+        _, L._wo_b_copies, _ = g.split_kernel(batch_split, L.wo_b, TP)
 
     # ── Phase 2: TP splits ───────────────────────────────────────────
     for L in layers:
-        # TP splits (attention core path)
-        _, sa_copies, _ = g.split_kernel(head_split, L.sa, TP)
-        _, wo_a_copies, _ = g.split_kernel(row_split, L.wo_a, TP)
-        _, wo_b_copies, _ = g.split_kernel(row_split, L.wo_b, TP)
-
         # Shared expert TP: column-split sw_up, row-split sw_down
         _, sw_up_copies, _ = g.split_kernel(column_split, L.sw_up, TP)
         _, sw_down_copies, _ = g.split_kernel(row_split, L.sw_down, TP)
 
         # Store copies for placement
-        L._sa_copies = sa_copies
-        L._wo_a_copies = wo_a_copies
-        L._wo_b_copies = wo_b_copies
         L._sw_up_copies = sw_up_copies
         L._sw_down_copies = sw_down_copies
 
@@ -400,14 +401,16 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
 
     for L in layers:
         # Non-split kernels → GPU0
-        for k in [L.wkv, L.kv_norm,
-                  L.ffn_norm, L.gate, L.dispatch]:
+        for k in [L.ffn_norm, L.gate, L.dispatch]:
             p.set_kernel_device(k, gpus[0])
 
         # DP copies → GPU0-7
         for copies in [L._bridge_copies, L._attn_norm_copies,
                        L._attn_fan_copies, L._wq_a_copies,
-                       L._q_norm_copies, L._wq_b_copies]:
+                       L._q_norm_copies, L._wq_b_copies,
+                       L._wkv_copies, L._kv_norm_copies,
+                       L._kv_concat_copies, L._sa_copies,
+                       L._wo_a_copies, L._wo_b_copies]:
             for i, c in enumerate(copies):
                 p.set_kernel_device(c, gpus[i])
         if L.comp is not None:
@@ -418,9 +421,7 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
                 p.set_kernel_device(c, gpus[i])
 
         # TP copies → GPU0-7
-        for copies in [L._sa_copies,
-                       L._wo_a_copies, L._wo_b_copies,
-                       L._sw_up_copies, L._sw_down_copies]:
+        for copies in [L._sw_up_copies, L._sw_down_copies]:
             for i, c in enumerate(copies):
                 p.set_kernel_device(c, gpus[i])
 

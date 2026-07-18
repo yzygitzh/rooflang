@@ -241,6 +241,10 @@ def _make_batch_copy(kernel, n):
     elif isinstance(kernel, TokenCombine):
         c = TokenCombine(kernel.M // n, kernel.D, kernel.N_experts,
                          kernel.topk, kernel.a_dtype)
+    elif isinstance(kernel, SparseAttn):
+        c = SparseAttn(kernel.B // n, kernel.H, kernel.H_kv, kernel.S_q,
+                       kernel.k_sel, kernel.S_kv, kernel.Hd, kernel.dtype_,
+                       kernel.kv_factor)
     elif isinstance(kernel, Spawn):
         c = Spawn(world=kernel.world)
     elif isinstance(kernel, Concat):

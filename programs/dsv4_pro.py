@@ -22,7 +22,7 @@ from rooflang.language.optimization.split import column_split, head_split, row_s
 from rooflang.language.placement import Placement
 from rooflang.language.tensor import Tensor
 from rooflang.language.utils import dtype_bytes, gemm_scale_bytes
-from rooflang.programs.presets.b300 import B300ClusterA
+from rooflang.programs.presets.b300 import B300ClusterA, B300SuperChipA
 from rooflang.runtime.simulator import Simulator
 from rooflang.runtime.trace_export import export_trace
 from rooflang.runtime.graph_export import export_graph
@@ -455,6 +455,18 @@ def visualize_layer(g, layer_meta, extra_seeds=None,
     export_graph(g, path, kernels=kernels, figsize=figsize)
 
 
+def optimize_model_superchip(g, layers, hw, emb=None):
+    """Place all kernels on the single fused GPU (no splits, no comms)."""
+    gpu = [c for c in hw.nodes if isinstance(c, Compute)
+           and "nvidia-b300" in c.name][0]
+    p = Placement(hardware=hw, graph=g)
+    for k in g.topological_sort():
+        p.set_kernel_device(k, gpu)
+    g.validate()
+    p.validate(g)
+    return g, p
+
+
 def main():
     # A. Declaration
     hw = B300ClusterA(n_nodes=1)
@@ -469,6 +481,18 @@ def main():
     result = simulate(g, p, hw)
     print(f"Prefill: {result.total_time_us:.1f} us "
           f"({result.total_time_us / 1000:.1f} ms)")
+
+    # ── SuperChip (zero-comm) comparison ──
+    hw_sc = B300SuperChipA()
+    g_sc, layers_sc, emb_sc = declare_model()
+
+    # B. Optimization (no splits)
+    g_sc, p_sc = optimize_model_superchip(g_sc, layers_sc, hw_sc, emb_sc)
+
+    # C. Simulation
+    result_sc = simulate(g_sc, p_sc, hw_sc)
+    print(f"Prefill (SuperChip): {result_sc.total_time_us:.1f} us "
+          f"({result_sc.total_time_us / 1000:.1f} ms)")
 
 
 if __name__ == "__main__":

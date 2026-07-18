@@ -357,6 +357,11 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
         _, L._bridge_copies, _ = g.split_kernel(batch_split, L.bridge, TP)
         _, L._attn_norm_copies, _ = g.split_kernel(batch_split, L.attn_norm, TP)
         _, L._attn_fan_copies, _ = g.split_kernel(batch_split, L.attn_fan, TP)
+        if L.comp is not None:
+            _, L._comp_copies, _ = g.split_kernel(batch_split, L.comp, TP)
+        if L.comp_norm is not None:
+            _, L._comp_norm_copies, _ = g.split_kernel(
+                batch_split, L.comp_norm, TP)
 
     # ── Phase 2: TP splits ───────────────────────────────────────────
     for L in layers:
@@ -397,15 +402,17 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
         for k in [L.wq_a, L.q_norm, L.wkv, L.kv_norm,
                   L.ffn_norm, L.gate, L.dispatch]:
             p.set_kernel_device(k, gpus[0])
-        if L.comp is not None:
-            p.set_kernel_device(L.comp, gpus[0])
-        if L.comp_norm is not None:
-            p.set_kernel_device(L.comp_norm, gpus[0])
 
         # DP copies → GPU0-7
         for copies in [L._bridge_copies, L._attn_norm_copies,
                        L._attn_fan_copies]:
             for i, c in enumerate(copies):
+                p.set_kernel_device(c, gpus[i])
+        if L.comp is not None:
+            for i, c in enumerate(L._comp_copies):
+                p.set_kernel_device(c, gpus[i])
+        if L.comp_norm is not None:
+            for i, c in enumerate(L._comp_norm_copies):
                 p.set_kernel_device(c, gpus[i])
 
         # TP copies → GPU0-7

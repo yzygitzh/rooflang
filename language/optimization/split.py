@@ -252,5 +252,6 @@ def _make_batch_copy(kernel, n):
             c.weights = {"emb": Tensor(kernel.w_dtype,
                                        (kernel.M // n, kernel.D))}
         else:
-            c.weights = dict(kernel.weights)
+            c.weights = {k: Tensor(t.dtype, t.shape)
+                         for k, t in kernel.weights.items()}
     return c

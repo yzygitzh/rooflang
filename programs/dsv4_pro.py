@@ -108,6 +108,7 @@ class LayerMeta:
     wo_a: Kernel = None
     wo_b: Kernel = None
     ffn_norm: Kernel = None
+    ffn_fan: Kernel = None
     gate: Kernel = None
     dispatch: Kernel = None
     combine: Kernel = None
@@ -275,6 +276,7 @@ def declare_model():
                            "y2": Tensor("bf16", (BATCH, S, D))}
         g.add_kernel(ffn_fan)
         g.add_data_edge(ffn_norm, ffn_fan, {"y": "x"})
+        L.ffn_fan = ffn_fan
 
         gate = make_gemm(BATCH, S, N_EXPERTS, D, "bf16", "bf16", "fp32")
         g.add_kernel(gate)
@@ -374,6 +376,9 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
         _, L._sa_copies, _ = g.split_kernel(batch_split, L.sa, TP)
         _, L._wo_a_copies, _ = g.split_kernel(batch_split, L.wo_a, TP)
         _, L._wo_b_copies, _ = g.split_kernel(batch_split, L.wo_b, TP)
+        _, L._ffn_norm_copies, _ = g.split_kernel(batch_split, L.ffn_norm, TP)
+        _, L._ffn_fan_copies, _ = g.split_kernel(batch_split, L.ffn_fan, TP)
+        _, L._gate_copies, _ = g.split_kernel(batch_split, L.gate, TP)
 
     # ── Phase 2: TP splits ───────────────────────────────────────────
     for L in layers:
@@ -401,7 +406,7 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
 
     for L in layers:
         # Non-split kernels → GPU0
-        for k in [L.ffn_norm, L.gate, L.dispatch]:
+        for k in [L.dispatch]:
             p.set_kernel_device(k, gpus[0])
 
         # DP copies → GPU0-7
@@ -410,7 +415,9 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
                        L._q_norm_copies, L._wq_b_copies,
                        L._wkv_copies, L._kv_norm_copies,
                        L._kv_concat_copies, L._sa_copies,
-                       L._wo_a_copies, L._wo_b_copies]:
+                       L._wo_a_copies, L._wo_b_copies,
+                       L._ffn_norm_copies, L._ffn_fan_copies,
+                       L._gate_copies]:
             for i, c in enumerate(copies):
                 p.set_kernel_device(c, gpus[i])
         if L.comp is not None:

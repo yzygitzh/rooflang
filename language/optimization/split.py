@@ -30,6 +30,8 @@ from rooflang.language.utils import dtype_bytes, gemm_scale_bytes
 
 def _shard_shape(shape, n, dim=0):
     """Divide shape[dim] by n."""
+    if dim < 0:
+        dim = len(shape) + dim
     lst = list(shape)
     lst[dim] = lst[dim] // n
     return tuple(lst)
@@ -37,6 +39,8 @@ def _shard_shape(shape, n, dim=0):
 
 def _make_scatter(tensor, n, dim=0):
     """Create a Scatter comm: 1 input "x", n outputs "o0".."o{n-1}"."""
+    if dim < 0:
+        dim = len(tensor.shape) + dim
     shard = _shard_shape(tensor.shape, n, dim)
     comm = Scatter(total_bytes=tensor.size_bytes, world=n, dim=dim)
     comm.inputs = {"x": Tensor(tensor.dtype, tensor.shape)}
@@ -46,6 +50,8 @@ def _make_scatter(tensor, n, dim=0):
 
 def _make_gather(tensor, n, dim=0):
     """Create a Gather comm: n inputs "i0".."i{n-1}", 1 output "y"."""
+    if dim < 0:
+        dim = len(tensor.shape) + dim
     shard = _shard_shape(tensor.shape, n, dim)
     comm = Gather(total_bytes=tensor.size_bytes, world=n, dim=dim)
     comm.inputs = {f"i{i}": Tensor(tensor.dtype, shard) for i in range(n)}

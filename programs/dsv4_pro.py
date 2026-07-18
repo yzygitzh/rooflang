@@ -362,11 +362,13 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
         if L.comp_norm is not None:
             _, L._comp_norm_copies, _ = g.split_kernel(
                 batch_split, L.comp_norm, TP)
+        _, L._wq_a_copies, _ = g.split_kernel(batch_split, L.wq_a, TP)
+        _, L._q_norm_copies, _ = g.split_kernel(batch_split, L.q_norm, TP)
+        _, L._wq_b_copies, _ = g.split_kernel(batch_split, L.wq_b, TP)
 
     # ── Phase 2: TP splits ───────────────────────────────────────────
     for L in layers:
         # TP splits (attention core path)
-        _, wq_b_copies, _ = g.split_kernel(column_split, L.wq_b, TP)
         _, sa_copies, _ = g.split_kernel(head_split, L.sa, TP)
         _, wo_a_copies, _ = g.split_kernel(row_split, L.wo_a, TP)
         _, wo_b_copies, _ = g.split_kernel(row_split, L.wo_b, TP)
@@ -376,7 +378,6 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
         _, sw_down_copies, _ = g.split_kernel(row_split, L.sw_down, TP)
 
         # Store copies for placement
-        L._wq_b_copies = wq_b_copies
         L._sa_copies = sa_copies
         L._wo_a_copies = wo_a_copies
         L._wo_b_copies = wo_b_copies
@@ -399,13 +400,14 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
 
     for L in layers:
         # Non-split kernels → GPU0
-        for k in [L.wq_a, L.q_norm, L.wkv, L.kv_norm,
+        for k in [L.wkv, L.kv_norm,
                   L.ffn_norm, L.gate, L.dispatch]:
             p.set_kernel_device(k, gpus[0])
 
         # DP copies → GPU0-7
         for copies in [L._bridge_copies, L._attn_norm_copies,
-                       L._attn_fan_copies]:
+                       L._attn_fan_copies, L._wq_a_copies,
+                       L._q_norm_copies, L._wq_b_copies]:
             for i, c in enumerate(copies):
                 p.set_kernel_device(c, gpus[i])
         if L.comp is not None:
@@ -416,7 +418,7 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
                 p.set_kernel_device(c, gpus[i])
 
         # TP copies → GPU0-7
-        for copies in [L._wq_b_copies, L._sa_copies,
+        for copies in [L._sa_copies,
                        L._wo_a_copies, L._wo_b_copies,
                        L._sw_up_copies, L._sw_down_copies]:
             for i, c in enumerate(copies):

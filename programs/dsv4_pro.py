@@ -12,8 +12,8 @@ from typing import List, Set
 from rooflang.language.graph import ComputeGraph
 from rooflang.language.hardware.component import Compute
 from rooflang.language.kernels.forward import (
-    Embedding, Gemm, RMSNorm, SparseAttn, StridedGemm, TokenCombine,
-    TokenDispatch,
+    Embedding, Gemm, ReadInput, RMSNorm, SparseAttn, StridedGemm,
+    TokenCombine, TokenDispatch,
 )
 from rooflang.language.kernels.identity import Concat, Spawn
 from rooflang.language.kernels.kernel import Kernel
@@ -120,12 +120,19 @@ def declare_model():
     M = BATCH * S  # total tokens (all Gemm/Norm/MoE use M)
     layers = []
 
+    # ReadInput: host-to-device transfer of token indices
+    read_input = ReadInput(BATCH * S, "int32")
+    read_input.inputs = {"tokens": Tensor("int32", (BATCH, S))}
+    read_input.outputs = {"tokens": Tensor("int32", (BATCH, S))}
+    g.add_kernel(read_input)
+
     # Embedding lookup
     emb = Embedding(M, V, D)
-    emb.inputs = {"idx": Tensor("int32", (M,))}
+    emb.inputs = {"idx": Tensor("int32", (BATCH, S))}
     emb.weights = {"emb": Tensor("bf16", (M, D))}
     emb.outputs = {"y": Tensor("bf16", (M, D))}
     g.add_kernel(emb)
+    g.add_data_edge(read_input, emb, {"tokens": "idx"})
 
     prev_out = emb
 
@@ -319,14 +326,14 @@ def declare_model():
         layers.append(L)
 
     g.validate()
-    return g, layers, emb
+    return g, layers, emb, read_input
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # B. Optimization Phase
 # ═══════════════════════════════════════════════════════════════════════
 
-def optimize_model(g, layers, hw, emb=None):
+def optimize_model(g, layers, hw, emb=None, read_input=None):
     """Apply split_kernel for TP, add control edges, and place."""
     gpus = sorted(
         [c for c in hw.nodes if isinstance(c, Compute)
@@ -358,6 +365,13 @@ def optimize_model(g, layers, hw, emb=None):
 
     if emb is not None:
         p.set_kernel_device(emb, gpus[0])
+
+    if read_input is not None:
+        p.set_kernel_device(read_input, gpus[0])
+        cpu = [c for c in hw.nodes if isinstance(c, Compute)
+               and "intel-xeon" in c.name][0]
+        cpu_mem = hw.find_local_memory(cpu)
+        p.set_tensor_memory(read_input.inputs["tokens"], cpu_mem)
 
     for L in layers:
         # Non-split kernels → GPU0
@@ -472,12 +486,12 @@ def optimize_model_superchip(g, layers, hw, emb=None):
 def main():
     # A. Declaration
     hw = B300ClusterA(n_nodes=1)
-    g, layers, emb = declare_model()
+    g, layers, emb, read_input = declare_model()
 
-    visualize_layer(g, layers[0], extra_seeds={emb})
+    visualize_layer(g, layers[0], extra_seeds={emb, read_input})
 
     # B. Optimization
-    g, p = optimize_model(g, layers, hw, emb)
+    g, p = optimize_model(g, layers, hw, emb, read_input)
 
     # C. Simulation
     result = simulate(g, p, hw)
@@ -486,7 +500,7 @@ def main():
 
     # ── SuperChip (zero-comm) comparison ──
     hw_sc = B300SuperChipA()
-    g_sc, layers_sc, emb_sc = declare_model()
+    g_sc, layers_sc, emb_sc, read_input_sc = declare_model()
 
     # B. Optimization (no splits)
     g_sc, p_sc = optimize_model_superchip(g_sc, layers_sc, hw_sc, emb_sc)

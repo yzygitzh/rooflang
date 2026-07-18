@@ -2,7 +2,7 @@
 
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.kernels.forward import (
-    Embedding, Gemm, RMSNorm, LayerNorm, RoPE, Attn, SparseAttn,
+    Embedding, Gemm, ReadInput, RMSNorm, LayerNorm, RoPE, Attn, SparseAttn,
     TokenDispatch, TokenCombine,
 )
 from rooflang.language.kernels import backward
@@ -102,6 +102,15 @@ class TestKernelBase:
 # ── Forward kernels ──────────────────────────────────────────────────
 
 
+class TestReadInput(TestKernelBase):
+    __test__ = True
+    kernel = ReadInput(n_elements=64 * 8192, dtype="int32")
+    expected_flops = 0.0
+    expected_input_bytes = 64 * 8192 * 4.0
+    expected_weight_bytes = 0.0
+    expected_output_bytes = 64 * 8192 * 4.0
+
+
 class TestEmbedding(TestKernelBase):
     __test__ = True
     kernel = Embedding(M=8192, V=129280, D=7168, w_dtype="bf16")
@@ -174,6 +183,15 @@ class TestSparseAttn(TestKernelBase):
 
 
 # ── Backward kernels ─────────────────────────────────────────────────
+
+
+class TestBwdReadInput(TestKernelBase):
+    __test__ = True
+    kernel = backward.ReadInput(n_elements=64 * 8192, dtype="int32")
+    expected_flops = 0.0
+    expected_input_bytes = 64 * 8192 * 4.0
+    expected_weight_bytes = 0.0
+    expected_output_bytes = 64 * 8192 * 4.0
 
 
 class TestBwdEmbedding(TestKernelBase):

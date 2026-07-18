@@ -20,6 +20,40 @@ from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.utils import dtype_bytes, gemm_scale_bytes
 
 
+class ReadInput(Kernel):
+    """ReadInput backward: device-to-host transfer.
+
+    Symmetric to forward ReadInput (host-to-device). Models writing
+    data from GPU HBM back to CPU DRAM.
+
+    flops = 0 (pure memcpy).
+    bytes:
+        input_bytes  = n_elements · sizeof(dtype)  (from GPU HBM)
+        output_bytes = n_elements · sizeof(dtype)  (to CPU DRAM)
+    """
+
+    def __init__(self, n_elements: int, dtype: str = "int32"):
+        self.n_elements = n_elements
+        self.dtype_ = dtype
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        return 0.0
+
+    @property
+    def input_bytes(self) -> float:
+        return self.n_elements * dtype_bytes(self.dtype_)
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        return self.n_elements * dtype_bytes(self.dtype_)
+
+
 class Embedding(Kernel):
     """Embedding backward: scatter-add gradients to M rows of the table.
 

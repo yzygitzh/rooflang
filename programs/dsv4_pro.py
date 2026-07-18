@@ -18,7 +18,9 @@ from rooflang.language.kernels.forward import (
 from rooflang.language.kernels.identity import Concat, Spawn
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.optimization.comm import optimize_comms
-from rooflang.language.optimization.split import column_split, head_split, row_split
+from rooflang.language.optimization.split import (
+    batch_split, column_split, head_split, row_split,
+)
 from rooflang.language.placement import Placement
 from rooflang.language.tensor import Tensor
 from rooflang.language.utils import dtype_bytes, gemm_scale_bytes
@@ -45,7 +47,7 @@ TP = 8
 EP = 8
 N_LOCAL_EXPERTS = N_EXPERTS // EP
 V = 129280
-BATCH = 1
+BATCH = 8
 S_PREFILL = 8192
 COMPRESS_RATIOS = [128, 128] + [v for _ in range(29) for v in (4, 128)] + [4]
 
@@ -340,7 +342,12 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
          and "nvidia-b300" in c.name],
         key=lambda c: c.name)
 
-    # ── Graph transforms ──────────────────────────────────────────
+    # ── Phase 1: DP splits (batch dim) ───────────────────────────────
+    emb_copies = None
+    if emb is not None:
+        _, emb_copies, _ = g.split_kernel(batch_split, emb, TP)
+
+    # ── Phase 2: TP splits ───────────────────────────────────────────
     for L in layers:
         # TP splits (attention core path)
         _, wq_b_copies, _ = g.split_kernel(column_split, L.wq_b, TP)
@@ -363,8 +370,9 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
     # ── Placement ─────────────────────────────────────────────────
     p = Placement(hardware=hw, graph=g)
 
-    if emb is not None:
-        p.set_kernel_device(emb, gpus[0])
+    if emb_copies is not None:
+        for i, c in enumerate(emb_copies):
+            p.set_kernel_device(c, gpus[i])
 
     if read_input is not None:
         p.set_kernel_device(read_input, gpus[0])

@@ -16,9 +16,62 @@ Each next_comm has n inputs ("i0".."i{n-1}") and 1 output ("y").
 """
 
 from rooflang.language.kernels.comm import Broadcast, Gather, Reduce, Scatter
-from rooflang.language.kernels.forward import Gemm, SparseAttn, StridedGemm
+from rooflang.language.kernels.forward import (
+    Embedding, Gemm, ReadInput, RMSNorm, SparseAttn, StridedGemm,
+    TokenCombine, TokenDispatch,
+)
+from rooflang.language.kernels.identity import Concat, Spawn
 from rooflang.language.tensor import Tensor
-from rooflang.language.utils import gemm_scale_bytes
+from rooflang.language.utils import dtype_bytes, gemm_scale_bytes
+
+
+# ── Shared helpers ─────────────────────────────────────────────────────
+
+
+def _shard_shape(shape, n, dim=0):
+    """Divide shape[dim] by n."""
+    lst = list(shape)
+    lst[dim] = lst[dim] // n
+    return tuple(lst)
+
+
+def _make_scatter(tensor, n, dim=0):
+    """Create a Scatter comm: 1 input "x", n outputs "o0".."o{n-1}"."""
+    shard = _shard_shape(tensor.shape, n, dim)
+    comm = Scatter(total_bytes=tensor.size_bytes, world=n, dim=dim)
+    comm.inputs = {"x": Tensor(tensor.dtype, tensor.shape)}
+    comm.outputs = {f"o{i}": Tensor(tensor.dtype, shard) for i in range(n)}
+    return comm
+
+
+def _make_gather(tensor, n, dim=0):
+    """Create a Gather comm: n inputs "i0".."i{n-1}", 1 output "y"."""
+    shard = _shard_shape(tensor.shape, n, dim)
+    comm = Gather(total_bytes=tensor.size_bytes, world=n, dim=dim)
+    comm.inputs = {f"i{i}": Tensor(tensor.dtype, shard) for i in range(n)}
+    comm.outputs = {"y": Tensor(tensor.dtype, tensor.shape)}
+    return comm
+
+
+def _make_broadcast(tensor, n):
+    """Create a Broadcast comm: 1 input "x", n outputs "o0".."o{n-1}" (unchanged shape)."""
+    comm = Broadcast(total_bytes=tensor.size_bytes, world=n)
+    comm.inputs = {"x": Tensor(tensor.dtype, tensor.shape)}
+    comm.outputs = {f"o{i}": Tensor(tensor.dtype, tensor.shape)
+                    for i in range(n)}
+    return comm
+
+
+def _make_reduce(tensor, n, dtype="bf16"):
+    """Create a Reduce comm: n inputs "i0".."i{n-1}", 1 output "y" (unchanged shape)."""
+    comm = Reduce(total_bytes=tensor.size_bytes, world=n, dtype=dtype)
+    comm.inputs = {f"i{i}": Tensor(tensor.dtype, tensor.shape)
+                   for i in range(n)}
+    comm.outputs = {"y": Tensor(tensor.dtype, tensor.shape)}
+    return comm
+
+
+# ── column_split / row_split / head_split ──────────────────────────────
 
 
 def column_split(kernel, n):
@@ -28,31 +81,20 @@ def column_split(kernel, n):
     concatenated (Gather). Works for both Gemm and StridedGemm.
     """
     shard_n = kernel.N // n
-
-    # Read actual tensor shapes from kernel
     in_tensor = kernel.inputs["x"]
-    in_shape = in_tensor.shape
-    in_dtype = in_tensor.dtype
-    in_bytes = in_tensor.size_bytes
+    out_tensor = kernel.outputs["y"]
 
-    # prev_comms: Broadcast the input to all ranks (unchanged)
-    prev_comms = {}
-    prev_comms["x"] = Broadcast(total_bytes=in_bytes, world=n)
-    prev_comms["x"].inputs = {"x": Tensor(in_dtype, in_shape)}
-    prev_comms["x"].outputs = {f"o{i}": Tensor(in_dtype, in_shape)
-                               for i in range(n)}
+    prev_comms = {"x": _make_broadcast(in_tensor, n)}
 
-    # copies: split along N dimension
     copies = []
     if isinstance(kernel, StridedGemm):
         shard_out_elems = kernel._out_elems // n
-        out_shape = kernel.outputs["y"].shape
-        shard_out_shape = out_shape[:-1] + (out_shape[-1] // n,)
+        shard_out_shape = _shard_shape(out_tensor.shape, n, dim=-1)
         for _ in range(n):
             c = StridedGemm(kernel.M, shard_n, kernel.K, kernel.w_dtype,
                             kernel.a_dtype, kernel.out_dtype,
                             in_elems=kernel._in_elems, out_elems=shard_out_elems)
-            c.inputs = {"x": Tensor(in_dtype, in_shape)}
+            c.inputs = {"x": Tensor(in_tensor.dtype, in_tensor.shape)}
             c.weights = {"w": Tensor(kernel.w_dtype, (kernel.K, shard_n))}
             scale_bytes = gemm_scale_bytes(shard_n, kernel.K, kernel.w_dtype)
             if scale_bytes > 0:
@@ -60,27 +102,19 @@ def column_split(kernel, n):
             c.outputs = {"y": Tensor(kernel.out_dtype, shard_out_shape)}
             copies.append(c)
     else:
+        shard_out_shape = (kernel.M, shard_n)
         for _ in range(n):
             c = Gemm(kernel.M, shard_n, kernel.K, kernel.w_dtype,
                      kernel.a_dtype, kernel.out_dtype)
-            c.inputs = {"x": Tensor(in_dtype, in_shape)}
+            c.inputs = {"x": Tensor(in_tensor.dtype, in_tensor.shape)}
             c.weights = {"w": Tensor(kernel.w_dtype, (kernel.K, shard_n))}
             scale_bytes = gemm_scale_bytes(shard_n, kernel.K, kernel.w_dtype)
             if scale_bytes > 0:
                 c.weights["s"] = Tensor("ue8m0", (int(scale_bytes),))
-            c.outputs = {"y": Tensor(kernel.out_dtype, (kernel.M, shard_n))}
+            c.outputs = {"y": Tensor(kernel.out_dtype, shard_out_shape)}
             copies.append(c)
 
-    # next_comms: Gather output shards
-    out_tensor = kernel.outputs["y"]
-    out_bytes = out_tensor.size_bytes
-    out_dtype = out_tensor.dtype
-    shard_shape = copies[0].outputs["y"].shape
-    next_comms = {}
-    next_comms["y"] = Gather(total_bytes=out_bytes, world=n)
-    next_comms["y"].inputs = {f"i{i}": Tensor(out_dtype, shard_shape)
-                              for i in range(n)}
-    next_comms["y"].outputs = {"y": Tensor(out_dtype, out_tensor.shape)}
+    next_comms = {"y": _make_gather(out_tensor, n, dim=-1)}
 
     return prev_comms, copies, next_comms
 
@@ -92,27 +126,12 @@ def row_split(kernel, n):
     reduced (Reduce).
     """
     shard_k = kernel.K // n
-
-    # Read actual tensor shapes from kernel
     in_tensor = kernel.inputs["x"]
-    in_shape = in_tensor.shape
-    in_dtype = in_tensor.dtype
-    in_bytes = in_tensor.size_bytes
-
-    # Shard input along last dimension (K)
-    shard_in_shape = in_shape[:-1] + (in_shape[-1] // n,)
-
-    # prev_comms: Scatter input into K-shards
-    prev_comms = {}
-    prev_comms["x"] = Scatter(total_bytes=in_bytes, world=n)
-    prev_comms["x"].inputs = {"x": Tensor(in_dtype, in_shape)}
-    prev_comms["x"].outputs = {f"o{i}": Tensor(in_dtype, shard_in_shape)
-                               for i in range(n)}
-
-    # copies
     out_tensor = kernel.outputs["y"]
-    out_dtype = out_tensor.dtype
-    out_shape = out_tensor.shape
+    shard_in_shape = _shard_shape(in_tensor.shape, n, dim=-1)
+
+    prev_comms = {"x": _make_scatter(in_tensor, n, dim=-1)}
+
     copies = []
     if isinstance(kernel, StridedGemm):
         for _ in range(n):
@@ -120,32 +139,26 @@ def row_split(kernel, n):
                             kernel.a_dtype, kernel.out_dtype,
                             in_elems=kernel._in_elems // n,
                             out_elems=kernel._out_elems)
-            c.inputs = {"x": Tensor(in_dtype, shard_in_shape)}
+            c.inputs = {"x": Tensor(in_tensor.dtype, shard_in_shape)}
             c.weights = {"w": Tensor(kernel.w_dtype, (shard_k, kernel.N))}
             scale_bytes = gemm_scale_bytes(kernel.N, shard_k, kernel.w_dtype)
             if scale_bytes > 0:
                 c.weights["s"] = Tensor("ue8m0", (int(scale_bytes),))
-            c.outputs = {"y": Tensor(out_dtype, out_shape)}
+            c.outputs = {"y": Tensor(out_tensor.dtype, out_tensor.shape)}
             copies.append(c)
     else:
         for _ in range(n):
             c = Gemm(kernel.M, kernel.N, shard_k, kernel.w_dtype,
                      kernel.a_dtype, kernel.out_dtype)
-            c.inputs = {"x": Tensor(in_dtype, shard_in_shape)}
+            c.inputs = {"x": Tensor(in_tensor.dtype, shard_in_shape)}
             c.weights = {"w": Tensor(kernel.w_dtype, (shard_k, kernel.N))}
             scale_bytes = gemm_scale_bytes(kernel.N, shard_k, kernel.w_dtype)
             if scale_bytes > 0:
                 c.weights["s"] = Tensor("ue8m0", (int(scale_bytes),))
-            c.outputs = {"y": Tensor(out_dtype, out_shape)}
+            c.outputs = {"y": Tensor(out_tensor.dtype, out_tensor.shape)}
             copies.append(c)
 
-    # next_comms: Reduce partial sums
-    out_bytes = out_tensor.size_bytes
-    next_comms = {}
-    next_comms["y"] = Reduce(total_bytes=out_bytes, world=n)
-    next_comms["y"].inputs = {f"i{i}": Tensor(out_dtype, out_shape)
-                              for i in range(n)}
-    next_comms["y"].outputs = {"y": Tensor(out_dtype, out_shape)}
+    next_comms = {"y": _make_reduce(out_tensor, n, dtype=kernel.out_dtype)}
 
     return prev_comms, copies, next_comms
 
@@ -157,47 +170,87 @@ def head_split(kernel, n):
     (same KV cache to each rank). Output shards are concatenated (Gather).
     """
     shard_h = kernel.H // n
-
-    # Read actual tensor shapes
     q_tensor = kernel.inputs["q"]
     kv_tensor = kernel.inputs["kv"]
+    out_tensor = kernel.outputs["y"]
+    shard_q_shape = _shard_shape(q_tensor.shape, n, dim=-1)
 
-    # Q shard: split last dimension by n
-    q_shape = q_tensor.shape
-    shard_q_shape = q_shape[:-1] + (q_shape[-1] // n,)
+    prev_comms = {
+        "q": _make_scatter(q_tensor, n, dim=-1),
+        "kv": _make_broadcast(kv_tensor, n),
+    }
 
-    # KV: broadcast unchanged
-    kv_shape = kv_tensor.shape
-
-    # prev_comms: Scatter for Q, Broadcast for KV
-    prev_comms = {}
-    prev_comms["q"] = Scatter(total_bytes=q_tensor.size_bytes, world=n)
-    prev_comms["q"].inputs = {"x": Tensor(kernel.dtype_, q_shape)}
-    prev_comms["q"].outputs = {f"o{i}": Tensor(kernel.dtype_, shard_q_shape)
-                               for i in range(n)}
-
-    prev_comms["kv"] = Broadcast(total_bytes=kv_tensor.size_bytes, world=n)
-    prev_comms["kv"].inputs = {"x": Tensor(kernel.dtype_, kv_shape)}
-    prev_comms["kv"].outputs = {f"o{i}": Tensor(kernel.dtype_, kv_shape)
-                                for i in range(n)}
-
-    # copies
     copies = []
     for _ in range(n):
         c = SparseAttn(kernel.B, shard_h, kernel.H_kv, kernel.S_q,
                        kernel.k_sel, kernel.S_kv, kernel.Hd, kernel.dtype_,
                        kernel.kv_factor)
         c.inputs = {"q": Tensor(kernel.dtype_, shard_q_shape),
-                    "kv": Tensor(kernel.dtype_, kv_shape)}
+                    "kv": Tensor(kernel.dtype_, kv_tensor.shape)}
         c.outputs = {"y": Tensor(kernel.dtype_, shard_q_shape)}
         copies.append(c)
 
-    # next_comms: Gather output
-    out_tensor = kernel.outputs["y"]
-    next_comms = {}
-    next_comms["y"] = Gather(total_bytes=out_tensor.size_bytes, world=n)
-    next_comms["y"].inputs = {f"i{i}": Tensor(kernel.dtype_, shard_q_shape)
-                              for i in range(n)}
-    next_comms["y"].outputs = {"y": Tensor(kernel.dtype_, out_tensor.shape)}
+    next_comms = {"y": _make_gather(out_tensor, n, dim=-1)}
 
     return prev_comms, copies, next_comms
+
+
+# ── batch_split ────────────────────────────────────────────────────────
+
+
+def batch_split(kernel, n):
+    """Non-contracting batch dim (M/token count): Scatter → Kernels → Gather.
+
+    Splits the leading token dimension (M) across n ranks. Each copy
+    processes M/n tokens independently. Weights are replicated.
+    """
+    prev_comms = {port: _make_scatter(tensor, n)
+                  for port, tensor in kernel.inputs.items()}
+    copies = [_make_batch_copy(kernel, n) for _ in range(n)]
+    next_comms = {port: _make_gather(tensor, n)
+                  for port, tensor in kernel.outputs.items()}
+    return prev_comms, copies, next_comms
+
+
+def _make_batch_copy(kernel, n):
+    """Construct a single batch-sharded copy of kernel (M → M/n)."""
+    if isinstance(kernel, StridedGemm):
+        c = StridedGemm(kernel.M // n, kernel.N, kernel.K, kernel.w_dtype,
+                        kernel.a_dtype, kernel.out_dtype,
+                        in_elems=kernel._in_elems // n,
+                        out_elems=kernel._out_elems // n)
+    elif isinstance(kernel, Gemm):
+        c = Gemm(kernel.M // n, kernel.N, kernel.K, kernel.w_dtype,
+                 kernel.a_dtype, kernel.out_dtype)
+    elif isinstance(kernel, RMSNorm):
+        c = RMSNorm(kernel.M // n, kernel.D, kernel.dtype_)
+    elif isinstance(kernel, Embedding):
+        c = Embedding(kernel.M // n, kernel.V, kernel.D, kernel.w_dtype,
+                      kernel.idx_dtype, kernel.out_dtype)
+    elif isinstance(kernel, ReadInput):
+        c = ReadInput(kernel.n_elements // n, kernel.dtype_)
+    elif isinstance(kernel, TokenDispatch):
+        c = TokenDispatch(kernel.M // n, kernel.D, kernel.N_experts,
+                          kernel.topk, kernel.a_dtype)
+    elif isinstance(kernel, TokenCombine):
+        c = TokenCombine(kernel.M // n, kernel.D, kernel.N_experts,
+                         kernel.topk, kernel.a_dtype)
+    elif isinstance(kernel, Spawn):
+        c = Spawn(world=kernel.world)
+    elif isinstance(kernel, Concat):
+        c = Concat()
+    else:
+        raise TypeError(
+            f"batch_split: unsupported kernel type {type(kernel).__name__}")
+
+    c.inputs = {k: Tensor(t.dtype, _shard_shape(t.shape, n))
+                for k, t in kernel.inputs.items()}
+    c.outputs = {k: Tensor(t.dtype, _shard_shape(t.shape, n))
+                 for k, t in kernel.outputs.items()}
+    if kernel.weights:
+        if isinstance(kernel, Embedding):
+            c.weights = {"emb": Tensor(kernel.w_dtype,
+                                       (kernel.M // n, kernel.D))}
+        else:
+            c.weights = dict(kernel.weights)
+    return c

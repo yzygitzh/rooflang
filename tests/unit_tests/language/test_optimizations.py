@@ -1,4 +1,4 @@
-"""Unit tests for rooflang.language.optimization (optimize_comms)."""
+"""Unit tests for rooflang.language.optimization (split + optimize_comms)."""
 
 import pytest
 
@@ -8,10 +8,19 @@ from rooflang.language.kernels.comm import (
     AllGather, AllReduce, AllToAll, Broadcast, CommKernel, Gather, Reduce,
     ReduceScatter, Scatter, Send, Recv,
 )
+from rooflang.language.kernels.forward import (
+    Embedding, Gemm, ReadInput, RMSNorm, SparseAttn, StridedGemm,
+    TokenCombine, TokenDispatch,
+)
+from rooflang.language.kernels.identity import Concat, Spawn
 from rooflang.language.tensor import Tensor
 from rooflang.language.placement import Placement
 from rooflang.language.hardware.component import Compute
 from rooflang.language.optimization.comm import optimize_comms
+from rooflang.language.optimization.split import (
+    batch_split, column_split, head_split, row_split,
+)
+from rooflang.language.utils import gemm_scale_bytes
 
 
 SHARD = Tensor("bf16", (4, 4))
@@ -309,3 +318,566 @@ class TestFusePairsGuards:
         optimize_comms(g, p)
         assert r in g.kernels
         assert b in g.kernels
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Split function tests
+# ═══════════════════════════════════════════════════════════════════════
+
+N = 4  # split world size for tests
+
+
+def _make_test_gemm(M=32, N_dim=128, K=64, w_dtype="bf16"):
+    k = Gemm(M, N_dim, K, w_dtype, "bf16")
+    k.inputs = {"x": Tensor("bf16", (M, K))}
+    k.weights = {"w": Tensor(w_dtype, (K, N_dim))}
+    sb = gemm_scale_bytes(N_dim, K, w_dtype)
+    if sb > 0:
+        k.weights["s"] = Tensor("ue8m0", (int(sb),))
+    k.outputs = {"y": Tensor("bf16", (M, N_dim))}
+    return k
+
+
+def _make_test_strided_gemm(M=32, N_dim=256, K=64, w_dtype="fp8",
+                             out_elems=None):
+    out_elems = out_elems or M * 128
+    k = StridedGemm(M, N_dim, K, w_dtype, "bf16", out_elems=out_elems)
+    k.inputs = {"x": Tensor("bf16", (M, K))}
+    k.weights = {"w": Tensor(w_dtype, (K, N_dim))}
+    sb = gemm_scale_bytes(N_dim, K, w_dtype)
+    if sb > 0:
+        k.weights["s"] = Tensor("ue8m0", (int(sb),))
+    k.outputs = {"y": Tensor("bf16", (M, 128))}
+    return k
+
+
+# ── column_split ───────────────────────────────────────────────────────
+
+
+class TestColumnSplitGemm:
+    def setup_method(self):
+        self.kernel = _make_test_gemm()
+        self.prev, self.copies, self.nxt = column_split(self.kernel, N)
+
+    def test_prev_broadcast(self):
+        assert "x" in self.prev
+        assert isinstance(self.prev["x"], Broadcast)
+        assert self.prev["x"].world == N
+        assert self.prev["x"].inputs["x"].shape == (32, 64)
+        assert self.prev["x"].outputs["o0"].shape == (32, 64)
+
+    def test_copies_count_and_dims(self):
+        assert len(self.copies) == N
+        for c in self.copies:
+            assert isinstance(c, Gemm)
+            assert c.M == 32
+            assert c.N == 32  # 128/4
+            assert c.K == 64
+
+    def test_copies_shapes(self):
+        for c in self.copies:
+            assert c.inputs["x"].shape == (32, 64)
+            assert c.outputs["y"].shape == (32, 32)
+            assert c.weights["w"].shape == (64, 32)
+
+    def test_next_gather(self):
+        assert "y" in self.nxt
+        assert isinstance(self.nxt["y"], Gather)
+        assert self.nxt["y"].world == N
+        assert self.nxt["y"].inputs["i0"].shape == (32, 32)
+        assert self.nxt["y"].outputs["y"].shape == (32, 128)
+
+    def test_graph_validates(self):
+        g = ComputeGraph()
+        pred = Kernel(outputs={"out": Tensor("bf16", (32, 64))})
+        succ = Kernel(inputs={"inp": Tensor("bf16", (32, 128))})
+        k = _make_test_gemm()
+        g.add_kernel(pred)
+        g.add_kernel(k)
+        g.add_kernel(succ)
+        g.add_data_edge(pred, k, {"out": "x"})
+        g.add_data_edge(k, succ, {"y": "inp"})
+        g.split_kernel(column_split, k, N)
+        g.validate()
+
+
+class TestColumnSplitStridedGemm:
+    def setup_method(self):
+        self.kernel = _make_test_strided_gemm()
+        self.prev, self.copies, self.nxt = column_split(self.kernel, N)
+
+    def test_copies_strided(self):
+        assert len(self.copies) == N
+        for c in self.copies:
+            assert isinstance(c, StridedGemm)
+            assert c.N == 64  # 256/4
+            assert c._out_elems == 32 * 128 // N
+
+    def test_shapes(self):
+        for c in self.copies:
+            assert c.inputs["x"].shape == (32, 64)
+            assert c.outputs["y"].shape == (32, 32)  # 128/4
+
+
+# ── row_split ──────────────────────────────────────────────────────────
+
+
+class TestRowSplitGemm:
+    def setup_method(self):
+        self.kernel = _make_test_gemm()
+        self.prev, self.copies, self.nxt = row_split(self.kernel, N)
+
+    def test_prev_scatter(self):
+        assert "x" in self.prev
+        assert isinstance(self.prev["x"], Scatter)
+        assert self.prev["x"].world == N
+        assert self.prev["x"].inputs["x"].shape == (32, 64)
+        assert self.prev["x"].outputs["o0"].shape == (32, 16)  # K/4
+
+    def test_copies_count_and_dims(self):
+        assert len(self.copies) == N
+        for c in self.copies:
+            assert isinstance(c, Gemm)
+            assert c.M == 32
+            assert c.N == 128
+            assert c.K == 16  # 64/4
+
+    def test_copies_shapes(self):
+        for c in self.copies:
+            assert c.inputs["x"].shape == (32, 16)
+            assert c.outputs["y"].shape == (32, 128)
+            assert c.weights["w"].shape == (16, 128)
+
+    def test_next_reduce(self):
+        assert "y" in self.nxt
+        assert isinstance(self.nxt["y"], Reduce)
+        assert self.nxt["y"].world == N
+        assert self.nxt["y"].inputs["i0"].shape == (32, 128)
+        assert self.nxt["y"].outputs["y"].shape == (32, 128)
+
+    def test_graph_validates(self):
+        g = ComputeGraph()
+        k = _make_test_gemm()
+        pred = Kernel(outputs={"out": Tensor("bf16", (32, 64))})
+        succ = Kernel(inputs={"inp": Tensor("bf16", (32, 128))})
+        g.add_kernel(pred)
+        g.add_kernel(k)
+        g.add_kernel(succ)
+        g.add_data_edge(pred, k, {"out": "x"})
+        g.add_data_edge(k, succ, {"y": "inp"})
+        g.split_kernel(row_split, k, N)
+        g.validate()
+
+
+class TestRowSplitStridedGemm:
+    def setup_method(self):
+        self.kernel = _make_test_strided_gemm()
+        self.prev, self.copies, self.nxt = row_split(self.kernel, N)
+
+    def test_copies_strided(self):
+        assert len(self.copies) == N
+        for c in self.copies:
+            assert isinstance(c, StridedGemm)
+            assert c.K == 16  # 64/4
+            assert c._in_elems == 32 * 64 // N
+
+    def test_shapes(self):
+        for c in self.copies:
+            assert c.inputs["x"].shape == (32, 16)
+            assert c.outputs["y"].shape == (32, 128)
+
+
+# ── head_split ─────────────────────────────────────────────────────────
+
+
+class TestHeadSplit:
+    def setup_method(self):
+        B, H, H_kv, S_q, k_sel, S_kv, Hd = 1, 8, 1, 64, 16, 80, 64
+        self.kernel = SparseAttn(B, H, H_kv, S_q, k_sel, S_kv, Hd, "bf16",
+                                 kv_factor=1)
+        self.kernel.inputs = {
+            "q": Tensor("bf16", (64, H * Hd)),
+            "kv": Tensor("bf16", (80, Hd)),
+        }
+        self.kernel.outputs = {"y": Tensor("bf16", (64, H * Hd))}
+        self.prev, self.copies, self.nxt = head_split(self.kernel, N)
+
+    def test_prev_scatter_q(self):
+        assert "q" in self.prev
+        assert isinstance(self.prev["q"], Scatter)
+        assert self.prev["q"].inputs["x"].shape == (64, 512)
+        assert self.prev["q"].outputs["o0"].shape == (64, 128)  # H*Hd/4
+
+    def test_prev_broadcast_kv(self):
+        assert "kv" in self.prev
+        assert isinstance(self.prev["kv"], Broadcast)
+        assert self.prev["kv"].inputs["x"].shape == (80, 64)
+        assert self.prev["kv"].outputs["o0"].shape == (80, 64)
+
+    def test_copies(self):
+        assert len(self.copies) == N
+        for c in self.copies:
+            assert isinstance(c, SparseAttn)
+            assert c.H == 2  # 8/4
+            assert c.inputs["q"].shape == (64, 128)
+            assert c.inputs["kv"].shape == (80, 64)
+            assert c.outputs["y"].shape == (64, 128)
+
+    def test_next_gather(self):
+        assert "y" in self.nxt
+        assert isinstance(self.nxt["y"], Gather)
+        assert self.nxt["y"].inputs["i0"].shape == (64, 128)
+        assert self.nxt["y"].outputs["y"].shape == (64, 512)
+
+    def test_graph_validates(self):
+        B, H, H_kv, S_q, k_sel, S_kv, Hd = 1, 8, 1, 64, 16, 80, 64
+        g = ComputeGraph()
+        k = SparseAttn(B, H, H_kv, S_q, k_sel, S_kv, Hd, "bf16", kv_factor=1)
+        k.inputs = {"q": Tensor("bf16", (64, H * Hd)),
+                    "kv": Tensor("bf16", (80, Hd))}
+        k.outputs = {"y": Tensor("bf16", (64, H * Hd))}
+        pred_q = Kernel(outputs={"out": Tensor("bf16", (64, 512))})
+        pred_kv = Kernel(outputs={"out": Tensor("bf16", (80, 64))})
+        succ = Kernel(inputs={"inp": Tensor("bf16", (64, 512))})
+        g.add_kernel(pred_q)
+        g.add_kernel(pred_kv)
+        g.add_kernel(k)
+        g.add_kernel(succ)
+        g.add_data_edge(pred_q, k, {"out": "q"})
+        g.add_data_edge(pred_kv, k, {"out": "kv"})
+        g.add_data_edge(k, succ, {"y": "inp"})
+        g.split_kernel(head_split, k, N)
+        g.validate()
+
+
+# ── batch_split ────────────────────────────────────────────────────────
+
+
+class TestBatchSplitGemm:
+    def setup_method(self):
+        M, K_dim, N_dim = 32, 64, 128
+        self.kernel = Gemm(M, N_dim, K_dim, "bf16", "bf16")
+        self.kernel.inputs = {"x": Tensor("bf16", (M, K_dim))}
+        self.kernel.weights = {"w": Tensor("bf16", (K_dim, N_dim))}
+        self.kernel.outputs = {"y": Tensor("bf16", (M, N_dim))}
+        self.prev, self.copies, self.nxt = batch_split(self.kernel, N)
+
+    def test_prev_comms_scatter(self):
+        assert "x" in self.prev
+        assert isinstance(self.prev["x"], Scatter)
+        assert self.prev["x"].world == N
+        assert self.prev["x"].inputs["x"].shape == (32, 64)
+        assert self.prev["x"].outputs["o0"].shape == (8, 64)
+
+    def test_copies_count_and_M(self):
+        assert len(self.copies) == N
+        for c in self.copies:
+            assert isinstance(c, Gemm)
+            assert c.M == 8
+            assert c.N == 128
+            assert c.K == 64
+
+    def test_copies_shapes(self):
+        for c in self.copies:
+            assert c.inputs["x"].shape == (8, 64)
+            assert c.outputs["y"].shape == (8, 128)
+            assert c.weights["w"].shape == (64, 128)
+
+    def test_next_comms_gather(self):
+        assert "y" in self.nxt
+        assert isinstance(self.nxt["y"], Gather)
+        assert self.nxt["y"].world == N
+        assert self.nxt["y"].inputs["i0"].shape == (8, 128)
+        assert self.nxt["y"].outputs["y"].shape == (32, 128)
+
+
+class TestBatchSplitStridedGemm:
+    def setup_method(self):
+        M = 32
+        self.kernel = StridedGemm(M, 256, 64, "fp8", "bf16",
+                                  in_elems=M * 64, out_elems=M * 128)
+        self.kernel.inputs = {"x": Tensor("bf16", (M, 64))}
+        self.kernel.weights = {"w": Tensor("fp8", (64, 256))}
+        scale_bytes = gemm_scale_bytes(256, 64, "fp8")
+        if scale_bytes > 0:
+            self.kernel.weights["s"] = Tensor("ue8m0", (int(scale_bytes),))
+        self.kernel.outputs = {"y": Tensor("bf16", (M, 128))}
+        self.prev, self.copies, self.nxt = batch_split(self.kernel, N)
+
+    def test_copies_strided(self):
+        assert len(self.copies) == N
+        for c in self.copies:
+            assert isinstance(c, StridedGemm)
+            assert c.M == 8
+            assert c._in_elems == 32 * 64 // N
+            assert c._out_elems == 32 * 128 // N
+
+    def test_copies_shapes(self):
+        for c in self.copies:
+            assert c.inputs["x"].shape == (8, 64)
+            assert c.outputs["y"].shape == (8, 128)
+
+
+class TestBatchSplitRMSNorm:
+    def setup_method(self):
+        M, D = 32, 64
+        self.kernel = RMSNorm(M, D, "bf16")
+        self.kernel.inputs = {"x": Tensor("bf16", (M, D))}
+        self.kernel.weights = {"g": Tensor("bf16", (D,))}
+        self.kernel.outputs = {"y": Tensor("bf16", (M, D))}
+        self.prev, self.copies, self.nxt = batch_split(self.kernel, N)
+
+    def test_copies(self):
+        assert len(self.copies) == N
+        for c in self.copies:
+            assert isinstance(c, RMSNorm)
+            assert c.M == 8
+            assert c.D == 64
+
+    def test_weights_replicated(self):
+        for c in self.copies:
+            assert c.weights["g"].shape == (64,)
+
+    def test_shapes(self):
+        assert self.prev["x"].outputs["o0"].shape == (8, 64)
+        assert self.nxt["y"].inputs["i0"].shape == (8, 64)
+
+
+class TestBatchSplitEmbedding:
+    def setup_method(self):
+        M, V, D = 32, 1000, 64
+        self.kernel = Embedding(M, V, D)
+        self.kernel.inputs = {"idx": Tensor("int32", (M,))}
+        self.kernel.weights = {"emb": Tensor("bf16", (M, D))}
+        self.kernel.outputs = {"y": Tensor("bf16", (M, D))}
+        self.prev, self.copies, self.nxt = batch_split(self.kernel, N)
+
+    def test_prev_scatter_idx(self):
+        assert "idx" in self.prev
+        assert isinstance(self.prev["idx"], Scatter)
+        assert self.prev["idx"].inputs["x"].shape == (32,)
+        assert self.prev["idx"].outputs["o0"].shape == (8,)
+
+    def test_copies(self):
+        assert len(self.copies) == N
+        for c in self.copies:
+            assert isinstance(c, Embedding)
+            assert c.M == 8
+            assert c.V == 1000
+            assert c.D == 64
+
+    def test_copies_weight_shape(self):
+        for c in self.copies:
+            assert c.weights["emb"].shape == (8, 64)
+
+
+class TestBatchSplitReadInput:
+    def setup_method(self):
+        self.kernel = ReadInput(32, "int32")
+        self.kernel.inputs = {"tokens": Tensor("int32", (4, 8))}
+        self.kernel.outputs = {"tokens": Tensor("int32", (4, 8))}
+        self.prev, self.copies, self.nxt = batch_split(self.kernel, N)
+
+    def test_copies(self):
+        assert len(self.copies) == N
+        for c in self.copies:
+            assert isinstance(c, ReadInput)
+            assert c.n_elements == 8
+
+    def test_shapes(self):
+        assert self.prev["tokens"].outputs["o0"].shape == (1, 8)
+        assert self.nxt["tokens"].inputs["i0"].shape == (1, 8)
+
+
+class TestBatchSplitSpawn:
+    def setup_method(self):
+        self.kernel = Spawn(world=2)
+        self.kernel.inputs = {"x": Tensor("bf16", (32, 64))}
+        self.kernel.outputs = {"y": Tensor("bf16", (32, 64)),
+                               "y2": Tensor("bf16", (32, 64))}
+        self.prev, self.copies, self.nxt = batch_split(self.kernel, N)
+
+    def test_prev_comms_single_input(self):
+        assert len(self.prev) == 1
+        assert "x" in self.prev
+        assert isinstance(self.prev["x"], Scatter)
+
+    def test_copies(self):
+        assert len(self.copies) == N
+        for c in self.copies:
+            assert isinstance(c, Spawn)
+            assert c.world == 2
+            assert c.inputs["x"].shape == (8, 64)
+            assert c.outputs["y"].shape == (8, 64)
+            assert c.outputs["y2"].shape == (8, 64)
+
+    def test_next_comms_per_output(self):
+        assert len(self.nxt) == 2
+        assert "y" in self.nxt and "y2" in self.nxt
+        for port in ("y", "y2"):
+            assert isinstance(self.nxt[port], Gather)
+            assert self.nxt[port].inputs["i0"].shape == (8, 64)
+            assert self.nxt[port].outputs["y"].shape == (32, 64)
+
+
+class TestBatchSplitConcat:
+    def setup_method(self):
+        self.kernel = Concat()
+        self.kernel.inputs = {"a": Tensor("bf16", (32, 64)),
+                              "b": Tensor("bf16", (16, 64))}
+        self.kernel.outputs = {"y": Tensor("bf16", (48, 64))}
+        self.prev, self.copies, self.nxt = batch_split(self.kernel, N)
+
+    def test_prev_comms_per_input(self):
+        assert len(self.prev) == 2
+        assert "a" in self.prev and "b" in self.prev
+        assert isinstance(self.prev["a"], Scatter)
+        assert isinstance(self.prev["b"], Scatter)
+        assert self.prev["a"].outputs["o0"].shape == (8, 64)
+        assert self.prev["b"].outputs["o0"].shape == (4, 64)
+
+    def test_copies(self):
+        assert len(self.copies) == N
+        for c in self.copies:
+            assert isinstance(c, Concat)
+            assert c.inputs["a"].shape == (8, 64)
+            assert c.inputs["b"].shape == (4, 64)
+            assert c.outputs["y"].shape == (12, 64)
+
+    def test_next_comms(self):
+        assert "y" in self.nxt
+        assert self.nxt["y"].inputs["i0"].shape == (12, 64)
+        assert self.nxt["y"].outputs["y"].shape == (48, 64)
+
+
+class TestBatchSplitTokenDispatch:
+    def setup_method(self):
+        M, D, N_experts, topk = 32, 64, 8, 2
+        self.kernel = TokenDispatch(M, D, N_experts, topk)
+        self.kernel.inputs = {"x": Tensor("bf16", (M, D)),
+                              "routing": Tensor("fp32", (M, N_experts))}
+        M_e = M * topk // N_experts  # 8
+        self.kernel.outputs = {f"o{i}": Tensor("bf16", (M_e, D))
+                               for i in range(N_experts)}
+        self.prev, self.copies, self.nxt = batch_split(self.kernel, N)
+
+    def test_prev_comms(self):
+        assert len(self.prev) == 2
+        assert "x" in self.prev and "routing" in self.prev
+        assert self.prev["x"].outputs["o0"].shape == (8, 64)
+        assert self.prev["routing"].outputs["o0"].shape == (8, 8)
+
+    def test_copies(self):
+        assert len(self.copies) == N
+        for c in self.copies:
+            assert isinstance(c, TokenDispatch)
+            assert c.M == 8
+            assert c.M_e == 2  # 8*2/8
+
+    def test_next_comms_per_expert(self):
+        assert len(self.nxt) == 8
+        for i in range(8):
+            g = self.nxt[f"o{i}"]
+            assert isinstance(g, Gather)
+            assert g.inputs["i0"].shape == (2, 64)
+            assert g.outputs["y"].shape == (8, 64)
+
+
+class TestBatchSplitTokenCombine:
+    def setup_method(self):
+        M, D, N_experts, topk = 32, 64, 8, 2
+        M_e = M * topk // N_experts  # 8
+        self.kernel = TokenCombine(M, D, N_experts, topk)
+        self.kernel.inputs = {f"i{i}": Tensor("bf16", (M_e, D))
+                              for i in range(N_experts)}
+        self.kernel.outputs = {"y": Tensor("bf16", (M, D))}
+        self.prev, self.copies, self.nxt = batch_split(self.kernel, N)
+
+    def test_prev_comms_per_expert(self):
+        assert len(self.prev) == 8
+        for i in range(8):
+            s = self.prev[f"i{i}"]
+            assert isinstance(s, Scatter)
+            assert s.inputs["x"].shape == (8, 64)
+            assert s.outputs["o0"].shape == (2, 64)
+
+    def test_copies(self):
+        assert len(self.copies) == N
+        for c in self.copies:
+            assert isinstance(c, TokenCombine)
+            assert c.M == 8
+            assert c.M_e == 2
+
+    def test_next_comms(self):
+        assert len(self.nxt) == 1
+        g = self.nxt["y"]
+        assert isinstance(g, Gather)
+        assert g.inputs["i0"].shape == (8, 64)
+        assert g.outputs["y"].shape == (32, 64)
+
+
+class TestBatchSplitGraphIntegration:
+    def test_gemm_split_validates(self):
+        g = ComputeGraph()
+        M, K_dim, N_dim = 32, 64, 128
+        pred = Kernel(outputs={"out": Tensor("bf16", (M, K_dim))})
+        succ = Kernel(inputs={"inp": Tensor("bf16", (M, N_dim))})
+        k = Gemm(M, N_dim, K_dim, "bf16", "bf16")
+        k.inputs = {"x": Tensor("bf16", (M, K_dim))}
+        k.weights = {"w": Tensor("bf16", (K_dim, N_dim))}
+        k.outputs = {"y": Tensor("bf16", (M, N_dim))}
+        g.add_kernel(pred)
+        g.add_kernel(k)
+        g.add_kernel(succ)
+        g.add_data_edge(pred, k, {"out": "x"})
+        g.add_data_edge(k, succ, {"y": "inp"})
+        prev, copies, nxt = g.split_kernel(batch_split, k, N)
+        g.validate()
+        assert k not in g.kernels
+        assert len(copies) == N
+        assert all(c in g.kernels for c in copies)
+
+    def test_spawn_split_validates(self):
+        g = ComputeGraph()
+        pred = Kernel(outputs={"out": Tensor("bf16", (32, 64))})
+        succ1 = Kernel(inputs={"a": Tensor("bf16", (32, 64))})
+        succ2 = Kernel(inputs={"b": Tensor("bf16", (32, 64))})
+        k = Spawn(world=2)
+        k.inputs = {"x": Tensor("bf16", (32, 64))}
+        k.outputs = {"y": Tensor("bf16", (32, 64)),
+                     "y2": Tensor("bf16", (32, 64))}
+        g.add_kernel(pred)
+        g.add_kernel(k)
+        g.add_kernel(succ1)
+        g.add_kernel(succ2)
+        g.add_data_edge(pred, k, {"out": "x"})
+        g.add_data_edge(k, succ1, {"y": "a"})
+        g.add_data_edge(k, succ2, {"y2": "b"})
+        g.split_kernel(batch_split, k, N)
+        g.validate()
+
+    def test_concat_split_validates(self):
+        g = ComputeGraph()
+        pred_a = Kernel(outputs={"out": Tensor("bf16", (32, 64))})
+        pred_b = Kernel(outputs={"out": Tensor("bf16", (16, 64))})
+        succ = Kernel(inputs={"inp": Tensor("bf16", (48, 64))})
+        k = Concat()
+        k.inputs = {"a": Tensor("bf16", (32, 64)),
+                    "b": Tensor("bf16", (16, 64))}
+        k.outputs = {"y": Tensor("bf16", (48, 64))}
+        g.add_kernel(pred_a)
+        g.add_kernel(pred_b)
+        g.add_kernel(k)
+        g.add_kernel(succ)
+        g.add_data_edge(pred_a, k, {"out": "a"})
+        g.add_data_edge(pred_b, k, {"out": "b"})
+        g.add_data_edge(k, succ, {"y": "inp"})
+        g.split_kernel(batch_split, k, N)
+        g.validate()
+
+    def test_unsupported_kernel_raises(self):
+        k = Kernel()
+        k.inputs = {"x": Tensor("bf16", (32, 64))}
+        k.outputs = {"y": Tensor("bf16", (32, 64))}
+        with pytest.raises(TypeError, match="unsupported kernel type"):
+            batch_split(k, N)

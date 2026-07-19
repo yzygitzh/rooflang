@@ -5,7 +5,7 @@ import pytest
 from rooflang.language.graph import ComputeGraph, FabricEdge, HardwareGraph
 from rooflang.language.hardware.component import Compute, Memory
 from rooflang.language.kernels.kernel import Kernel
-from rooflang.language.kernels.comm import AllReduce
+from rooflang.language.kernels.comm import AllReduce, Gather
 from rooflang.language.kernels.identity import Move
 from rooflang.language.placement import Placement
 from rooflang.language.tensor import Tensor
@@ -629,3 +629,490 @@ class TestCrossDeviceFabric:
         #   worst_time = 2.0 us → net_share = 0.5 → effective = 2.0 us
         # Total = k1(0.2) + max(move1, move2)(2.0) = 2.2 us
         assert result.total_time_us == pytest.approx(2.2, rel=1e-2)
+
+
+class TestMultiStreamComm:
+    """Tests for multi-stream collective comm blocking and retry."""
+
+    def test_allreduce_blocks_all_participant_streams(self):
+        """AllReduce waits when a participant stream is already active."""
+        gpu0 = Compute(name="gpu0", tflops={"bf16": 1000.0})
+        gpu1 = Compute(name="gpu1", tflops={"bf16": 1000.0})
+        hbm0 = Memory(name="hbm0", capacity_gb=80.0)
+        hbm1 = Memory(name="hbm1", capacity_gb=80.0)
+        hw = HardwareGraph()
+        hw.add_node(gpu0)
+        hw.add_node(gpu1)
+        hw.add_node(hbm0)
+        hw.add_node(hbm1)
+        hw.add_edge(FabricEdge(name="hbm0", src=gpu0, dst=hbm0,
+                               src_to_dst_bandwidth_gbs=1000.0,
+                               dst_to_src_bandwidth_gbs=1000.0,
+                               is_full_duplex=False))
+        hw.add_edge(FabricEdge(name="hbm1", src=gpu1, dst=hbm1,
+                               src_to_dst_bandwidth_gbs=1000.0,
+                               dst_to_src_bandwidth_gbs=1000.0,
+                               is_full_duplex=False))
+        hw.add_edge(FabricEdge(name="nvlink", src=gpu0, dst=gpu1,
+                               src_to_dst_bandwidth_gbs=100.0,
+                               dst_to_src_bandwidth_gbs=100.0,
+                               is_full_duplex=True))
+
+        # k_long on GPU1 (root, no connection to AR): 10 us compute
+        # k_pred on GPU0 → AR → k_succ on GPU1
+        # AR participants = [GPU0, GPU1]. k_pred finishes instantly.
+        # AR tries to start at t≈0 but GPU1/stream0 is occupied → waits.
+        # At t=10, k_long finishes → AR retries and starts.
+        t_long_out = Tensor("bf16", (1,))
+        k_long = SyntheticKernel(flops_val=10e9, outputs={"y": t_long_out})
+
+        t0_out = Tensor("bf16", (1,))
+        k_pred = SyntheticKernel(flops_val=0.0, outputs={"y": t0_out})
+
+        ar = AllReduce(total_bytes=100000.0, world=2, dtype="bf16")
+        ar.inputs = {"i0": Tensor("bf16", (1,)), "i1": Tensor("bf16", (1,))}
+        ar.outputs = {"o0": Tensor("bf16", (1,)), "o1": Tensor("bf16", (1,))}
+
+        t_succ_in = Tensor("bf16", (1,))
+        k_succ = SyntheticKernel(flops_val=0.0, inputs={"x": t_succ_in})
+
+        g = ComputeGraph()
+        g.add_kernel(k_long)
+        g.add_kernel(k_pred)
+        g.add_kernel(ar)
+        g.add_kernel(k_succ)
+        g.add_data_edge(k_pred, ar, {"y": "i0"})
+        g.add_data_edge(ar, k_succ, {"o1": "x"})
+
+        p = Placement(hardware=hw, graph=g)
+        p.set_kernel_device(k_long, gpu1)
+        p.set_kernel_device(k_pred, gpu0)
+        p.set_kernel_device(k_succ, gpu1)
+
+        result = _sim(g, p, hw)
+        # AR starts at t≈10 (after k_long frees GPU1/stream0)
+        # AR xfer = 100000/(100*1e3) = 1.0 us
+        # Total ≈ 10 + 1 = 11 us
+        assert result.total_time_us == pytest.approx(11.0, rel=0.1)
+        ar_entries = [e for e in result.trace if e.kernel is ar]
+        assert len(ar_entries) == 2
+        assert ar_entries[0].start_us >= 9.9
+
+    def test_pending_on_extra_participant_stream(self):
+        """After multi-stream comm, pending kernels on participant streams resume."""
+        gpu0 = Compute(name="gpu0", tflops={"bf16": 1000.0})
+        gpu1 = Compute(name="gpu1", tflops={"bf16": 1000.0})
+        hbm0 = Memory(name="hbm0", capacity_gb=80.0)
+        hbm1 = Memory(name="hbm1", capacity_gb=80.0)
+        hw = HardwareGraph()
+        hw.add_node(gpu0)
+        hw.add_node(gpu1)
+        hw.add_node(hbm0)
+        hw.add_node(hbm1)
+        hw.add_edge(FabricEdge(name="hbm0", src=gpu0, dst=hbm0,
+                               src_to_dst_bandwidth_gbs=1000.0,
+                               dst_to_src_bandwidth_gbs=1000.0,
+                               is_full_duplex=False))
+        hw.add_edge(FabricEdge(name="hbm1", src=gpu1, dst=hbm1,
+                               src_to_dst_bandwidth_gbs=1000.0,
+                               dst_to_src_bandwidth_gbs=1000.0,
+                               is_full_duplex=False))
+        hw.add_edge(FabricEdge(name="nvlink", src=gpu0, dst=gpu1,
+                               src_to_dst_bandwidth_gbs=100.0,
+                               dst_to_src_bandwidth_gbs=100.0,
+                               is_full_duplex=True))
+
+        # k0(GPU0) → AR(GPU0,GPU1) → k_after(GPU1)
+        # k_after should run on GPU1 after AR finishes (pending on stream)
+        t0_out = Tensor("bf16", (1,))
+        k0 = SyntheticKernel(flops_val=0.0, outputs={"y": t0_out})
+
+        ar = AllReduce(total_bytes=100000.0, world=2, dtype="bf16")
+        ar.inputs = {"i0": Tensor("bf16", (1,)), "i1": Tensor("bf16", (1,))}
+        ar.outputs = {"o0": Tensor("bf16", (1,)), "o1": Tensor("bf16", (1,))}
+
+        t_after = Tensor("bf16", (1,))
+        k_after = SyntheticKernel(flops_val=1e9,
+                                  inputs={"x": t_after})
+
+        g = ComputeGraph()
+        g.add_kernel(k0)
+        g.add_kernel(ar)
+        g.add_kernel(k_after)
+        g.add_data_edge(k0, ar, {"y": "i0"})
+        g.add_data_edge(ar, k_after, {"o1": "x"})
+
+        p = Placement(hardware=hw, graph=g)
+        p.set_kernel_device(k0, gpu0)
+        p.set_kernel_device(k_after, gpu1)
+
+        result = _sim(g, p, hw)
+        # AR: xfer = 100000/(100*1e3) = 1.0 us
+        # k_after: 1e6 / (1000*1e6) = 1.0 us
+        # Total ≈ 1.0 (AR) + 1.0 (k_after) = 2.0 us
+        assert result.total_time_us == pytest.approx(2.0, rel=0.1)
+        k_after_entry = [e for e in result.trace if e.kernel is k_after]
+        assert len(k_after_entry) == 1
+        assert k_after_entry[0].start_us >= 1.0 - 0.01
+
+
+class TestLocalComm:
+    """Tests for local single-participant communication kernels."""
+
+    def test_local_comm_uses_memory_bandwidth(self):
+        """CommKernel with all data in same memory uses local BW."""
+        hw, gpu, hbm = _hw(read_bw=500.0, write_bw=500.0, tflops=1000.0)
+        from rooflang.language.kernels.comm import Gather
+
+        # k_pred produces 50KB output, gather collects it
+        t_pred_out = Tensor("bf16", (25000,))  # 50KB
+        k_pred = SyntheticKernel(flops_val=0.0, outputs={"y": t_pred_out})
+
+        gather = Gather(total_bytes=100000.0, world=2)
+        gather.inputs = {"i0": Tensor("bf16", (25000,)),
+                         "i1": Tensor("bf16", (25000,))}
+        gather.outputs = {"y": Tensor("bf16", (50000,))}
+
+        t_succ_in = Tensor("bf16", (50000,))
+        k_succ = SyntheticKernel(flops_val=0.0, inputs={"x": t_succ_in})
+
+        g = ComputeGraph()
+        g.add_kernel(k_pred)
+        g.add_kernel(gather)
+        g.add_kernel(k_succ)
+        g.add_data_edge(k_pred, gather, {"y": "i0"})
+        g.add_data_edge(gather, k_succ, {"y": "x"})
+
+        p = Placement(hardware=hw, graph=g)
+        p.set_kernel_device(k_pred, gpu)
+        p.set_kernel_device(k_succ, gpu)
+        p.set_tensor_memory(k_pred.outputs["y"], hbm)
+        p.set_tensor_memory(gather.outputs["y"], hbm)
+        p.set_tensor_memory(k_succ.inputs["x"], hbm)
+
+        result = _sim(g, p, hw)
+        # Gather resolved to local: mt = max(total_bytes/read_bw, total_bytes/write_bw)
+        # = max(100000/(500*1e3), 100000/(500*1e3)) = 0.2 us
+        gather_entry = [e for e in result.trace if e.kernel is gather]
+        assert len(gather_entry) == 1
+        gather_time = gather_entry[0].end_us - gather_entry[0].start_us
+        assert gather_time == pytest.approx(0.2, rel=0.1)
+
+
+class TestNetSharePureCompute:
+    """Tests for net_share behavior with compute-only kernels."""
+
+    def test_compute_kernel_net_share_unaffected(self):
+        """A pure-compute kernel gets net_share=1.0 even when fabric is busy."""
+        hw, gpus, hbms = _hw_multi_gpu(n_gpus=2, hbm_bw=1000.0,
+                                       link_bw=100.0, tflops=1000.0)
+
+        # k_net on GPU0 stream 0: reads 1MB from HBM1 (remote) → 10 us xfer
+        # k_comp on GPU0 stream 1: 10 us pure compute, local-only data
+        # They overlap and share dev_share=0.5, but k_comp's net_share stays 1.0
+        t_remote = Tensor("bf16", (500000,))  # 1MB
+        k_src = SyntheticKernel(flops_val=0.0, outputs={"y": t_remote})
+        t_in = Tensor("bf16", (500000,))
+        k_net = SyntheticKernel(flops_val=0.0, inputs={"x": t_in})
+
+        t_local_in = Tensor("bf16", (500,))
+        t_local_out = Tensor("bf16", (500,))
+        k_comp = SyntheticKernel(flops_val=10e9,
+                                 inputs={"x": t_local_in},
+                                 outputs={"y": t_local_out})
+
+        g = ComputeGraph()
+        g.add_kernel(k_src)
+        g.add_kernel(k_net)
+        g.add_kernel(k_comp)
+        g.add_data_edge(k_src, k_net, {"y": "x"})
+
+        p = Placement(hardware=hw, graph=g)
+        p.set_kernel_device(k_src, gpus[1])
+        p.set_kernel_device(k_net, gpus[0], stream=0)
+        p.set_kernel_device(k_comp, gpus[0], stream=1)
+        p.set_tensor_memory(t_remote, hbms[1])
+
+        result = _sim(g, p, hw)
+        # k_net: xfer=10 us (1MB at 100 GB/s). k_comp: ct=10 us.
+        # Phase 1 (0-10 us): both overlap, dev_share=0.5. k_comp does 5/10 progress.
+        # Phase 2 (10-15 us): k_net done, k_comp alone, dev_share=1.0 → 5 us remaining.
+        # k_comp total = 15 us. k_comp has net_share=1.0 throughout (no fabric_keys).
+        comp_entry = [e for e in result.trace if e.kernel is k_comp]
+        assert len(comp_entry) == 1
+        comp_time = comp_entry[0].end_us - comp_entry[0].start_us
+        assert comp_time == pytest.approx(15.0, rel=0.01)
+
+
+class TestMultipleRemoteReadsAccumulate:
+    """Tests that multiple remote reads through same link accumulate bytes."""
+
+    def test_two_inputs_from_same_remote_share_link(self):
+        """Reading two tensors from the same remote memory accumulates on one key."""
+        hw, gpus, hbms = _hw_multi_gpu(n_gpus=2, hbm_bw=1000.0,
+                                       link_bw=100.0, tflops=1000.0)
+
+        # k1 on GPU0 produces two outputs placed on HBM0
+        t1 = Tensor("bf16", (50000,))  # 100KB
+        t2 = Tensor("bf16", (50000,))  # 100KB
+        k1 = SyntheticKernel(flops_val=0.0, outputs={"a": t1, "b": t2})
+
+        # k2 on GPU1 reads both from HBM0
+        t2_a = Tensor("bf16", (50000,))
+        t2_b = Tensor("bf16", (50000,))
+        k2 = SyntheticKernel(flops_val=0.0,
+                             inputs={"x": t2_a, "y": t2_b})
+
+        g = ComputeGraph()
+        g.add_kernel(k1)
+        g.add_kernel(k2)
+        g.add_data_edge(k1, k2, {"a": "x", "b": "y"})
+
+        p = Placement(hardware=hw, graph=g)
+        p.set_kernel_device(k1, gpus[0])
+        p.set_kernel_device(k2, gpus[1])
+
+        result = _sim(g, p, hw)
+        # k2 reads 200KB total through link0 (both tensors accumulate on same key)
+        # xfer = max(per_link_time) = 200KB / (100*1e3) = 2.0 us
+        k2_entry = [e for e in result.trace if e.kernel is k2]
+        k2_time = k2_entry[0].end_us - k2_entry[0].start_us
+        assert k2_time == pytest.approx(2.0, rel=0.01)
+
+
+class TestInferDtype:
+    """Test _infer_dtype static method coverage."""
+
+    def test_infer_w_dtype(self):
+        """Kernel with w_dtype uses it."""
+        from rooflang.language.kernels.forward import Gemm
+        gpu = Compute(name="gpu0", tflops={"bf16": 1000.0, "fp8e4m3": 2000.0})
+        hbm = Memory(name="hbm", capacity_gb=80.0)
+        hw = HardwareGraph()
+        hw.add_node(gpu)
+        hw.add_node(hbm)
+        hw.add_edge(FabricEdge(name="hbm_link", src=gpu, dst=hbm,
+                               src_to_dst_bandwidth_gbs=1000.0,
+                               dst_to_src_bandwidth_gbs=1000.0,
+                               is_full_duplex=False))
+        k = Gemm(M=128, N=64, K=32, w_dtype="fp8e4m3",
+                 a_dtype="bf16", out_dtype="bf16")
+        g = ComputeGraph()
+        g.add_kernel(k)
+        p = Placement(hardware=hw, graph=g)
+        p.set_kernel_device(k, gpu)
+        result = _sim(g, p, hw)
+        assert len(result.trace) == 1
+
+
+class TestFindLocalCommDevice:
+    """Tests for _find_local_comm_device optimization."""
+
+    def test_comm_resolved_to_local_when_all_data_in_same_memory(self):
+        """CommKernel between 2 GPUs resolves to local when all tensors in one memory."""
+        gpu0 = Compute(name="gpu0", tflops={"bf16": 1000.0})
+        gpu1 = Compute(name="gpu1", tflops={"bf16": 1000.0})
+        hbm = Memory(name="hbm_shared", capacity_gb=80.0)
+        hw = HardwareGraph()
+        hw.add_node(gpu0)
+        hw.add_node(gpu1)
+        hw.add_node(hbm)
+        hw.add_edge(FabricEdge(name="link0", src=gpu0, dst=hbm,
+                               src_to_dst_bandwidth_gbs=500.0,
+                               dst_to_src_bandwidth_gbs=500.0,
+                               is_full_duplex=False))
+        hw.add_edge(FabricEdge(name="link1", src=gpu1, dst=hbm,
+                               src_to_dst_bandwidth_gbs=1000.0,
+                               dst_to_src_bandwidth_gbs=1000.0,
+                               is_full_duplex=False))
+
+        t_pred_out = Tensor("bf16", (50000,))  # 100KB
+        k_pred = SyntheticKernel(flops_val=0.0, outputs={"y": t_pred_out})
+
+        ar = AllReduce(total_bytes=200000.0, world=2, dtype="bf16")
+        ar.inputs = {"i0": Tensor("bf16", (50000,)), "i1": Tensor("bf16", (50000,))}
+        ar.outputs = {"o0": Tensor("bf16", (50000,)), "o1": Tensor("bf16", (50000,))}
+
+        t_succ_in = Tensor("bf16", (50000,))
+        k_succ = SyntheticKernel(flops_val=0.0, inputs={"x": t_succ_in})
+
+        g = ComputeGraph()
+        g.add_kernel(k_pred)
+        g.add_kernel(ar)
+        g.add_kernel(k_succ)
+        g.add_data_edge(k_pred, ar, {"y": "i0"})
+        g.add_data_edge(ar, k_succ, {"o0": "x"})
+
+        p = Placement(hardware=hw, graph=g)
+        p.set_kernel_device(k_pred, gpu0)
+        p.set_kernel_device(k_succ, gpu1)
+        p.set_tensor_memory(t_pred_out, hbm)
+        p.set_tensor_memory(k_succ.inputs["x"], hbm)
+
+        result = _sim(g, p, hw)
+        # AR resolved to local device (gpu1 has highest BW=1000 to hbm)
+        # Local comm: mt = max(200000/(1000*1e3), 200000/(1000*1e3)) = 0.2 us
+        ar_entry = [e for e in result.trace if e.kernel is ar]
+        assert len(ar_entry) == 1
+        ar_time = ar_entry[0].end_us - ar_entry[0].start_us
+        assert ar_time == pytest.approx(0.2, rel=0.1)
+
+    def test_comm_not_local_when_data_in_different_memories(self):
+        """CommKernel stays remote when tensors are in different memories."""
+        hw, gpus, hbms = _hw_multi_gpu(n_gpus=2, hbm_bw=1000.0,
+                                       link_bw=100.0, tflops=1000.0)
+
+        t_pred_out = Tensor("bf16", (50000,))
+        k_pred = SyntheticKernel(flops_val=0.0, outputs={"y": t_pred_out})
+
+        ar = AllReduce(total_bytes=200000.0, world=2, dtype="bf16")
+        ar.inputs = {"i0": Tensor("bf16", (50000,)), "i1": Tensor("bf16", (50000,))}
+        ar.outputs = {"o0": Tensor("bf16", (50000,)), "o1": Tensor("bf16", (50000,))}
+
+        t_succ_in = Tensor("bf16", (50000,))
+        k_succ = SyntheticKernel(flops_val=0.0, inputs={"x": t_succ_in})
+
+        g = ComputeGraph()
+        g.add_kernel(k_pred)
+        g.add_kernel(ar)
+        g.add_kernel(k_succ)
+        g.add_data_edge(k_pred, ar, {"y": "i0"})
+        g.add_data_edge(ar, k_succ, {"o0": "x"})
+
+        p = Placement(hardware=hw, graph=g)
+        p.set_kernel_device(k_pred, gpus[0])
+        p.set_kernel_device(k_succ, gpus[1])
+        p.set_tensor_memory(t_pred_out, hbms[0])
+        p.set_tensor_memory(k_succ.inputs["x"], hbms[1])
+
+        result = _sim(g, p, hw)
+        ar_entries = [e for e in result.trace if e.kernel is ar]
+        assert len(ar_entries) == 2
+
+
+class TestHalfDuplexCollective:
+    """Tests for collective comm over half-duplex links."""
+
+    def test_allreduce_over_half_duplex_link(self):
+        """AllReduce over a half-duplex link registers single direction key."""
+        gpu0 = Compute(name="gpu0", tflops={"bf16": 1000.0})
+        gpu1 = Compute(name="gpu1", tflops={"bf16": 1000.0})
+        hbm0 = Memory(name="hbm0", capacity_gb=80.0)
+        hbm1 = Memory(name="hbm1", capacity_gb=80.0)
+        hw = HardwareGraph()
+        hw.add_node(gpu0)
+        hw.add_node(gpu1)
+        hw.add_node(hbm0)
+        hw.add_node(hbm1)
+        hw.add_edge(FabricEdge(name="hbm0", src=gpu0, dst=hbm0,
+                               src_to_dst_bandwidth_gbs=1000.0,
+                               dst_to_src_bandwidth_gbs=1000.0,
+                               is_full_duplex=False))
+        hw.add_edge(FabricEdge(name="hbm1", src=gpu1, dst=hbm1,
+                               src_to_dst_bandwidth_gbs=1000.0,
+                               dst_to_src_bandwidth_gbs=1000.0,
+                               is_full_duplex=False))
+        hw.add_edge(FabricEdge(name="pcie", src=gpu0, dst=gpu1,
+                               src_to_dst_bandwidth_gbs=50.0,
+                               dst_to_src_bandwidth_gbs=50.0,
+                               is_full_duplex=False))
+
+        t0_out = Tensor("bf16", (1,))
+        k_pred = SyntheticKernel(flops_val=0.0, outputs={"y": t0_out})
+
+        ar = AllReduce(total_bytes=100000.0, world=2, dtype="bf16")
+        ar.inputs = {"i0": Tensor("bf16", (1,)), "i1": Tensor("bf16", (1,))}
+        ar.outputs = {"o0": Tensor("bf16", (1,)), "o1": Tensor("bf16", (1,))}
+
+        t_succ_in = Tensor("bf16", (1,))
+        k_succ = SyntheticKernel(flops_val=0.0, inputs={"x": t_succ_in})
+
+        g = ComputeGraph()
+        g.add_kernel(k_pred)
+        g.add_kernel(ar)
+        g.add_kernel(k_succ)
+        g.add_data_edge(k_pred, ar, {"y": "i0"})
+        g.add_data_edge(ar, k_succ, {"o0": "x"})
+
+        p = Placement(hardware=hw, graph=g)
+        p.set_kernel_device(k_pred, gpu0)
+        p.set_kernel_device(k_succ, gpu1)
+
+        result = _sim(g, p, hw)
+        # AR xfer = 100000 / (50*1e3) = 2.0 us
+        ar_entries = [e for e in result.trace if e.kernel is ar]
+        assert len(ar_entries) == 2
+        ar_time = ar_entries[0].end_us - ar_entries[0].start_us
+        assert ar_time == pytest.approx(2.0, rel=0.1)
+
+
+class TestExtraParticipantStreamPending:
+    """Tests for scheduling pending kernels on extra participant streams."""
+
+    def test_pending_kernel_on_extra_stream_starts_after_comm(self):
+        """A kernel pending on a non-primary participant stream resumes after comm."""
+        gpu0 = Compute(name="gpu0", tflops={"bf16": 1000.0})
+        gpu1 = Compute(name="gpu1", tflops={"bf16": 1000.0})
+        hbm0 = Memory(name="hbm0", capacity_gb=80.0)
+        hbm1 = Memory(name="hbm1", capacity_gb=80.0)
+        hw = HardwareGraph()
+        hw.add_node(gpu0)
+        hw.add_node(gpu1)
+        hw.add_node(hbm0)
+        hw.add_node(hbm1)
+        hw.add_edge(FabricEdge(name="hbm0", src=gpu0, dst=hbm0,
+                               src_to_dst_bandwidth_gbs=1000.0,
+                               dst_to_src_bandwidth_gbs=1000.0,
+                               is_full_duplex=False))
+        hw.add_edge(FabricEdge(name="hbm1", src=gpu1, dst=hbm1,
+                               src_to_dst_bandwidth_gbs=1000.0,
+                               dst_to_src_bandwidth_gbs=1000.0,
+                               is_full_duplex=False))
+        hw.add_edge(FabricEdge(name="nvlink", src=gpu0, dst=gpu1,
+                               src_to_dst_bandwidth_gbs=100.0,
+                               dst_to_src_bandwidth_gbs=100.0,
+                               is_full_duplex=True))
+
+        t_pred_out = Tensor("bf16", (1,))
+        k_pred = SyntheticKernel(flops_val=0.0, outputs={"y": t_pred_out})
+
+        ar = AllReduce(total_bytes=200000.0, world=2, dtype="bf16")
+        ar.inputs = {"i0": Tensor("bf16", (1,)), "i1": Tensor("bf16", (1,))}
+        ar.outputs = {"o0": Tensor("bf16", (1,)), "o1": Tensor("bf16", (1,))}
+
+        # AR successor on GPU1 so AR resolves with participants=[gpu0, gpu1]
+        t_ar_succ_in = Tensor("bf16", (1,))
+        k_ar_succ = SyntheticKernel(flops_val=0.0, inputs={"x": t_ar_succ_in})
+
+        t_indep_out = Tensor("bf16", (1,))
+        k_indep_pred = SyntheticKernel(flops_val=1e9,
+                                       outputs={"y": t_indep_out})
+
+        t_pending_in = Tensor("bf16", (1,))
+        k_pending = SyntheticKernel(flops_val=1e9,
+                                    inputs={"x": t_pending_in})
+
+        g = ComputeGraph()
+        g.add_kernel(k_pred)
+        g.add_kernel(ar)
+        g.add_kernel(k_ar_succ)
+        g.add_kernel(k_indep_pred)
+        g.add_kernel(k_pending)
+        g.add_data_edge(k_pred, ar, {"y": "i0"})
+        g.add_data_edge(ar, k_ar_succ, {"o1": "x"})
+        g.add_data_edge(k_indep_pred, k_pending, {"y": "x"})
+
+        p = Placement(hardware=hw, graph=g)
+        p.set_kernel_device(k_pred, gpu0)
+        p.set_kernel_device(k_ar_succ, gpu1)
+        p.set_kernel_device(k_indep_pred, gpu1, stream=1)
+        p.set_kernel_device(k_pending, gpu1, stream=0)
+
+        result = _sim(g, p, hw)
+        # AR xfer = 200000/(100*1e3) = 2 us. AR blocks GPU1/stream0.
+        # k_indep_pred finishes at t=1, k_pending tries GPU1/stream0 → pending.
+        # AR finishes at t=2 → extra_keys fires → k_pending starts at t=2.
+        pending_entry = [e for e in result.trace if e.kernel is k_pending]
+        assert len(pending_entry) == 1
+        assert pending_entry[0].start_us == pytest.approx(2.0, rel=0.1)
+        assert pending_entry[0].end_us == pytest.approx(3.0, rel=0.1)

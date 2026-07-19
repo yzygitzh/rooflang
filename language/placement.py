@@ -157,9 +157,12 @@ class Placement:
     ) -> Optional[Memory]:
         if self._graph is None:
             return None
-        for edge in self._graph._in_edges(kernel):
-            for out_name, in_name in edge.mapping.items():
+        for src, _, attr in self._graph._dag.in_edges(kernel, data=True):
+            mapping = attr["mapping"]
+            if not mapping:
+                continue
+            for out_name, in_name in mapping.items():
                 if in_name == input_name:
-                    src_tensor = edge.src.outputs[out_name]
+                    src_tensor = src.outputs[out_name]
                     return self._memory.get(src_tensor)
         return None

@@ -81,11 +81,10 @@ def _create_collective(collector: Kernel, distributor: Kernel) -> Kernel | None:
 
 def _fuse_pairs(graph: ComputeGraph, placement: Placement) -> bool:
     """Fuse adjacent (Gather|Reduce) → (Scatter|Broadcast) pairs."""
-    changed = True
     did_change = False
-    while changed:
-        changed = False
-        for kernel in list(graph.kernels):
+    while True:
+        pairs = []
+        for kernel in list(graph._dag.nodes):
             if not isinstance(kernel, (Gather, Reduce)):
                 continue
             out_edges = graph._out_edges(kernel)
@@ -103,11 +102,17 @@ def _fuse_pairs(graph: ComputeGraph, placement: Placement) -> bool:
                 continue
             if not _same_device_set(graph, kernel, successor, placement):
                 continue
+            pairs.append((kernel, successor))
 
+        if not pairs:
+            break
+
+        did_change = True
+        for kernel, successor in pairs:
+            if not graph._dag.has_node(kernel) or not graph._dag.has_node(successor):
+                continue
             collective = _create_collective(kernel, successor)
-
             if collective is None:
-                # Identity case — verify shard shapes match before bypass
                 collector_shard = next(iter(kernel.inputs.values())).shape
                 distributor_shard = next(iter(successor.outputs.values())).shape
                 if collector_shard != distributor_shard:
@@ -115,9 +120,7 @@ def _fuse_pairs(graph: ComputeGraph, placement: Placement) -> bool:
                 _bypass_pair(graph, kernel, successor)
             else:
                 _replace_pair(graph, kernel, successor, collective)
-            changed = True
-            did_change = True
-            break
+
     return did_change
 
 
@@ -171,18 +174,24 @@ def _bypass_pair(
 
 def _eliminate_dead(graph: ComputeGraph) -> bool:
     """Remove trivial comm nodes (single in-edge and single out-edge)."""
-    changed = True
     did_change = False
-    while changed:
-        changed = False
-        for kernel in list(graph.kernels):
+    while True:
+        to_remove = []
+        for kernel in list(graph._dag.nodes):
             if not isinstance(kernel, CommKernel):
                 continue
             in_edges = graph._in_edges(kernel)
             out_edges = graph._out_edges(kernel)
             if len(in_edges) == 1 and len(out_edges) == 1:
-                graph.remove_identity(kernel)
-                changed = True
-                did_change = True
-                break
+                to_remove.append(kernel)
+
+        if not to_remove:
+            break
+
+        did_change = True
+        for kernel in to_remove:
+            if not graph._dag.has_node(kernel):
+                continue
+            graph.remove_identity(kernel)
+
     return did_change

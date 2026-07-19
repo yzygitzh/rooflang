@@ -10,6 +10,7 @@ Two edge types (distinguished by whether mapping is empty):
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Callable, Dict, FrozenSet, List, NamedTuple, Optional, Set, Tuple
 
 import networkx as nx
@@ -602,6 +603,7 @@ class HardwareGraph:
     def nodes(self) -> FrozenSet[HardwareComponent]:
         return frozenset(self._graph.nodes)
 
+    @lru_cache(maxsize=None)
     def find_fabric(self, src: HardwareComponent, dst: HardwareComponent) -> FabricEdge:
         """Find the effective fabric between src and dst.
 
@@ -688,6 +690,7 @@ class HardwareGraph:
             result.append((edge, direction))
         return result
 
+    @lru_cache(maxsize=None)
     def find_local_memory(self, device: Compute) -> Memory:
         """Find the Memory node connected to device with highest bandwidth."""
         best_mem: Optional[Memory] = None

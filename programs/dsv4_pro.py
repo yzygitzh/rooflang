@@ -19,7 +19,7 @@ from rooflang.language.kernels.identity import Concat, Spawn
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.optimization.comm import optimize_comms
 from rooflang.language.optimization.split import (
-    batch_split, column_split, head_split, row_split,
+    batch_split,
 )
 from rooflang.language.placement import Placement
 from rooflang.language.tensor import Tensor
@@ -382,16 +382,8 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
         _, L._dispatch_copies, _ = g.split_kernel(batch_split, L.dispatch, TP)
         _, L._combine_copies, _ = g.split_kernel(
             batch_split, L.combine, TP)
-
-    # ── Phase 2: TP splits ───────────────────────────────────────────
-    for L in layers:
-        # Shared expert TP: column-split sw_up, row-split sw_down
-        _, sw_up_copies, _ = g.split_kernel(column_split, L.sw_up, TP)
-        _, sw_down_copies, _ = g.split_kernel(row_split, L.sw_down, TP)
-
-        # Store copies for placement
-        L._sw_up_copies = sw_up_copies
-        L._sw_down_copies = sw_down_copies
+        _, L._sw_up_copies, _ = g.split_kernel(batch_split, L.sw_up, TP)
+        _, L._sw_down_copies, _ = g.split_kernel(batch_split, L.sw_down, TP)
 
     # ── Placement ─────────────────────────────────────────────────
     p = Placement(hardware=hw, graph=g)
@@ -417,7 +409,8 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
                        L._wo_a_copies, L._wo_b_copies,
                        L._ffn_norm_copies, L._ffn_fan_copies,
                        L._gate_copies, L._dispatch_copies,
-                       L._combine_copies]:
+                       L._combine_copies,
+                       L._sw_up_copies, L._sw_down_copies]:
             for i, c in enumerate(copies):
                 p.set_kernel_device(c, gpus[i])
         if L.comp is not None:
@@ -425,11 +418,6 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
                 p.set_kernel_device(c, gpus[i])
         if L.comp_norm is not None:
             for i, c in enumerate(L._comp_norm_copies):
-                p.set_kernel_device(c, gpus[i])
-
-        # TP copies → GPU0-7
-        for copies in [L._sw_up_copies, L._sw_down_copies]:
-            for i, c in enumerate(copies):
                 p.set_kernel_device(c, gpus[i])
 
         # Expert kernels → respective GPUs

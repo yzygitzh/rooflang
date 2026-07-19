@@ -1,8 +1,8 @@
-"""DeepSeek V4 Pro inference simulation — 8k prefill on B300 TP=8.
+"""DeepSeek V4 Pro inference simulation — 8k prefill on B300 DP=8.
 
 Three-phase structure:
   A. declare_model() — build logical compute graph (add_kernel + add_data_edge)
-  B. optimize_model() — split_kernel for TP, control edges, placement
+  B. optimize_model() — split_kernel for DP, control edges, placement
   C. simulate() — DES execution + trace export
 """
 
@@ -43,7 +43,7 @@ TOPK = 6
 MOE_INTER = 3072
 WINDOW = 128
 INDEX_TOPK = 1024
-TP = 8
+DP = 8
 EP = 8
 N_LOCAL_EXPERTS = N_EXPERTS // EP
 V = 129280
@@ -306,7 +306,7 @@ def declare_model():
 
         # Expert kernels per GPU (up_proj + down_proj per expert, independent)
         L.experts = []
-        for gpu_id in range(TP):
+        for gpu_id in range(DP):
             gpu_experts = []
             for eid in range(N_LOCAL_EXPERTS):
                 global_eid = gpu_id * N_LOCAL_EXPERTS + eid
@@ -346,7 +346,7 @@ def declare_model():
 # ═══════════════════════════════════════════════════════════════════════
 
 def optimize_model(g, layers, hw, emb=None, read_input=None):
-    """Apply split_kernel for TP, add control edges, and place."""
+    """Apply split_kernel for DP, add control edges, and place."""
     gpus = sorted(
         [c for c in hw.nodes if isinstance(c, Compute)
          and "nvidia-b300" in c.name],
@@ -355,35 +355,35 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
     # ── Phase 1: DP splits (batch dim) ───────────────────────────────
     emb_copies = None
     if emb is not None:
-        _, emb_copies, _ = g.split_kernel(batch_split, emb, TP)
+        _, emb_copies, _ = g.split_kernel(batch_split, emb, DP)
 
     for L in layers:
-        _, L._bridge_copies, _ = g.split_kernel(batch_split, L.bridge, TP)
-        _, L._attn_norm_copies, _ = g.split_kernel(batch_split, L.attn_norm, TP)
-        _, L._attn_fan_copies, _ = g.split_kernel(batch_split, L.attn_fan, TP)
+        _, L._bridge_copies, _ = g.split_kernel(batch_split, L.bridge, DP)
+        _, L._attn_norm_copies, _ = g.split_kernel(batch_split, L.attn_norm, DP)
+        _, L._attn_fan_copies, _ = g.split_kernel(batch_split, L.attn_fan, DP)
         if L.comp is not None:
-            _, L._comp_copies, _ = g.split_kernel(batch_split, L.comp, TP)
+            _, L._comp_copies, _ = g.split_kernel(batch_split, L.comp, DP)
         if L.comp_norm is not None:
             _, L._comp_norm_copies, _ = g.split_kernel(
-                batch_split, L.comp_norm, TP)
-        _, L._wq_a_copies, _ = g.split_kernel(batch_split, L.wq_a, TP)
-        _, L._q_norm_copies, _ = g.split_kernel(batch_split, L.q_norm, TP)
-        _, L._wq_b_copies, _ = g.split_kernel(batch_split, L.wq_b, TP)
-        _, L._wkv_copies, _ = g.split_kernel(batch_split, L.wkv, TP)
-        _, L._kv_norm_copies, _ = g.split_kernel(batch_split, L.kv_norm, TP)
+                batch_split, L.comp_norm, DP)
+        _, L._wq_a_copies, _ = g.split_kernel(batch_split, L.wq_a, DP)
+        _, L._q_norm_copies, _ = g.split_kernel(batch_split, L.q_norm, DP)
+        _, L._wq_b_copies, _ = g.split_kernel(batch_split, L.wq_b, DP)
+        _, L._wkv_copies, _ = g.split_kernel(batch_split, L.wkv, DP)
+        _, L._kv_norm_copies, _ = g.split_kernel(batch_split, L.kv_norm, DP)
         _, L._kv_concat_copies, _ = g.split_kernel(
-            batch_split, L.kv_concat, TP)
-        _, L._sa_copies, _ = g.split_kernel(batch_split, L.sa, TP)
-        _, L._wo_a_copies, _ = g.split_kernel(batch_split, L.wo_a, TP)
-        _, L._wo_b_copies, _ = g.split_kernel(batch_split, L.wo_b, TP)
-        _, L._ffn_norm_copies, _ = g.split_kernel(batch_split, L.ffn_norm, TP)
-        _, L._ffn_fan_copies, _ = g.split_kernel(batch_split, L.ffn_fan, TP)
-        _, L._gate_copies, _ = g.split_kernel(batch_split, L.gate, TP)
-        _, L._dispatch_copies, _ = g.split_kernel(batch_split, L.dispatch, TP)
+            batch_split, L.kv_concat, DP)
+        _, L._sa_copies, _ = g.split_kernel(batch_split, L.sa, DP)
+        _, L._wo_a_copies, _ = g.split_kernel(batch_split, L.wo_a, DP)
+        _, L._wo_b_copies, _ = g.split_kernel(batch_split, L.wo_b, DP)
+        _, L._ffn_norm_copies, _ = g.split_kernel(batch_split, L.ffn_norm, DP)
+        _, L._ffn_fan_copies, _ = g.split_kernel(batch_split, L.ffn_fan, DP)
+        _, L._gate_copies, _ = g.split_kernel(batch_split, L.gate, DP)
+        _, L._dispatch_copies, _ = g.split_kernel(batch_split, L.dispatch, DP)
         _, L._combine_copies, _ = g.split_kernel(
-            batch_split, L.combine, TP)
-        _, L._sw_up_copies, _ = g.split_kernel(batch_split, L.sw_up, TP)
-        _, L._sw_down_copies, _ = g.split_kernel(batch_split, L.sw_down, TP)
+            batch_split, L.combine, DP)
+        _, L._sw_up_copies, _ = g.split_kernel(batch_split, L.sw_up, DP)
+        _, L._sw_down_copies, _ = g.split_kernel(batch_split, L.sw_down, DP)
 
     # ── Placement ─────────────────────────────────────────────────
     p = Placement(hardware=hw, graph=g)
@@ -434,7 +434,7 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
 
         # Dispatch RDMA: each copy writes expert outputs to target GPU's HBM
         for copy in L._dispatch_copies:
-            for gpu_id in range(TP):
+            for gpu_id in range(DP):
                 local_mem = hw.find_local_memory(gpus[gpu_id])
                 for local_eid in range(N_LOCAL_EXPERTS):
                     global_eid = gpu_id * N_LOCAL_EXPERTS + local_eid
@@ -443,7 +443,7 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
 
         # Combine RDMA: each copy reads expert outputs from source GPU's HBM
         for copy in L._combine_copies:
-            for gpu_id in range(TP):
+            for gpu_id in range(DP):
                 local_mem = hw.find_local_memory(gpus[gpu_id])
                 for local_eid in range(N_LOCAL_EXPERTS):
                     global_eid = gpu_id * N_LOCAL_EXPERTS + local_eid

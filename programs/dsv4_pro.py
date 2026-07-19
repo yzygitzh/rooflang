@@ -380,6 +380,8 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
         _, L._ffn_fan_copies, _ = g.split_kernel(batch_split, L.ffn_fan, TP)
         _, L._gate_copies, _ = g.split_kernel(batch_split, L.gate, TP)
         _, L._dispatch_copies, _ = g.split_kernel(batch_split, L.dispatch, TP)
+        _, L._combine_copies, _ = g.split_kernel(
+            batch_split, L.combine, TP)
 
     # ── Phase 2: TP splits ───────────────────────────────────────────
     for L in layers:
@@ -414,7 +416,8 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
                        L._kv_concat_copies, L._sa_copies,
                        L._wo_a_copies, L._wo_b_copies,
                        L._ffn_norm_copies, L._ffn_fan_copies,
-                       L._gate_copies, L._dispatch_copies]:
+                       L._gate_copies, L._dispatch_copies,
+                       L._combine_copies]:
             for i, c in enumerate(copies):
                 p.set_kernel_device(c, gpus[i])
         if L.comp is not None:
@@ -429,13 +432,10 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
             for i, c in enumerate(copies):
                 p.set_kernel_device(c, gpus[i])
 
-        # Expert kernels → respective GPUs (before combine)
+        # Expert kernels → respective GPUs
         for gpu_id, gpu_experts in enumerate(L.experts):
             for k in gpu_experts:
                 p.set_kernel_device(k, gpus[gpu_id])
-
-        # Post-expert kernels → GPU0
-        p.set_kernel_device(L.combine, gpus[0])
 
         # Expert input locality: placed on destination GPU's HBM
         for gpu_id, gpu_experts in enumerate(L.experts):
@@ -452,6 +452,15 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
                     global_eid = gpu_id * N_LOCAL_EXPERTS + local_eid
                     p.set_tensor_memory(
                         copy.outputs[f"o{global_eid}"], local_mem)
+
+        # Combine RDMA: each copy reads expert outputs from source GPU's HBM
+        for copy in L._combine_copies:
+            for gpu_id in range(TP):
+                local_mem = hw.find_local_memory(gpus[gpu_id])
+                for local_eid in range(N_LOCAL_EXPERTS):
+                    global_eid = gpu_id * N_LOCAL_EXPERTS + local_eid
+                    p.set_tensor_memory(
+                        copy.inputs[f"i{global_eid}"], local_mem)
 
     optimize_comms(g, p)
 

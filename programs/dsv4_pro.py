@@ -379,6 +379,7 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
         _, L._ffn_norm_copies, _ = g.split_kernel(batch_split, L.ffn_norm, TP)
         _, L._ffn_fan_copies, _ = g.split_kernel(batch_split, L.ffn_fan, TP)
         _, L._gate_copies, _ = g.split_kernel(batch_split, L.gate, TP)
+        _, L._dispatch_copies, _ = g.split_kernel(batch_split, L.dispatch, TP)
 
     # ── Phase 2: TP splits ───────────────────────────────────────────
     for L in layers:
@@ -405,10 +406,6 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
         p.set_tensor_memory(read_input.inputs["tokens"], cpu_mem)
 
     for L in layers:
-        # Non-split kernels → GPU0
-        for k in [L.dispatch]:
-            p.set_kernel_device(k, gpus[0])
-
         # DP copies → GPU0-7
         for copies in [L._bridge_copies, L._attn_norm_copies,
                        L._attn_fan_copies, L._wq_a_copies,
@@ -417,7 +414,7 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
                        L._kv_concat_copies, L._sa_copies,
                        L._wo_a_copies, L._wo_b_copies,
                        L._ffn_norm_copies, L._ffn_fan_copies,
-                       L._gate_copies]:
+                       L._gate_copies, L._dispatch_copies]:
             for i, c in enumerate(copies):
                 p.set_kernel_device(c, gpus[i])
         if L.comp is not None:
@@ -440,15 +437,21 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
         # Post-expert kernels → GPU0
         p.set_kernel_device(L.combine, gpus[0])
 
-        # Expert input locality: dispatch outputs placed on destination GPU's HBM
+        # Expert input locality: placed on destination GPU's HBM
         for gpu_id, gpu_experts in enumerate(L.experts):
             local_mem = hw.find_local_memory(gpus[gpu_id])
             for eid in range(0, len(gpu_experts), 2):
                 up_kernel = gpu_experts[eid]
-                global_eid = gpu_id * N_LOCAL_EXPERTS + eid // 2
-                out_name = f"o{global_eid}"
-                p.set_tensor_memory(L.dispatch.outputs[out_name], local_mem)
                 p.set_tensor_memory(up_kernel.inputs["x"], local_mem)
+
+        # Dispatch RDMA: each copy writes expert outputs to target GPU's HBM
+        for copy in L._dispatch_copies:
+            for gpu_id in range(TP):
+                local_mem = hw.find_local_memory(gpus[gpu_id])
+                for local_eid in range(N_LOCAL_EXPERTS):
+                    global_eid = gpu_id * N_LOCAL_EXPERTS + local_eid
+                    p.set_tensor_memory(
+                        copy.outputs[f"o{global_eid}"], local_mem)
 
     optimize_comms(g, p)
 

@@ -11,7 +11,7 @@ import heapq
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from rooflang.language.graph import ComputeGraph, FabricEdge, HardwareGraph
 from rooflang.language.hardware.component import Compute, Memory
@@ -19,6 +19,17 @@ from rooflang.language.kernels.comm import AllToAll, CommKernel, Recv, Send
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.placement import Placement
 from rooflang.language.tensor import Tensor
+
+FabricKey = Tuple[FabricEdge, Optional[str]]
+
+
+def _fabric_key(edge: FabricEdge, direction: str) -> FabricKey:
+    return (edge, direction) if edge.is_full_duplex else (edge, None)
+
+
+def _direction_bw(edge: FabricEdge, direction: str) -> float:
+    return edge.src_to_dst_bandwidth_gbs if direction == 'fwd' \
+        else edge.dst_to_src_bandwidth_gbs
 
 
 class Bound(Enum):
@@ -77,12 +88,12 @@ class RunningKernel:
     __slots__ = ("kernel", "device", "stream", "resource_cap",
                  "compute_time", "memory_time",
                  "network_alpha", "network_transfer_time",
-                 "fabric_edges", "participants", "start_us",
+                 "link_data", "fabric_keys", "participants", "start_us",
                  "cp", "mp", "tp", "alpha_remaining",
                  "seg_start", "dev_share", "net_share")
 
     def __init__(self, kernel, device, stream, cap, ct, mt,
-                 alpha, xfer, fabs, parts, t0):
+                 alpha, xfer, link_data, parts, t0):
         self.kernel = kernel
         self.device = device
         self.stream = stream
@@ -91,7 +102,8 @@ class RunningKernel:
         self.memory_time = mt
         self.network_alpha = alpha
         self.network_transfer_time = xfer
-        self.fabric_edges = fabs
+        self.link_data = link_data
+        self.fabric_keys = list(link_data.keys()) if link_data else []
         self.participants = parts
         self.start_us = t0
         self.cp = self.mp = self.tp = 0.0
@@ -152,7 +164,7 @@ class Simulator:
         self._kernel_end: Dict[Kernel, float] = {}
         self._stream_end: Dict[Tuple[Compute, int], float] = {}
         self._on_dev: Dict[Compute, List[RunningKernel]] = {}
-        self._on_fab: Dict[FabricEdge, List[RunningKernel]] = {}
+        self._on_fab: Dict[FabricKey, List[RunningKernel]] = {}
         self._trace: List[TraceEntry] = []
         self._completed: Set[Kernel] = set()
         self._eid = 0
@@ -270,9 +282,9 @@ class Simulator:
                     self._multi_stream_waiting.append((now, kernel))
                     return
 
-        ct, mt, alpha, xfer, fabs = self._base_times(kernel, dev, parts)
+        ct, mt, alpha, xfer, link_data = self._base_times(kernel, dev, parts)
         rk = RunningKernel(kernel, dev, stream, cap, ct, mt,
-                           alpha, xfer, fabs, parts, now)
+                           alpha, xfer, link_data, parts, now)
         key = (dev, stream)
         self._stream_active[key] = rk
         if self._is_multi_stream_comm(kernel, parts):
@@ -281,8 +293,8 @@ class Simulator:
                 if p_key != key:
                     self._stream_active[p_key] = rk
         self._on_dev.setdefault(dev, []).append(rk)
-        for fab in fabs:
-            self._on_fab.setdefault(fab, []).append(rk)
+        for fk in rk.fabric_keys:
+            self._on_fab.setdefault(fk, []).append(rk)
         self._allocate_outputs(kernel)
         self._advance_peers(rk, now)
         self._recompute_shares(rk)
@@ -305,14 +317,14 @@ class Simulator:
                 self._stream_end[p_key] = now
 
         self._on_dev[rk.device].remove(rk)
-        for fab in rk.fabric_edges:
-            self._on_fab[fab].remove(rk)
+        for fk in rk.fabric_keys:
+            self._on_fab[fk].remove(rk)
         self._advance_peers(rk, now)
         if self._on_dev.get(rk.device):
             self._recompute_shares(self._on_dev[rk.device][0])
-        for fab in rk.fabric_edges:
-            if self._on_fab.get(fab):
-                self._recompute_shares(self._on_fab[fab][0])
+        for fk in rk.fabric_keys:
+            if self._on_fab.get(fk):
+                self._recompute_shares(self._on_fab[fk][0])
         self._resched_peers(rk)
         # Schedule next pending kernel on primary stream
         pending = self._stream_pending.get(key, [])
@@ -405,24 +417,31 @@ class Simulator:
         s = 1.0 / max(1.0, tc)
         for p in peers:
             p.dev_share = p.resource_cap * s
-        # Collect all kernels affected by fabric changes
         affected: Set[RunningKernel] = set()
-        for fab in rk.fabric_edges:
-            for p in self._on_fab.get(fab, []):
+        for fk in rk.fabric_keys:
+            for p in self._on_fab.get(fk, []):
                 affected.add(p)
         for p in affected:
-            min_share = 1.0
-            for fab in p.fabric_edges:
-                fp = self._on_fab.get(fab, [])
-                fab_share = 1.0 / max(1, len(fp))
-                min_share = min(min_share, fab_share)
-            p.net_share = min_share
+            if not p.link_data or p.network_transfer_time <= 0:
+                p.net_share = 1.0
+                continue
+            worst_time = 0.0
+            for key, (bytes_val, bw) in p.link_data.items():
+                if bytes_val <= 0:
+                    continue
+                n_users = max(1, len(self._on_fab.get(key, [])))
+                link_time = bytes_val / (bw * 1e3 / n_users)
+                worst_time = max(worst_time, link_time)
+            if worst_time > 0:
+                p.net_share = p.network_transfer_time / worst_time
+            else:
+                p.net_share = 1.0
 
     def _advance_peers(self, rk: RunningKernel, now: float):
         for p in self._on_dev.get(rk.device, []):
             p.advance_to(now)
-        for fab in rk.fabric_edges:
-            for p in self._on_fab.get(fab, []):
+        for fk in rk.fabric_keys:
+            for p in self._on_fab.get(fk, []):
                 p.advance_to(now)
 
     def _resched_peers(self, rk: RunningKernel):
@@ -430,8 +449,8 @@ class Simulator:
         for p in self._on_dev.get(rk.device, []):
             if p is not rk:
                 seen.add(p)
-        for fab in rk.fabric_edges:
-            for p in self._on_fab.get(fab, []):
+        for fk in rk.fabric_keys:
+            for p in self._on_fab.get(fk, []):
                 if p is not rk:
                     seen.add(p)
         for p in seen:
@@ -464,7 +483,50 @@ class Simulator:
             if p._requires_placement:
                 stream = self._placement.get_kernel_device(p).stream
                 break
+
+        if isinstance(kernel, CommKernel) and len(devs) > 1:
+            local_dev = self._find_local_comm_device(kernel)
+            if local_dev is not None:
+                return local_dev, stream, 1.0, [local_dev]
+
         return primary, stream, 1.0, devs
+
+    def _find_local_comm_device(self, kernel: Kernel) -> Optional[Compute]:
+        """If all input/output data is in the same memory, return the closest device."""
+        target_mem = None
+        for edge in self._graph._in_edges(kernel):
+            for out_name in edge.mapping:
+                mem = self._placement.get_tensor_memory(edge.src.outputs[out_name])
+                if mem is None:
+                    return None
+                if target_mem is None:
+                    target_mem = mem
+                elif mem is not target_mem:
+                    return None
+        for edge in self._graph._out_edges(kernel):
+            for _, in_name in edge.mapping.items():
+                mem = self._placement.get_tensor_memory(edge.dst.inputs[in_name])
+                if mem is None:
+                    return None
+                if target_mem is None:
+                    target_mem = mem
+                elif mem is not target_mem:
+                    return None
+        if target_mem is None:
+            return None
+        best_dev, best_bw = None, 0.0
+        for node in self._hardware.nodes:
+            if not isinstance(node, Compute):
+                continue
+            try:
+                fab = self._hardware.find_fabric(node, target_mem)
+            except (ValueError, KeyError):
+                continue
+            bw = max(fab.src_to_dst_bandwidth_gbs, fab.dst_to_src_bandwidth_gbs)
+            if bw > best_bw:
+                best_bw = bw
+                best_dev = node
+        return best_dev
 
     def _base_times(self, kernel: Kernel, device: Compute,
                     participants: List[Compute]):
@@ -478,8 +540,7 @@ class Simulator:
 
         mt = 0.0
         xfer = 0.0
-        fab_edges: List[FabricEdge] = []
-        seen_fab: Set[FabricEdge] = set()
+        link_data: Dict[FabricKey, List] = {}
 
         if kernel._requires_placement:
             local_mem = self._hardware.find_local_memory(device)
@@ -497,47 +558,55 @@ class Simulator:
                     if bw > 0:
                         mt += t.size_bytes / bw
                 else:
-                    fab = self._hardware.find_fabric(device, mem)
-                    bw = fab.dst_to_src_bandwidth_gbs * 1e3
-                    if t.size_bytes > 0 and bw <= 0:
-                        raise ValueError(
-                            f"Zero read bandwidth on fabric '{fab.name}' "
-                            f"for tensor with {t.size_bytes} bytes")
-                    if bw > 0:
-                        xfer += t.size_bytes / bw
-                    for f in self._hardware.find_fabric_path(device, mem):
-                        if f not in seen_fab:
-                            seen_fab.add(f)
-                            fab_edges.append(f)
+                    path = self._hardware.find_fabric_path_directed(device, mem)
+                    for edge, direction in path:
+                        rev_dir = 'rev' if direction == 'fwd' else 'fwd'
+                        key = _fabric_key(edge, rev_dir)
+                        bw_gbs = _direction_bw(edge, rev_dir)
+                        if key in link_data:
+                            link_data[key][0] += t.size_bytes
+                        else:
+                            link_data[key] = [t.size_bytes, bw_gbs]
             for t in kernel.outputs.values():
                 mem = self._placement.get_tensor_memory(t) \
                     if self._placement.get_tensor_memory(t) \
                     else local_mem
-                fab = self._hardware.find_fabric(device, mem)
-                bw = fab.src_to_dst_bandwidth_gbs * 1e3
-                if t.size_bytes > 0 and bw <= 0:
-                    raise ValueError(
-                        f"Zero write bandwidth on fabric '{fab.name}' "
-                        f"for tensor with {t.size_bytes} bytes")
-                if bw > 0:
-                    if mem is local_mem:
+                if mem is local_mem:
+                    fab = self._hardware.find_fabric(device, mem)
+                    bw = fab.src_to_dst_bandwidth_gbs * 1e3
+                    if t.size_bytes > 0 and bw <= 0:
+                        raise ValueError(
+                            f"Zero write bandwidth on fabric '{fab.name}' "
+                            f"for tensor with {t.size_bytes} bytes")
+                    if bw > 0:
                         mt += t.size_bytes / bw
-                    else:
-                        xfer += t.size_bytes / bw
-                        for f in self._hardware.find_fabric_path(device, mem):
-                            if f not in seen_fab:
-                                seen_fab.add(f)
-                                fab_edges.append(f)
+                else:
+                    path = self._hardware.find_fabric_path_directed(device, mem)
+                    for edge, direction in path:
+                        key = _fabric_key(edge, direction)
+                        bw_gbs = _direction_bw(edge, direction)
+                        if key in link_data:
+                            link_data[key][0] += t.size_bytes
+                        else:
+                            link_data[key] = [t.size_bytes, bw_gbs]
 
         alpha = 0.0
         if isinstance(kernel, CommKernel) and len(participants) >= 2 \
            and kernel.transferred_bytes > 0:
             for i, d1 in enumerate(participants):
                 for d2 in participants[i + 1:]:
-                    for fab in self._hardware.find_fabric_path(d1, d2):
-                        if fab not in seen_fab:
-                            seen_fab.add(fab)
-                            fab_edges.append(fab)
+                    for edge, direction in \
+                            self._hardware.find_fabric_path_directed(d1, d2):
+                        if edge.is_full_duplex:
+                            for d in ('fwd', 'rev'):
+                                key = _fabric_key(edge, d)
+                                if key not in link_data:
+                                    link_data[key] = [0.0, _direction_bw(edge, d)]
+                        else:
+                            key = _fabric_key(edge, direction)
+                            if key not in link_data:
+                                link_data[key] = [0.0,
+                                                  _direction_bw(edge, direction)]
             if isinstance(kernel, (AllToAll, Send, Recv)):
                 eff_bw = min(
                     min(self._hardware.find_fabric(d1, d2).src_to_dst_bandwidth_gbs,
@@ -551,8 +620,26 @@ class Simulator:
                 for i, d1 in enumerate(participants)
                 for d2 in participants[i + 1:])
             xfer = kernel.transferred_bytes / (eff_bw * 1e3)
+        elif isinstance(kernel, CommKernel) and len(participants) == 1 \
+                and kernel.transferred_bytes > 0:
+            local_mem = self._hardware.find_local_memory(device)
+            fab = self._hardware.find_fabric(device, local_mem)
+            read_bw = fab.dst_to_src_bandwidth_gbs * 1e3
+            write_bw = fab.src_to_dst_bandwidth_gbs * 1e3
+            if read_bw > 0 and write_bw > 0:
+                mt = max(kernel.total_bytes / read_bw,
+                         kernel.total_bytes / write_bw)
+            key = _fabric_key(fab, 'fwd')
+            if key not in link_data:
+                link_data[key] = [0.0, fab.src_to_dst_bandwidth_gbs]
 
-        return ct, mt, alpha, xfer, fab_edges
+        if not (isinstance(kernel, CommKernel) and len(participants) >= 2
+                and kernel.transferred_bytes > 0):
+            xfer = max((b / (bw * 1e3)
+                        for b, bw in link_data.values() if b > 0),
+                       default=0.0)
+
+        return ct, mt, alpha, xfer, link_data
 
     @staticmethod
     def _infer_dtype(kernel: Kernel) -> str:

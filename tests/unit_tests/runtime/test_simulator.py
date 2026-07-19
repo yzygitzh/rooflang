@@ -623,9 +623,9 @@ class TestCrossDeviceFabric:
 
         # k1: write 200KB locally at 1000 GB/s = 0.2 us
         # move1/move2 run in parallel on different GPUs:
-        #   Each reads 100KB remotely from HBM0: xfer_read = 100000/(100*1e3) = 1.0 us
-        #   Each writes 100KB remotely to HBM0: xfer_write = 100000/(100*1e3) = 1.0 us
-        #   Total xfer per move = 2.0 us without sharing
-        #   Both share GPU0↔switch (link0): net_share = 0.5 → 4.0 us each
-        # Total = k1(0.2) + max(move1, move2)(4.0) = 4.2 us
-        assert result.total_time_us == pytest.approx(4.2, rel=1e-2)
+        #   Each reads 100KB via link0 'fwd' and writes 100KB via link0 'rev'
+        #   Full-duplex: read/write parallel → base xfer = 1.0 us
+        #   Both share link0 'fwd' (2 users) and link0 'rev' (2 users)
+        #   worst_time = 2.0 us → net_share = 0.5 → effective = 2.0 us
+        # Total = k1(0.2) + max(move1, move2)(2.0) = 2.2 us
+        assert result.total_time_us == pytest.approx(2.2, rel=1e-2)

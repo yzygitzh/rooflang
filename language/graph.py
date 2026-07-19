@@ -10,7 +10,7 @@ Two edge types (distinguished by whether mapping is empty):
 
 from __future__ import annotations
 
-from typing import Callable, Dict, FrozenSet, List, NamedTuple, Optional, Set
+from typing import Callable, Dict, FrozenSet, List, NamedTuple, Optional, Set, Tuple
 
 import networkx as nx
 
@@ -666,6 +666,27 @@ class HardwareGraph:
         for i in range(len(path) - 1):
             hops.append(self._best_fabric(path[i], path[i + 1]))
         return hops
+
+    def find_fabric_path_directed(
+        self, src: HardwareComponent, dst: HardwareComponent,
+    ) -> List[Tuple[FabricEdge, str]]:
+        """Return directed path: list of (FabricEdge, direction).
+
+        direction is 'fwd' if data flows src→dst on that edge,
+        'rev' if data flows dst→src.
+        """
+        if src is dst:
+            return []
+        try:
+            path = nx.shortest_path(self._graph, src, dst)
+        except nx.NetworkXNoPath:
+            raise ValueError(f"No path between {src.name} and {dst.name}")
+        result: List[Tuple[FabricEdge, str]] = []
+        for i in range(len(path) - 1):
+            edge = self._best_fabric(path[i], path[i + 1])
+            direction = 'fwd' if edge.src is path[i] else 'rev'
+            result.append((edge, direction))
+        return result
 
     def find_local_memory(self, device: Compute) -> Memory:
         """Find the Memory node connected to device with highest bandwidth."""

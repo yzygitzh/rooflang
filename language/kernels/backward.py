@@ -493,3 +493,45 @@ class StridedGemmDW(Kernel):
     @property
     def output_bytes(self) -> float:
         return self.K * self.N * dtype_bytes(self.grad_dtype)
+
+
+class ElementwiseOp(Kernel):
+    """Backward of element-wise binary op.
+
+    "add" backward: da = dy, db = dy (gradient copied to both inputs).
+      flops = 0
+      input  = M·D · sizeof(dtype)          (read dy)
+      output = 2·M·D · sizeof(grad_dtype)   (write da, db)
+
+    "mul" backward: da = dy * b, db = dy * a
+      flops = 2·M·D
+      input  = 3·M·D · sizeof(dtype)        (read dy, saved a, saved b)
+      output = 2·M·D · sizeof(grad_dtype)   (write da, db)
+    """
+
+    def __init__(self, M: int, D: int, dtype: str = "bf16",
+                 op: str = "add", grad_dtype: str = "fp32"):
+        self.M, self.D, self.dtype_ = M, D, dtype
+        self.op = op
+        self.grad_dtype = grad_dtype
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        if self.op == "add":
+            return 0.0
+        return 2.0 * self.M * self.D
+
+    @property
+    def input_bytes(self) -> float:
+        if self.op == "add":
+            return float(self.M * self.D) * dtype_bytes(self.dtype_)
+        return 3.0 * self.M * self.D * dtype_bytes(self.dtype_)
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        return 2.0 * self.M * self.D * dtype_bytes(self.grad_dtype)

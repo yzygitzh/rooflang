@@ -2,8 +2,8 @@
 
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.kernels.forward import (
-    Embedding, Gemm, ReadInput, RMSNorm, LayerNorm, RoPE, Attn, SparseAttn,
-    TokenDispatch, TokenCombine,
+    ElementwiseOp, Embedding, Gemm, ReadInput, RMSNorm, LayerNorm, RoPE,
+    Attn, SparseAttn, TokenDispatch, TokenCombine,
 )
 from rooflang.language.kernels import backward
 from rooflang.language.kernels.comm import (
@@ -116,7 +116,7 @@ class TestEmbedding(TestKernelBase):
     kernel = Embedding(M=8192, V=129280, D=7168, w_dtype="bf16")
     expected_flops = 0.0
     expected_input_bytes = 8192 * 4.0
-    expected_weight_bytes = 8192 * 7168 * 2.0
+    expected_weight_bytes = 129280 * 7168 * 2.0
     expected_output_bytes = 8192 * 7168 * 2.0
 
 
@@ -180,6 +180,24 @@ class TestSparseAttn(TestKernelBase):
     expected_input_bytes = (2 * 8 * 256 * 64 + 2 * 2 * 8 * 64 * 64) * 2.0
     expected_weight_bytes = 0.0
     expected_output_bytes = 2 * 8 * 256 * 64 * 2.0
+
+
+class TestElementwiseOpAdd(TestKernelBase):
+    __test__ = True
+    kernel = ElementwiseOp(M=8192, D=7168, dtype="bf16", op="add")
+    expected_flops = 8192.0 * 7168
+    expected_input_bytes = 2 * 8192 * 7168 * 2.0
+    expected_weight_bytes = 0.0
+    expected_output_bytes = 8192 * 7168 * 2.0
+
+
+class TestElementwiseOpMul(TestKernelBase):
+    __test__ = True
+    kernel = ElementwiseOp(M=8192, D=7168, dtype="bf16", op="mul")
+    expected_flops = 8192.0 * 7168
+    expected_input_bytes = 2 * 8192 * 7168 * 2.0
+    expected_weight_bytes = 0.0
+    expected_output_bytes = 8192 * 7168 * 2.0
 
 
 # ── Backward kernels ─────────────────────────────────────────────────
@@ -269,6 +287,24 @@ class TestBwdSparseAttn(TestKernelBase):
     expected_input_bytes = (2 * 2 * 8 * 256 * 64 + 2 * 2 * 8 * 256 * 64 * 64) * 2.0
     expected_weight_bytes = 0.0
     expected_output_bytes = (2 * 8 * 256 * 64 + 2 * 2 * 8 * 256 * 64 * 64) * 2.0
+
+
+class TestBwdElementwiseOpAdd(TestKernelBase):
+    __test__ = True
+    kernel = backward.ElementwiseOp(M=8192, D=7168, dtype="bf16", op="add")
+    expected_flops = 0.0
+    expected_input_bytes = 8192 * 7168 * 2.0
+    expected_weight_bytes = 0.0
+    expected_output_bytes = 2 * 8192 * 7168 * 4.0
+
+
+class TestBwdElementwiseOpMul(TestKernelBase):
+    __test__ = True
+    kernel = backward.ElementwiseOp(M=8192, D=7168, dtype="bf16", op="mul")
+    expected_flops = 2.0 * 8192 * 7168
+    expected_input_bytes = 3 * 8192 * 7168 * 2.0
+    expected_weight_bytes = 0.0
+    expected_output_bytes = 2 * 8192 * 7168 * 4.0
 
 
 # ── Comm kernels ─────────────────────────────────────────────────────

@@ -49,7 +49,7 @@ class Embedding(Kernel):
     flops = 0 (pure gather, no arithmetic).
     bytes:
         input_bytes  = M · sizeof(idx_dtype)        (token indices)
-        weight_bytes = M · D · sizeof(w_dtype)      (gathered rows from table)
+        weight_bytes = V · D · sizeof(w_dtype)      (full embedding table in HBM)
         output_bytes = M · D · sizeof(out_dtype)
     """
 
@@ -72,11 +72,48 @@ class Embedding(Kernel):
 
     @property
     def weight_bytes(self) -> float:
-        return self.M * self.D * dtype_bytes(self.w_dtype)
+        return self.V * self.D * dtype_bytes(self.w_dtype)
 
     @property
     def output_bytes(self) -> float:
         return self.M * self.D * dtype_bytes(self.out_dtype)
+
+
+class ElementwiseOp(Kernel):
+    """Element-wise binary op: y = op(a, b).
+
+    Supported ops:
+      "add": y = a + b
+      "mul": y = a * b
+
+    flops = M·D (one op per element).
+    bytes:
+        input_bytes  = 2·M·D · sizeof(dtype)  (two input tensors)
+        weight_bytes = 0
+        output_bytes = M·D · sizeof(dtype)
+    """
+
+    def __init__(self, M: int, D: int, dtype: str = "bf16",
+                 op: str = "add"):
+        self.M, self.D, self.dtype_ = M, D, dtype
+        self.op = op
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        return float(self.M * self.D)
+
+    @property
+    def input_bytes(self) -> float:
+        return 2.0 * self.M * self.D * dtype_bytes(self.dtype_)
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        return self.M * self.D * dtype_bytes(self.dtype_)
 
 
 class Gemm(Kernel):

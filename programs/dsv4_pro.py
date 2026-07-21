@@ -12,8 +12,8 @@ from typing import List, Set
 from rooflang.language.graph import ComputeGraph
 from rooflang.language.hardware.component import Compute
 from rooflang.language.kernels.forward import (
-    Embedding, Gemm, ReadInput, RMSNorm, SparseAttn, StridedGemm,
-    TokenCombine, TokenDispatch,
+    ElementwiseOp, Embedding, Gemm, ReadInput, RMSNorm, SparseAttn,
+    StridedGemm, TokenCombine, TokenDispatch,
 )
 from rooflang.language.kernels.identity import Concat, Spawn
 from rooflang.language.kernels.kernel import Kernel
@@ -107,6 +107,8 @@ class LayerMeta:
     sa: Kernel = None
     wo_a: Kernel = None
     wo_b: Kernel = None
+    attn_add: Kernel = None
+    ffn_bridge: Kernel = None
     ffn_norm: Kernel = None
     ffn_fan: Kernel = None
     gate: Kernel = None
@@ -114,182 +116,257 @@ class LayerMeta:
     combine: Kernel = None
     sw_up: Kernel = None
     sw_down: Kernel = None
+    moe_add: Kernel = None
+    ffn_add: Kernel = None
     experts: List[List[Kernel]] = field(default_factory=list)
+    # Decode KV chain (set by declare_model after _build_layers)
+    kv_acc: Kernel = None
+    kv_spawn: Kernel = None
+
+
+@dataclass
+class DecodeStepMeta:
+    """Per-decode-step metadata (token input + embedding + layer list)."""
+    read_input: Kernel = None
+    emb: Kernel = None
+    layers: List[LayerMeta] = field(default_factory=list)
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # A. Declaration Phase
 # ═══════════════════════════════════════════════════════════════════════
 
-def declare_model():
-    """Build logical compute graph using only add_kernel and add_data_edge."""
-    g = ComputeGraph()
-    S = S_PREFILL
-    M = BATCH * S  # total tokens (all Gemm/Norm/MoE use M)
+def _build_layers(g, B, S, context_len, prev_out, kv_fanout=False):
+    """Build N_LAYERS transformer layers into graph g.
+
+    Args:
+        g: ComputeGraph to add kernels to.
+        B: batch size.
+        S: sequence length.
+        context_len: None for prefill mode (builds compressor + kv_concat).
+            For decode mode: (prefill_S, n_cached_decode_tokens) tuple.
+            Per-layer S_kv = prefill_S + prefill_S//ratio + n_cached + S.
+        prev_out: kernel whose "y" output feeds into the first layer.
+        kv_fanout: if True (prefill in full model), add Spawn after kv_concat
+            so kv_cache_out is available for decode chain.
+
+    Returns (layers, last_output_kernel).
+    """
+    M = B * S
+    is_decode = context_len is not None
     layers = []
-
-    # ReadInput: host-to-device transfer of token indices
-    read_input = ReadInput(BATCH * S, "int32")
-    read_input.inputs = {"tokens": Tensor("int32", (BATCH, S, 1))}
-    read_input.outputs = {"tokens": Tensor("int32", (BATCH, S, 1))}
-    g.add_kernel(read_input)
-
-    # Embedding lookup
-    emb = Embedding(M, V, D)
-    emb.inputs = {"idx": Tensor("int32", (BATCH, S, 1))}
-    emb.weights = {"emb": Tensor("bf16", (M, D))}
-    emb.outputs = {"y": Tensor("bf16", (BATCH, S, D))}
-    g.add_kernel(emb)
-    g.add_data_edge(read_input, emb, {"tokens": "idx"})
-
-    prev_out = emb
 
     for layer_id in range(N_LAYERS):
         ratio = COMPRESS_RATIOS[layer_id]
         L = LayerMeta()
 
+        # ── Input fan-out (residual + attention + optional compressor) ──
+        if context_len is None:
+            # Prefill: y→attn_norm, y2→comp, y3→attn_residual
+            bridge = Spawn(world=3)
+            bridge.inputs = {"x": Tensor("bf16", (B, S, D))}
+            bridge.outputs = {"y": Tensor("bf16", (B, S, D)),
+                              "y2": Tensor("bf16", (B, S, D)),
+                              "y3": Tensor("bf16", (B, S, D))}
+            g.add_kernel(bridge)
+            g.add_data_edge(prev_out, bridge, {"y": "x"})
+        else:
+            # Decode: y→attn_norm, y2→attn_residual
+            bridge = Spawn(world=2)
+            bridge.inputs = {"x": Tensor("bf16", (B, S, D))}
+            bridge.outputs = {"y": Tensor("bf16", (B, S, D)),
+                              "y2": Tensor("bf16", (B, S, D))}
+            g.add_kernel(bridge)
+            g.add_data_edge(prev_out, bridge, {"y": "x"})
+        L.bridge = bridge
+
         # ── Attention ─────────────────────────────────────────────
-        attn_norm = make_norm(BATCH, S, D)
+        attn_norm = make_norm(B, S, D)
         g.add_kernel(attn_norm)
+        g.add_data_edge(bridge, attn_norm, {"y": "x"})
         L.attn_norm = attn_norm
 
         # Fan-out after norm: Q path + KV path
         attn_fan = Spawn(world=2)
-        attn_fan.inputs = {"x": Tensor("bf16", (BATCH, S, D))}
-        attn_fan.outputs = {"y": Tensor("bf16", (BATCH, S, D)),
-                            "y2": Tensor("bf16", (BATCH, S, D))}
+        attn_fan.inputs = {"x": Tensor("bf16", (B, S, D))}
+        attn_fan.outputs = {"y": Tensor("bf16", (B, S, D)),
+                            "y2": Tensor("bf16", (B, S, D))}
         g.add_kernel(attn_fan)
         g.add_data_edge(attn_norm, attn_fan, {"y": "x"})
         L.attn_fan = attn_fan
 
-        # Residual fan-out: bridge feeds both attn_norm and comp
-        bridge = Spawn(world=2)
-        bridge.inputs = {"x": Tensor("bf16", (BATCH, S, D))}
-        bridge.outputs = {"y": Tensor("bf16", (BATCH, S, D)),
-                          "y2": Tensor("bf16", (BATCH, S, D))}
-        g.add_kernel(bridge)
-        g.add_data_edge(prev_out, bridge, {"y": "x"})
-        g.add_data_edge(bridge, attn_norm, {"y": "x"})
-        L.bridge = bridge
-
         # Q path
-        wq_a = make_gemm(BATCH, S, Q_LORA, D, "fp8")
+        wq_a = make_gemm(B, S, Q_LORA, D, "fp8")
         g.add_kernel(wq_a)
         g.add_data_edge(attn_fan, wq_a, {"y": "x"})
         L.wq_a = wq_a
 
-        q_norm = make_norm(BATCH, S, Q_LORA)
+        q_norm = make_norm(B, S, Q_LORA)
         g.add_kernel(q_norm)
         g.add_data_edge(wq_a, q_norm, {"y": "x"})
         L.q_norm = q_norm
 
-        wq_b = make_gemm(BATCH, S, H * HD, Q_LORA, "fp8")
+        wq_b = make_gemm(B, S, H * HD, Q_LORA, "fp8")
         g.add_kernel(wq_b)
         g.add_data_edge(q_norm, wq_b, {"y": "x"})
         L.wq_b = wq_b
 
         # KV path (branch from attn fan-out)
-        wkv = make_gemm(BATCH, S, KV_DIM, D, "fp8")
+        wkv = make_gemm(B, S, KV_DIM, D, "fp8")
         g.add_kernel(wkv)
         g.add_data_edge(attn_fan, wkv, {"y2": "x"})
         L.wkv = wkv
 
-        kv_norm = make_norm(BATCH, S, KV_DIM)
+        kv_norm = make_norm(B, S, KV_DIM)
         g.add_kernel(kv_norm)
         g.add_data_edge(wkv, kv_norm, {"y": "x"})
         L.kv_norm = kv_norm
 
-        # Compressor (reads from residual via bridge, or root at layer 0)
-        if ratio in (128, 4):
-            coff = 1 if ratio == 128 else 2
-            S_comp = S // ratio  # compressed seq len per sequence
-            M_comp = BATCH * S_comp  # total compressed tokens
-            comp_out_elems = M_comp * KV_DIM
-            comp = StridedGemm(M, KV_DIM * coff, D, "fp32", "bf16",
-                               in_elems=M * D, out_elems=comp_out_elems)
-            comp.inputs = {"x": Tensor("bf16", (BATCH, S, D))}
-            comp.weights = {"w": Tensor("fp32", (D, KV_DIM * coff))}
-            comp.outputs = {"y": Tensor("bf16", (BATCH, S_comp, KV_DIM))}
-            g.add_kernel(comp)
-            if L.bridge is not None:
-                g.add_data_edge(L.bridge, comp, {"y2": "x"})
-            L.comp = comp
+        if context_len is None:
+            # Prefill: build compressor + kv_concat
+            if ratio in (128, 4):
+                coff = 1 if ratio == 128 else 2
+                S_comp = S // ratio
+                M_comp = B * S_comp
+                comp_out_elems = M_comp * KV_DIM
+                comp = StridedGemm(M, KV_DIM * coff, D, "fp32", "bf16",
+                                   in_elems=M * D, out_elems=comp_out_elems)
+                comp.inputs = {"x": Tensor("bf16", (B, S, D))}
+                comp.weights = {"w": Tensor("fp32", (D, KV_DIM * coff))}
+                comp.outputs = {"y": Tensor("bf16", (B, S_comp, KV_DIM))}
+                g.add_kernel(comp)
+                g.add_data_edge(bridge, comp, {"y2": "x"})
+                L.comp = comp
 
-            comp_norm = make_norm(BATCH, S_comp, KV_DIM)
-            g.add_kernel(comp_norm)
-            g.add_data_edge(comp, comp_norm, {"y": "x"})
-            L.comp_norm = comp_norm
+                comp_norm = make_norm(B, S_comp, KV_DIM)
+                g.add_kernel(comp_norm)
+                g.add_data_edge(comp, comp_norm, {"y": "x"})
+                L.comp_norm = comp_norm
 
-        # Sparse attention (per-sequence dimensions)
-        k_sel = WINDOW
-        if ratio == 128:
-            k_sel = WINDOW + S // 128
-        elif ratio == 4:
-            k_sel = WINDOW + INDEX_TOPK
+            # Sparse attention (prefill: S_kv = S + S//ratio)
+            k_sel = WINDOW
+            if ratio == 128:
+                k_sel = WINDOW + S // 128
+            elif ratio == 4:
+                k_sel = WINDOW + INDEX_TOPK
 
-        S_kv = S + S // ratio
-        sa = SparseAttn(BATCH, H, 1, S, k_sel, S_kv, HD, "bf16", kv_factor=1)
-        sa.inputs = {"q": Tensor("bf16", (BATCH, S, H * HD)),
-                     "kv": Tensor("bf16", (BATCH, S_kv, HD))}
-        sa.outputs = {"y": Tensor("bf16", (BATCH, S, H * HD))}
-        g.add_kernel(sa)
-        g.add_data_edge(wq_b, sa, {"y": "q"})
+            S_kv = S + S // ratio
+            S_comp = S // ratio
+            sa = SparseAttn(B, H, 1, S, k_sel, S_kv, HD, "bf16", kv_factor=1)
+            sa.inputs = {"q": Tensor("bf16", (B, S, H * HD)),
+                         "kv": Tensor("bf16", (B, S_kv, KV_DIM))}
+            sa.outputs = {"y": Tensor("bf16", (B, S, H * HD))}
+            g.add_kernel(sa)
+            g.add_data_edge(wq_b, sa, {"y": "q"})
 
-        # KV cache = concat(window_kv, compressed_kv)
-        kv_concat = Concat()
-        kv_concat.inputs = {"a": Tensor("bf16", (BATCH, S, KV_DIM)),
-                            "b": Tensor("bf16", (BATCH, S_comp, KV_DIM))}
-        kv_concat.outputs = {"y": Tensor("bf16", (BATCH, S_kv, KV_DIM))}
-        g.add_kernel(kv_concat)
-        g.add_data_edge(kv_norm, kv_concat, {"y": "a"})
-        g.add_data_edge(comp_norm, kv_concat, {"y": "b"})
-        g.add_data_edge(kv_concat, sa, {"y": "kv"})
-        L.kv_concat = kv_concat
+            # KV cache = concat(window_kv, compressed_kv)
+            kv_concat = Concat()
+            kv_concat.inputs = {"a": Tensor("bf16", (B, S, KV_DIM)),
+                                "b": Tensor("bf16", (B, S_comp, KV_DIM))}
+            kv_concat.outputs = {"y": Tensor("bf16", (B, S_kv, KV_DIM))}
+            g.add_kernel(kv_concat)
+            g.add_data_edge(kv_norm, kv_concat, {"y": "a"})
+            g.add_data_edge(comp_norm, kv_concat, {"y": "b"})
+
+            if kv_fanout:
+                # Fan-out: one branch to sa, another available for decode chain
+                kv_fan = Spawn(world=2)
+                kv_fan.inputs = {"x": Tensor("bf16", (B, S_kv, KV_DIM))}
+                kv_fan.outputs = {"y": Tensor("bf16", (B, S_kv, KV_DIM)),
+                                  "y2": Tensor("bf16", (B, S_kv, KV_DIM))}
+                g.add_kernel(kv_fan)
+                g.add_data_edge(kv_concat, kv_fan, {"y": "x"})
+                g.add_data_edge(kv_fan, sa, {"y": "kv"})
+                L.kv_cache_out = kv_fan
+            else:
+                g.add_data_edge(kv_concat, sa, {"y": "kv"})
+
+            L.kv_concat = kv_concat
+        else:
+            # Decode: attention reads from external KV cache
+            pfx_S, n_cached = context_len
+            S_kv = pfx_S + pfx_S // ratio + n_cached + S
+            k_sel = WINDOW
+            if ratio == 128:
+                k_sel = WINDOW + pfx_S // 128
+            elif ratio == 4:
+                k_sel = WINDOW + INDEX_TOPK
+
+            sa = SparseAttn(B, H, 1, S, k_sel, S_kv, HD, "bf16", kv_factor=1)
+            sa.inputs = {"q": Tensor("bf16", (B, S, H * HD)),
+                         "kv": Tensor("bf16", (B, S_kv, KV_DIM))}
+            sa.outputs = {"y": Tensor("bf16", (B, S, H * HD))}
+            g.add_kernel(sa)
+            g.add_data_edge(wq_b, sa, {"y": "q"})
+
         L.sa = sa
 
         # Output projection (grouped linear: O_GROUPS independent Gemms)
         wo_a = StridedGemm(M, O_GROUPS * O_LORA, H * HD // O_GROUPS,
                            "bf16", "bf16", in_elems=M * H * HD)
-        wo_a.inputs = {"x": Tensor("bf16", (BATCH, S, H * HD))}
+        wo_a.inputs = {"x": Tensor("bf16", (B, S, H * HD))}
         wo_a.weights = {"w": Tensor("bf16",
                         (H * HD // O_GROUPS, O_GROUPS * O_LORA))}
-        wo_a.outputs = {"y": Tensor("bf16", (BATCH, S, O_GROUPS * O_LORA))}
+        wo_a.outputs = {"y": Tensor("bf16", (B, S, O_GROUPS * O_LORA))}
         g.add_kernel(wo_a)
         g.add_data_edge(sa, wo_a, {"y": "x"})
         L.wo_a = wo_a
 
-        wo_b = make_gemm(BATCH, S, D, O_GROUPS * O_LORA, "fp8")
+        wo_b = make_gemm(B, S, D, O_GROUPS * O_LORA, "fp8")
         g.add_kernel(wo_b)
         g.add_data_edge(wo_a, wo_b, {"y": "x"})
         L.wo_b = wo_b
 
+        # ── Attention residual: input + attention_output ──────────
+        attn_add = ElementwiseOp(M, D, "bf16")
+        attn_add.inputs = {"a": Tensor("bf16", (B, S, D)),
+                           "b": Tensor("bf16", (B, S, D))}
+        attn_add.outputs = {"y": Tensor("bf16", (B, S, D))}
+        g.add_kernel(attn_add)
+        if context_len is None:
+            g.add_data_edge(bridge, attn_add, {"y3": "a"})
+        else:
+            g.add_data_edge(bridge, attn_add, {"y2": "a"})
+        g.add_data_edge(wo_b, attn_add, {"y": "b"})
+        L.attn_add = attn_add
+
+        # ── FFN residual fan-out ──────────────────────────────────
+        ffn_bridge = Spawn(world=2)
+        ffn_bridge.inputs = {"x": Tensor("bf16", (B, S, D))}
+        ffn_bridge.outputs = {"y": Tensor("bf16", (B, S, D)),
+                              "y2": Tensor("bf16", (B, S, D))}
+        g.add_kernel(ffn_bridge)
+        g.add_data_edge(attn_add, ffn_bridge, {"y": "x"})
+        L.ffn_bridge = ffn_bridge
+
         # ── FFN / MoE ─────────────────────────────────────────────
-        ffn_norm = make_norm(BATCH, S, D)
+        ffn_norm = make_norm(B, S, D)
         g.add_kernel(ffn_norm)
-        g.add_data_edge(wo_b, ffn_norm, {"y": "x"})
+        g.add_data_edge(ffn_bridge, ffn_norm, {"y": "x"})
         L.ffn_norm = ffn_norm
 
-        # FFN fan-out: gate needs routing scores, dispatch needs hidden states
-        ffn_fan = Spawn(world=2)
-        ffn_fan.inputs = {"x": Tensor("bf16", (BATCH, S, D))}
-        ffn_fan.outputs = {"y": Tensor("bf16", (BATCH, S, D)),
-                           "y2": Tensor("bf16", (BATCH, S, D))}
+        # FFN fan-out: gate + dispatch + shared expert (3 consumers)
+        ffn_fan = Spawn(world=3)
+        ffn_fan.inputs = {"x": Tensor("bf16", (B, S, D))}
+        ffn_fan.outputs = {"y": Tensor("bf16", (B, S, D)),
+                           "y2": Tensor("bf16", (B, S, D)),
+                           "y3": Tensor("bf16", (B, S, D))}
         g.add_kernel(ffn_fan)
         g.add_data_edge(ffn_norm, ffn_fan, {"y": "x"})
         L.ffn_fan = ffn_fan
 
-        gate = make_gemm(BATCH, S, N_EXPERTS, D, "bf16", "bf16", "fp32")
+        gate = make_gemm(B, S, N_EXPERTS, D, "bf16", "bf16", "fp32")
         g.add_kernel(gate)
         g.add_data_edge(ffn_fan, gate, {"y": "x"})
         L.gate = gate
 
         # Dispatch: softmax routing + token scatter to experts
         S_e = S * TOPK // N_EXPERTS
-        M_e = BATCH * S_e
+        M_e = B * S_e
         dispatch = TokenDispatch(M, D, N_EXPERTS, TOPK)
-        dispatch.inputs = {"x": Tensor("bf16", (BATCH, S, D)),
-                           "routing": Tensor("fp32", (BATCH, S, N_EXPERTS))}
-        dispatch.outputs = {f"o{i}": Tensor("bf16", (BATCH, S_e, D))
+        dispatch.inputs = {"x": Tensor("bf16", (B, S, D)),
+                           "routing": Tensor("fp32", (B, S, N_EXPERTS))}
+        dispatch.outputs = {f"o{i}": Tensor("bf16", (B, S_e, D))
                             for i in range(N_EXPERTS)}
         g.add_kernel(dispatch)
         g.add_data_edge(gate, dispatch, {"y": "routing"})
@@ -298,22 +375,22 @@ def declare_model():
 
         # Combine: weighted sum of expert outputs
         combine = TokenCombine(M, D, N_EXPERTS, TOPK)
-        combine.inputs = {f"i{i}": Tensor("bf16", (BATCH, S_e, D))
+        combine.inputs = {f"i{i}": Tensor("bf16", (B, S_e, D))
                           for i in range(N_EXPERTS)}
-        combine.outputs = {"y": Tensor("bf16", (BATCH, S, D))}
+        combine.outputs = {"y": Tensor("bf16", (B, S, D))}
         g.add_kernel(combine)
         L.combine = combine
 
-        # Expert kernels per GPU (up_proj + down_proj per expert, independent)
+        # Expert kernels per GPU (up_proj + down_proj per expert)
         L.experts = []
         for gpu_id in range(DP):
             gpu_experts = []
             for eid in range(N_LOCAL_EXPERTS):
                 global_eid = gpu_id * N_LOCAL_EXPERTS + eid
-                up = make_gated_up(BATCH, S_e, MOE_INTER, D, "fp4", "bf16")
+                up = make_gated_up(B, S_e, MOE_INTER, D, "fp4", "bf16")
                 g.add_kernel(up)
 
-                down = make_gemm(BATCH, S_e, D, MOE_INTER, "fp4", "bf16")
+                down = make_gemm(B, S_e, D, MOE_INTER, "fp4", "bf16")
                 g.add_kernel(down)
                 g.add_data_edge(up, down, {"y": "x"})
                 g.add_data_edge(dispatch, up, {f"o{global_eid}": "x"})
@@ -323,29 +400,215 @@ def declare_model():
 
             L.experts.append(gpu_experts)
 
-        # Shared expert
-        sw_up = make_gated_up(BATCH, S, MOE_INTER, D, "fp8", "bf16")
+        # Shared expert (parallel with routed — reads from ffn_fan)
+        sw_up = make_gated_up(B, S, MOE_INTER, D, "fp8", "bf16")
         g.add_kernel(sw_up)
-        g.add_data_edge(combine, sw_up, {"y": "x"})
+        g.add_data_edge(ffn_fan, sw_up, {"y3": "x"})
         L.sw_up = sw_up
 
-        sw_down = make_gemm(BATCH, S, D, MOE_INTER, "fp8", "bf16")
+        sw_down = make_gemm(B, S, D, MOE_INTER, "fp8", "bf16")
         g.add_kernel(sw_down)
         g.add_data_edge(sw_up, sw_down, {"y": "x"})
         L.sw_down = sw_down
 
-        prev_out = sw_down
+        # ── MoE output: routed + shared expert ────────────────────
+        moe_add = ElementwiseOp(M, D, "bf16")
+        moe_add.inputs = {"a": Tensor("bf16", (B, S, D)),
+                          "b": Tensor("bf16", (B, S, D))}
+        moe_add.outputs = {"y": Tensor("bf16", (B, S, D))}
+        g.add_kernel(moe_add)
+        g.add_data_edge(combine, moe_add, {"y": "a"})
+        g.add_data_edge(sw_down, moe_add, {"y": "b"})
+        L.moe_add = moe_add
+
+        # ── FFN residual: attn_residual + moe_output ─────────────
+        ffn_add = ElementwiseOp(M, D, "bf16")
+        ffn_add.inputs = {"a": Tensor("bf16", (B, S, D)),
+                          "b": Tensor("bf16", (B, S, D))}
+        ffn_add.outputs = {"y": Tensor("bf16", (B, S, D))}
+        g.add_kernel(ffn_add)
+        g.add_data_edge(ffn_bridge, ffn_add, {"y2": "a"})
+        g.add_data_edge(moe_add, ffn_add, {"y": "b"})
+        L.ffn_add = ffn_add
+
+        prev_out = ffn_add
         layers.append(L)
 
+    return layers, prev_out
+
+
+def declare_model(batch_size=BATCH, seq_prefill=S_PREFILL, seq_decode=64,
+                  n_decode_steps=0, kv_prefill_len=None):
+    """Build compute graph for prefill, decode, or both.
+
+    Three modes:
+      - Prefill only: declare_model(batch_size=8, seq_prefill=8192)
+      - Decode only:  declare_model(batch_size=8, seq_prefill=None,
+                          seq_decode=64, n_decode_steps=4, kv_prefill_len=8192)
+      - Prefill+decode: declare_model(batch_size=8, seq_prefill=8192,
+                          seq_decode=64, n_decode_steps=4)
+
+    Args:
+        batch_size: number of independent sequences.
+        seq_prefill: prefill sequence length. None to skip prefill.
+        seq_decode: decode tokens per step (>= 64 for MoE constraint).
+        n_decode_steps: number of decode steps. 0 for prefill-only.
+        kv_prefill_len: for decode-only mode, the original prefill length
+            that generated the KV cache (needed to compute per-layer cache
+            sizes). Ignored when seq_prefill is set.
+
+    Returns:
+        (g, prefill_layers, decode_steps, emb, read_input, kv_cache_reads)
+        - prefill_layers: list[LayerMeta] (empty if seq_prefill is None)
+        - decode_steps: list[DecodeStepMeta], one per step
+        - emb: prefill Embedding kernel (None if no prefill)
+        - read_input: prefill ReadInput kernel (None if no prefill)
+        - kv_cache_reads: list[Kernel] per-layer KV cache ReadInput
+            (empty unless decode-only mode)
+    """
+    g = ComputeGraph()
+    B = batch_size
+    S_d = seq_decode
+    has_prefill = seq_prefill is not None
+    has_decode = n_decode_steps > 0
+
+    prefill_layers = []
+    decode_steps = []
+    emb = None
+    read_input = None
+    kv_cache_reads = []
+
+    # ── Prefill ──────────────────────────────────────────────────
+    if has_prefill:
+        S_p = seq_prefill
+        M_p = B * S_p
+
+        read_input = ReadInput(M_p, "int32")
+        read_input.inputs = {"tokens": Tensor("int32", (B, S_p, 1))}
+        read_input.outputs = {"tokens": Tensor("int32", (B, S_p, 1))}
+        g.add_kernel(read_input)
+
+        emb = Embedding(M_p, V, D)
+        emb.inputs = {"idx": Tensor("int32", (B, S_p, 1))}
+        emb.weights = {"emb": Tensor("bf16", (V, D))}
+        emb.outputs = {"y": Tensor("bf16", (B, S_p, D))}
+        g.add_kernel(emb)
+        g.add_data_edge(read_input, emb, {"tokens": "idx"})
+
+        prefill_layers, prefill_last = _build_layers(
+            g, B, S_p, None, emb, kv_fanout=has_decode)
+
+    # ── Decode steps ─────────────────────────────────────────────
+    if has_decode:
+        pfx_len = seq_prefill if has_prefill else kv_prefill_len
+        if pfx_len is None:
+            raise ValueError(
+                "kv_prefill_len required when seq_prefill is None")
+
+        if has_prefill:
+            decode_prev_out = prefill_last
+        else:
+            decode_prev_out = None
+
+        # For decode-only: per-layer KV cache ReadInput (from CPU/NVMe)
+        if not has_prefill:
+            for layer_id in range(N_LAYERS):
+                ratio = COMPRESS_RATIOS[layer_id]
+                cache_len = pfx_len + pfx_len // ratio
+                kv_read = ReadInput(B * cache_len * KV_DIM, "bf16")
+                kv_read.inputs = {
+                    "kv": Tensor("bf16", (B, cache_len, KV_DIM))}
+                kv_read.outputs = {
+                    "y": Tensor("bf16", (B, cache_len, KV_DIM))}
+                g.add_kernel(kv_read)
+                kv_cache_reads.append(kv_read)
+
+        for step in range(n_decode_steps):
+            ctx = (pfx_len, step * S_d)
+
+            M_d = B * S_d
+            dec_read = ReadInput(M_d, "int32")
+            dec_read.inputs = {"tokens": Tensor("int32", (B, S_d, 1))}
+            dec_read.outputs = {"tokens": Tensor("int32", (B, S_d, 1))}
+            g.add_kernel(dec_read)
+
+            dec_emb = Embedding(M_d, V, D)
+            dec_emb.inputs = {"idx": Tensor("int32", (B, S_d, 1))}
+            dec_emb.weights = {"emb": Tensor("bf16", (V, D))}
+            dec_emb.outputs = {"y": Tensor("bf16", (B, S_d, D))}
+            g.add_kernel(dec_emb)
+            g.add_data_edge(dec_read, dec_emb, {"tokens": "idx"})
+
+            if decode_prev_out is not None:
+                g.add_control_edge(decode_prev_out, dec_read)
+
+            dec_step_layers, decode_last = _build_layers(
+                g, B, S_d, ctx, dec_emb)
+
+            step_meta = DecodeStepMeta(
+                read_input=dec_read, emb=dec_emb, layers=dec_step_layers)
+            decode_steps.append(step_meta)
+            decode_prev_out = decode_last
+
+        # ── KV cache data edges (Concat chains) ──────────────────
+        for layer_id in range(N_LAYERS):
+            ratio = COMPRESS_RATIOS[layer_id]
+
+            if has_prefill:
+                prev_cache_src = prefill_layers[layer_id].kv_cache_out
+                prev_cache_out_port = "y2"
+                prev_cache_len = seq_prefill + seq_prefill // ratio
+            else:
+                prev_cache_src = kv_cache_reads[layer_id]
+                prev_cache_out_port = "y"
+                prev_cache_len = pfx_len + pfx_len // ratio
+
+            for step in range(n_decode_steps):
+                dec_L = decode_steps[step].layers[layer_id]
+                new_kv_len = S_d
+                total_kv_len = prev_cache_len + new_kv_len
+
+                kv_acc = Concat()
+                kv_acc.inputs = {
+                    "a": Tensor("bf16", (B, prev_cache_len, KV_DIM)),
+                    "b": Tensor("bf16", (B, new_kv_len, KV_DIM)),
+                }
+                kv_acc.outputs = {
+                    "y": Tensor("bf16", (B, total_kv_len, KV_DIM))}
+                g.add_kernel(kv_acc)
+                g.add_data_edge(prev_cache_src, kv_acc,
+                                {prev_cache_out_port: "a"})
+                g.add_data_edge(dec_L.kv_norm, kv_acc, {"y": "b"})
+                dec_L.kv_acc = kv_acc
+
+                if step < n_decode_steps - 1:
+                    kv_step_fan = Spawn(world=2)
+                    kv_step_fan.inputs = {
+                        "x": Tensor("bf16", (B, total_kv_len, KV_DIM))}
+                    kv_step_fan.outputs = {
+                        "y": Tensor("bf16", (B, total_kv_len, KV_DIM)),
+                        "y2": Tensor("bf16", (B, total_kv_len, KV_DIM))}
+                    g.add_kernel(kv_step_fan)
+                    g.add_data_edge(kv_acc, kv_step_fan, {"y": "x"})
+                    g.add_data_edge(kv_step_fan, dec_L.sa, {"y": "kv"})
+                    dec_L.kv_spawn = kv_step_fan
+                    prev_cache_src = kv_step_fan
+                    prev_cache_out_port = "y2"
+                else:
+                    g.add_data_edge(kv_acc, dec_L.sa, {"y": "kv"})
+
+                prev_cache_len = total_kv_len
+
     g.validate()
-    return g, layers, emb, read_input
+    return g, prefill_layers, decode_steps, emb, read_input, kv_cache_reads
 
 
 # ═══════════════════════════════════════════════════════════════════════
 # B. Optimization Phase
 # ═══════════════════════════════════════════════════════════════════════
 
-def optimize_model(g, layers, hw, emb=None, read_input=None):
+def optimize_model(g, layers, hw, emb=None, read_input=None,
+                   decode_steps=None, kv_cache_reads=None):
     """Apply split_kernel for DP, add control edges, and place."""
     gpus = sorted(
         [c for c in hw.nodes if isinstance(c, Compute)
@@ -357,7 +620,8 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
     if emb is not None:
         _, emb_copies, _ = g.split_kernel(batch_split, emb, DP)
 
-    for L in layers:
+    def _split_layer(L):
+        """Split all kernels in a LayerMeta by batch dimension."""
         _, L._bridge_copies, _ = g.split_kernel(batch_split, L.bridge, DP)
         _, L._attn_norm_copies, _ = g.split_kernel(batch_split, L.attn_norm, DP)
         _, L._attn_fan_copies, _ = g.split_kernel(batch_split, L.attn_fan, DP)
@@ -371,11 +635,18 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
         _, L._wq_b_copies, _ = g.split_kernel(batch_split, L.wq_b, DP)
         _, L._wkv_copies, _ = g.split_kernel(batch_split, L.wkv, DP)
         _, L._kv_norm_copies, _ = g.split_kernel(batch_split, L.kv_norm, DP)
-        _, L._kv_concat_copies, _ = g.split_kernel(
-            batch_split, L.kv_concat, DP)
+        if L.kv_concat is not None:
+            _, L._kv_concat_copies, _ = g.split_kernel(
+                batch_split, L.kv_concat, DP)
+        if hasattr(L, 'kv_cache_out') and L.kv_cache_out is not None:
+            _, L._kv_cache_out_copies, _ = g.split_kernel(
+                batch_split, L.kv_cache_out, DP)
         _, L._sa_copies, _ = g.split_kernel(batch_split, L.sa, DP)
         _, L._wo_a_copies, _ = g.split_kernel(batch_split, L.wo_a, DP)
         _, L._wo_b_copies, _ = g.split_kernel(batch_split, L.wo_b, DP)
+        _, L._attn_add_copies, _ = g.split_kernel(batch_split, L.attn_add, DP)
+        _, L._ffn_bridge_copies, _ = g.split_kernel(
+            batch_split, L.ffn_bridge, DP)
         _, L._ffn_norm_copies, _ = g.split_kernel(batch_split, L.ffn_norm, DP)
         _, L._ffn_fan_copies, _ = g.split_kernel(batch_split, L.ffn_fan, DP)
         _, L._gate_copies, _ = g.split_kernel(batch_split, L.gate, DP)
@@ -384,6 +655,33 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
             batch_split, L.combine, DP)
         _, L._sw_up_copies, _ = g.split_kernel(batch_split, L.sw_up, DP)
         _, L._sw_down_copies, _ = g.split_kernel(batch_split, L.sw_down, DP)
+        _, L._moe_add_copies, _ = g.split_kernel(batch_split, L.moe_add, DP)
+        _, L._ffn_add_copies, _ = g.split_kernel(batch_split, L.ffn_add, DP)
+        if L.kv_acc is not None:
+            _, L._kv_acc_copies, _ = g.split_kernel(
+                batch_split, L.kv_acc, DP)
+        if L.kv_spawn is not None:
+            _, L._kv_spawn_copies, _ = g.split_kernel(
+                batch_split, L.kv_spawn, DP)
+
+    for L in layers:
+        _split_layer(L)
+
+    # Split decode steps
+    if decode_steps:
+        for step_meta in decode_steps:
+            if step_meta.emb is not None:
+                _, step_meta._emb_copies, _ = g.split_kernel(
+                    batch_split, step_meta.emb, DP)
+            for L in step_meta.layers:
+                _split_layer(L)
+
+    # Split KV cache reads (decode-only)
+    if kv_cache_reads:
+        _kv_read_copies = []
+        for kv_read in kv_cache_reads:
+            _, copies, _ = g.split_kernel(batch_split, kv_read, DP)
+            _kv_read_copies.append(copies)
 
     # ── Placement ─────────────────────────────────────────────────
     p = Placement(hardware=hw, graph=g)
@@ -399,18 +697,30 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
         cpu_mem = hw.find_local_memory(cpu)
         p.set_tensor_memory(read_input.inputs["tokens"], cpu_mem)
 
-    for L in layers:
-        # DP copies → GPU0-7
-        for copies in [L._bridge_copies, L._attn_norm_copies,
-                       L._attn_fan_copies, L._wq_a_copies,
-                       L._q_norm_copies, L._wq_b_copies,
-                       L._wkv_copies, L._kv_norm_copies,
-                       L._kv_concat_copies, L._sa_copies,
-                       L._wo_a_copies, L._wo_b_copies,
-                       L._ffn_norm_copies, L._ffn_fan_copies,
-                       L._gate_copies, L._dispatch_copies,
-                       L._combine_copies,
-                       L._sw_up_copies, L._sw_down_copies]:
+    def _place_layer(L):
+        """Place all DP copies of a layer onto their respective GPUs."""
+        always_copies = [L._bridge_copies,
+                         L._attn_norm_copies,
+                         L._attn_fan_copies, L._wq_a_copies,
+                         L._q_norm_copies, L._wq_b_copies,
+                         L._wkv_copies, L._kv_norm_copies,
+                         L._sa_copies,
+                         L._wo_a_copies, L._wo_b_copies,
+                         L._attn_add_copies, L._ffn_bridge_copies,
+                         L._ffn_norm_copies, L._ffn_fan_copies,
+                         L._gate_copies, L._dispatch_copies,
+                         L._combine_copies,
+                         L._sw_up_copies, L._sw_down_copies,
+                         L._moe_add_copies, L._ffn_add_copies]
+        if L.kv_concat is not None:
+            always_copies.append(L._kv_concat_copies)
+        if hasattr(L, 'kv_cache_out') and L.kv_cache_out is not None:
+            always_copies.append(L._kv_cache_out_copies)
+        if L.kv_acc is not None:
+            always_copies.append(L._kv_acc_copies)
+        if L.kv_spawn is not None:
+            always_copies.append(L._kv_spawn_copies)
+        for copies in always_copies:
             for i, c in enumerate(copies):
                 p.set_kernel_device(c, gpus[i])
         if L.comp is not None:
@@ -449,6 +759,35 @@ def optimize_model(g, layers, hw, emb=None, read_input=None):
                     global_eid = gpu_id * N_LOCAL_EXPERTS + local_eid
                     p.set_tensor_memory(
                         copy.inputs[f"i{global_eid}"], local_mem)
+
+    for L in layers:
+        _place_layer(L)
+
+    # Place decode steps
+    if decode_steps:
+        cpu = [c for c in hw.nodes if isinstance(c, Compute)
+               and "intel-xeon" in c.name][0]
+        cpu_mem = hw.find_local_memory(cpu)
+        for step_meta in decode_steps:
+            if step_meta.read_input is not None:
+                p.set_kernel_device(step_meta.read_input, gpus[0])
+                p.set_tensor_memory(
+                    step_meta.read_input.inputs["tokens"], cpu_mem)
+            if step_meta.emb is not None:
+                for i, c in enumerate(step_meta._emb_copies):
+                    p.set_kernel_device(c, gpus[i])
+            for L in step_meta.layers:
+                _place_layer(L)
+
+    # Place KV cache reads (decode-only)
+    if kv_cache_reads:
+        cpu = [c for c in hw.nodes if isinstance(c, Compute)
+               and "intel-xeon" in c.name][0]
+        cpu_mem = hw.find_local_memory(cpu)
+        for layer_copies in _kv_read_copies:
+            for i, c in enumerate(layer_copies):
+                p.set_kernel_device(c, gpus[i])
+                p.set_tensor_memory(c.inputs["kv"], cpu_mem)
 
     optimize_comms(g, p)
 
@@ -528,7 +867,7 @@ def optimize_model_superchip(g, layers, hw, emb=None):
 def main():
     # A. Declaration
     hw = B300ClusterA(n_nodes=1)
-    g, layers, emb, read_input = declare_model()
+    g, layers, _, emb, read_input, _ = declare_model()
 
     visualize_layer(g, layers[0], extra_seeds={emb, read_input})
 
@@ -542,7 +881,7 @@ def main():
 
     # ── SuperChip (zero-comm) comparison ──
     hw_sc = B300SuperChipA()
-    g_sc, layers_sc, emb_sc, read_input_sc = declare_model()
+    g_sc, layers_sc, _, emb_sc, _, _ = declare_model()
 
     # B. Optimization (no splits)
     g_sc, p_sc = optimize_model_superchip(g_sc, layers_sc, hw_sc, emb_sc)

@@ -17,8 +17,8 @@ Each next_comm has n inputs ("i0".."i{n-1}") and 1 output ("y").
 
 from rooflang.language.kernels.comm import Broadcast, Gather, Reduce, Scatter
 from rooflang.language.kernels.forward import (
-    Embedding, Gemm, ReadInput, RMSNorm, SparseAttn, StridedGemm,
-    TokenCombine, TokenDispatch,
+    ElementwiseOp, Embedding, Gemm, ReadInput, RMSNorm, SparseAttn,
+    StridedGemm, TokenCombine, TokenDispatch,
 )
 from rooflang.language.kernels.identity import Concat, Spawn
 from rooflang.language.tensor import Tensor
@@ -249,6 +249,8 @@ def _make_batch_copy(kernel, n):
         c = Spawn(world=kernel.world)
     elif isinstance(kernel, Concat):
         c = Concat()
+    elif isinstance(kernel, ElementwiseOp):
+        c = ElementwiseOp(kernel.M // n, kernel.D, kernel.dtype_, kernel.op)
     else:
         raise TypeError(
             f"batch_split: unsupported kernel type {type(kernel).__name__}")
@@ -259,8 +261,7 @@ def _make_batch_copy(kernel, n):
                  for k, t in kernel.outputs.items()}
     if kernel.weights:
         if isinstance(kernel, Embedding):
-            c.weights = {"emb": Tensor(kernel.w_dtype,
-                                       (kernel.M // n, kernel.D))}
+            c.weights = {"emb": Tensor(kernel.w_dtype, (kernel.V, kernel.D))}
         else:
             c.weights = {k: Tensor(t.dtype, t.shape)
                          for k, t in kernel.weights.items()}

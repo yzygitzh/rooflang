@@ -648,7 +648,7 @@ class TestBatchSplitEmbedding:
         M, V, D = 32, 1000, 64
         self.kernel = Embedding(M, V, D)
         self.kernel.inputs = {"idx": Tensor("int32", (M,))}
-        self.kernel.weights = {"emb": Tensor("bf16", (M, D))}
+        self.kernel.weights = {"emb": Tensor("bf16", (V, D))}
         self.kernel.outputs = {"y": Tensor("bf16", (M, D))}
         self.prev, self.copies, self.nxt = batch_split(self.kernel, N)
 
@@ -668,7 +668,7 @@ class TestBatchSplitEmbedding:
 
     def test_copies_weight_shape(self):
         for c in self.copies:
-            assert c.weights["emb"].shape == (8, 64)
+            assert c.weights["emb"].shape == (1000, 64)
 
 
 class TestBatchSplitReadInput:

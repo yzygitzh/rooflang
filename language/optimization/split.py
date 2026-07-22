@@ -17,7 +17,7 @@ Each next_comm has n inputs ("i0".."i{n-1}") and 1 output ("y").
 
 from rooflang.language.kernels.comm import Broadcast, Gather, Reduce, Scatter
 from rooflang.language.kernels.forward import (
-    ElementwiseOp, Embedding, Gemm, ReadInput, RMSNorm, SparseAttn,
+    ElementwiseOp, Embedding, Gemm, ReadInput, RMSNorm, Sampling, SparseAttn,
     StridedGemm, TokenCombine, TokenDispatch,
 )
 from rooflang.language.kernels.identity import Concat, Spawn
@@ -249,6 +249,8 @@ def _make_batch_copy(kernel, n):
         c = Spawn(world=kernel.world)
     elif isinstance(kernel, Concat):
         c = Concat()
+    elif isinstance(kernel, Sampling):
+        c = Sampling(kernel.M // n, kernel.V, kernel.dtype_, kernel.out_dtype)
     elif isinstance(kernel, ElementwiseOp):
         c = ElementwiseOp(kernel.M // n, kernel.D, kernel.dtype_, kernel.op)
     else:

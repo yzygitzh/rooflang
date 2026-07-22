@@ -535,3 +535,43 @@ class ElementwiseOp(Kernel):
     @property
     def output_bytes(self) -> float:
         return 2.0 * self.M * self.D * dtype_bytes(self.grad_dtype)
+
+
+class Sampling(Kernel):
+    """Backward of sampling: fused softmax-cross-entropy gradient.
+
+    In training, argmax/sampling is replaced by cross-entropy loss on
+    logits. The backward computes dL/d_logits = softmax(logits) - one_hot.
+
+    flops = 5·M·V (exp, sum, div, sub, scale per element).
+    bytes:
+        input_bytes  = M·V · sizeof(dtype) + M · sizeof(idx_dtype)
+                       (read logits + target token IDs)
+        output_bytes = M·V · sizeof(grad_dtype)  (write dL/d_logits)
+    """
+
+    def __init__(self, M: int, V: int,
+                 dtype: str = "bf16", idx_dtype: str = "int32",
+                 grad_dtype: str = "fp32"):
+        self.M, self.V = M, V
+        self.dtype_ = dtype
+        self.idx_dtype = idx_dtype
+        self.grad_dtype = grad_dtype
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        return 5.0 * self.M * self.V
+
+    @property
+    def input_bytes(self) -> float:
+        return (self.M * self.V * dtype_bytes(self.dtype_)
+                + self.M * dtype_bytes(self.idx_dtype))
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        return self.M * self.V * dtype_bytes(self.grad_dtype)

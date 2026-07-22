@@ -3,7 +3,7 @@
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.kernels.forward import (
     ElementwiseOp, Embedding, Gemm, ReadInput, RMSNorm, LayerNorm, RoPE,
-    Attn, SparseAttn, TokenDispatch, TokenCombine,
+    Attn, SparseAttn, Sampling, TokenDispatch, TokenCombine,
 )
 from rooflang.language.kernels import backward
 from rooflang.language.kernels.comm import (
@@ -200,6 +200,15 @@ class TestElementwiseOpMul(TestKernelBase):
     expected_output_bytes = 8192 * 7168 * 2.0
 
 
+class TestSampling(TestKernelBase):
+    __test__ = True
+    kernel = Sampling(M=512, V=129280, dtype="bf16", out_dtype="int32")
+    expected_flops = 512.0 * 129280
+    expected_input_bytes = 512 * 129280 * 2.0
+    expected_weight_bytes = 0.0
+    expected_output_bytes = 512 * 4.0
+
+
 # ── Backward kernels ─────────────────────────────────────────────────
 
 
@@ -305,6 +314,15 @@ class TestBwdElementwiseOpMul(TestKernelBase):
     expected_input_bytes = 3 * 8192 * 7168 * 2.0
     expected_weight_bytes = 0.0
     expected_output_bytes = 2 * 8192 * 7168 * 4.0
+
+
+class TestBwdSampling(TestKernelBase):
+    __test__ = True
+    kernel = backward.Sampling(M=512, V=129280, dtype="bf16")
+    expected_flops = 5.0 * 512 * 129280
+    expected_input_bytes = 512 * 129280 * 2.0 + 512 * 4.0
+    expected_weight_bytes = 0.0
+    expected_output_bytes = 512 * 129280 * 4.0
 
 
 # ── Comm kernels ─────────────────────────────────────────────────────

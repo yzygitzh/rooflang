@@ -433,3 +433,35 @@ class TokenCombine(Kernel):
     @property
     def output_bytes(self) -> float:
         return self.M * self.D * dtype_bytes(self.a_dtype)
+
+
+class Sampling(Kernel):
+    """Argmax / top-p sampling: select token IDs from logits.
+
+    flops = M · V (comparisons for argmax / top-p selection).
+    bytes:
+        input_bytes  = M · V · sizeof(dtype)       (read logits)
+        output_bytes = M · sizeof(out_dtype)        (write token IDs)
+    """
+
+    def __init__(self, M: int, V: int,
+                 dtype: str = "bf16", out_dtype: str = "int32"):
+        self.M, self.V = M, V
+        self.dtype_, self.out_dtype = dtype, out_dtype
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        return float(self.M * self.V)
+
+    @property
+    def input_bytes(self) -> float:
+        return self.M * self.V * dtype_bytes(self.dtype_)
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        return self.M * dtype_bytes(self.out_dtype)

@@ -2,10 +2,12 @@
 
 from rooflang.programs.presets.b300 import B300ClusterA, B300SuperChipA
 
-from .model import declare_model
-from .optimization import optimize_model, optimize_model_superchip
-from .simulation import simulate
-from .visualization import visualize_layer
+from rooflang.programs.dsv4_pro.model import declare_model
+from rooflang.programs.dsv4_pro.optimization import (
+    optimize_model, optimize_model_superchip,
+)
+from rooflang.programs.dsv4_pro.simulation import simulate
+from rooflang.programs.dsv4_pro.visualization import visualize_layer
 
 
 def main():

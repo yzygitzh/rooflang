@@ -6,9 +6,13 @@ Three-phase structure:
   C. simulate() — DES execution + trace export
 """
 
-from .config import *  # noqa: F401,F403
-from .model import declare_model
-from .optimization import optimize_model, optimize_model_superchip
-from .simulation import simulate
-from .utils import DecodeStepMeta, LayerMeta, make_gated_up, make_gemm, make_norm
-from .visualization import visualize_layer
+from rooflang.programs.dsv4_pro.config import *  # noqa: F401,F403
+from rooflang.programs.dsv4_pro.model import (
+    DecodeStepMeta, LayerMeta, declare_model, make_gated_up, make_gemm,
+    make_norm,
+)
+from rooflang.programs.dsv4_pro.optimization import (
+    optimize_model, optimize_model_superchip,
+)
+from rooflang.programs.dsv4_pro.simulation import simulate
+from rooflang.programs.dsv4_pro.visualization import visualize_layer

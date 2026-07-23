@@ -8,7 +8,7 @@ from rooflang.language.optimization.comm import optimize_comms
 from rooflang.language.optimization.split import batch_split
 from rooflang.language.placement import Placement
 
-from .config import DP, N_LOCAL_EXPERTS
+from rooflang.programs.dsv4_pro.config import DP, N_LOCAL_EXPERTS
 
 
 def optimize_model(g, layers, hw, emb=None, read_input=None,

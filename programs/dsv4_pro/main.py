@@ -31,44 +31,44 @@ def main():
                         help="Export layer graph visualization")
     args = parser.parse_args()
 
-    if not args.prefill and not args.decode:
-        parser.error("at least one of --prefill or --decode is required")
-
     hw = HARDWARE_MAP[args.hardware]()
     is_superchip = args.hardware == "B300SuperChipA"
 
+    has_sim = args.prefill or args.decode
     seq_prefill = 8192 if args.prefill else None
     n_decode_steps = 4 if args.decode else 0
     kv_prefill_len = 8192 if (args.decode and not args.prefill) else None
 
-    # A. Declaration
-    g, layers, decode_steps, emb, read_input, kv_cache_reads, pfx_out_head = \
-        declare_model(seq_prefill=seq_prefill, n_decode_steps=n_decode_steps,
-                      kv_prefill_len=kv_prefill_len)
+    if has_sim:
+        # A. Declaration
+        g, layers, decode_steps, emb, read_input, kv_cache_reads, \
+            pfx_out_head = declare_model(
+                seq_prefill=seq_prefill, n_decode_steps=n_decode_steps,
+                kv_prefill_len=kv_prefill_len)
 
-    # B. Visualization
-    if args.visualization and layers:
-        visualize_layer(g, layers[0], extra_seeds={emb, read_input})
+        # B. Visualization
+        if args.visualization and layers:
+            visualize_layer(g, layers[0], extra_seeds={emb, read_input})
 
-    # C. Optimization
-    if is_superchip:
-        g, p = optimize_model_superchip(g, layers, hw, emb)
-    else:
-        g, p = optimize_model(g, layers, hw, emb, read_input,
-                              decode_steps, kv_cache_reads, pfx_out_head)
+        # C. Optimization
+        if is_superchip:
+            g, p = optimize_model_superchip(g, layers, hw, emb)
+        else:
+            g, p = optimize_model(g, layers, hw, emb, read_input,
+                                  decode_steps, kv_cache_reads, pfx_out_head)
 
-    # D. Simulation
-    mode = []
-    if args.prefill:
-        mode.append("prefill")
-    if args.decode:
-        mode.append("decode")
-    trace_name = f"dsv4_pro_{'_'.join(mode)}_{args.hardware}.json"
+        # D. Simulation
+        mode = []
+        if args.prefill:
+            mode.append("prefill")
+        if args.decode:
+            mode.append("decode")
+        trace_name = f"dsv4_pro_{'_'.join(mode)}_{args.hardware}.json"
 
-    result = simulate(g, p, hw, trace_name)
-    print(f"{'+'.join(mode)} ({args.hardware}): "
-          f"{result.total_time_us:.1f} us "
-          f"({result.total_time_us / 1000:.1f} ms)")
+        result = simulate(g, p, hw, trace_name)
+        print(f"{'+'.join(mode)} ({args.hardware}): "
+              f"{result.total_time_us:.1f} us "
+              f"({result.total_time_us / 1000:.1f} ms)")
 
 
 if __name__ == "__main__":

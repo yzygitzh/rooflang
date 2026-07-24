@@ -12,7 +12,7 @@ from rooflang.programs.dsv4_pro.config import DP, N_LOCAL_EXPERTS
 
 
 def optimize_model(g, layers, hw, emb=None, read_input=None,
-                   decode_steps=None, kv_cache_reads=None,
+                   decode_step=None, kv_cache_reads=None,
                    prefill_output_head=None):
     """Apply split_kernel for DP, add control edges, and place."""
     gpus = sorted(
@@ -32,6 +32,12 @@ def optimize_model(g, layers, hw, emb=None, read_input=None,
         _, L._attn_fan_copies, _ = g.split_kernel(batch_split, L.attn_fan, DP)
         if L.comp is not None:
             _, L._comp_copies, _ = g.split_kernel(batch_split, L.comp, DP)
+        if L.comp_buf is not None:
+            _, L._comp_buf_copies, _ = g.split_kernel(
+                batch_split, L.comp_buf, DP)
+        if L.comp_concat is not None:
+            _, L._comp_concat_copies, _ = g.split_kernel(
+                batch_split, L.comp_concat, DP)
         if L.comp_norm is not None:
             _, L._comp_norm_copies, _ = g.split_kernel(
                 batch_split, L.comp_norm, DP)
@@ -68,27 +74,23 @@ def optimize_model(g, layers, hw, emb=None, read_input=None,
         if L.kv_acc is not None:
             _, L._kv_acc_copies, _ = g.split_kernel(
                 batch_split, L.kv_acc, DP)
-        if L.kv_spawn is not None:
-            _, L._kv_spawn_copies, _ = g.split_kernel(
-                batch_split, L.kv_spawn, DP)
 
     for L in layers:
         _split_layer(L)
 
-    # Split decode steps
-    if decode_steps:
-        for step_meta in decode_steps:
-            if step_meta.emb is not None:
-                _, step_meta._emb_copies, _ = g.split_kernel(
-                    batch_split, step_meta.emb, DP)
-            _, step_meta._final_norm_copies, _ = g.split_kernel(
-                batch_split, step_meta.final_norm, DP)
-            _, step_meta._logits_copies, _ = g.split_kernel(
-                batch_split, step_meta.logits, DP)
-            _, step_meta._sampling_copies, _ = g.split_kernel(
-                batch_split, step_meta.sampling, DP)
-            for L in step_meta.layers:
-                _split_layer(L)
+    # Split decode step
+    if decode_step:
+        if decode_step.emb is not None:
+            _, decode_step._emb_copies, _ = g.split_kernel(
+                batch_split, decode_step.emb, DP)
+        _, decode_step._final_norm_copies, _ = g.split_kernel(
+            batch_split, decode_step.final_norm, DP)
+        _, decode_step._logits_copies, _ = g.split_kernel(
+            batch_split, decode_step.logits, DP)
+        _, decode_step._sampling_copies, _ = g.split_kernel(
+            batch_split, decode_step.sampling, DP)
+        for L in decode_step.layers:
+            _split_layer(L)
 
     # Split prefill output head
     if prefill_output_head:
@@ -141,13 +143,17 @@ def optimize_model(g, layers, hw, emb=None, read_input=None,
             always_copies.append(L._comp_norm_fan_copies)
         if L.kv_acc is not None:
             always_copies.append(L._kv_acc_copies)
-        if L.kv_spawn is not None:
-            always_copies.append(L._kv_spawn_copies)
         for copies in always_copies:
             for i, c in enumerate(copies):
                 p.set_kernel_device(c, gpus[i])
         if L.comp is not None:
             for i, c in enumerate(L._comp_copies):
+                p.set_kernel_device(c, gpus[i])
+        if L.comp_buf is not None:
+            for i, c in enumerate(L._comp_buf_copies):
+                p.set_kernel_device(c, gpus[i])
+        if L.comp_concat is not None:
+            for i, c in enumerate(L._comp_concat_copies):
                 p.set_kernel_device(c, gpus[i])
         if L.comp_norm is not None:
             for i, c in enumerate(L._comp_norm_copies):
@@ -191,27 +197,26 @@ def optimize_model(g, layers, hw, emb=None, read_input=None,
     for L in layers:
         _place_layer(L)
 
-    # Place decode steps
-    if decode_steps:
+    # Place decode step
+    if decode_step:
         cpu = [c for c in hw.nodes if isinstance(c, Compute)
                and "intel-xeon" in c.name][0]
         cpu_mem = hw.find_local_memory(cpu)
-        for step_meta in decode_steps:
-            if step_meta.read_input is not None:
-                p.set_kernel_device(step_meta.read_input, gpus[0])
-                p.set_tensor_memory(
-                    step_meta.read_input.inputs["tokens"], cpu_mem)
-            if step_meta.emb is not None:
-                for i, c in enumerate(step_meta._emb_copies):
-                    p.set_kernel_device(c, gpus[i])
-            for i, c in enumerate(step_meta._final_norm_copies):
+        if decode_step.read_input is not None:
+            p.set_kernel_device(decode_step.read_input, gpus[0])
+            p.set_tensor_memory(
+                decode_step.read_input.inputs["tokens"], cpu_mem)
+        if decode_step.emb is not None:
+            for i, c in enumerate(decode_step._emb_copies):
                 p.set_kernel_device(c, gpus[i])
-            for i, c in enumerate(step_meta._logits_copies):
-                p.set_kernel_device(c, gpus[i])
-            for i, c in enumerate(step_meta._sampling_copies):
-                p.set_kernel_device(c, gpus[i])
-            for L in step_meta.layers:
-                _place_layer(L)
+        for i, c in enumerate(decode_step._final_norm_copies):
+            p.set_kernel_device(c, gpus[i])
+        for i, c in enumerate(decode_step._logits_copies):
+            p.set_kernel_device(c, gpus[i])
+        for i, c in enumerate(decode_step._sampling_copies):
+            p.set_kernel_device(c, gpus[i])
+        for L in decode_step.layers:
+            _place_layer(L)
 
     # Place prefill output head
     if prefill_output_head:

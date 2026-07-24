@@ -154,16 +154,21 @@ def optimize_model(g, layers, hw, emb=None, read_input=None,
                 p.set_kernel_device(c, gpus[i])
 
         # Expert kernels → respective GPUs
-        for gpu_id, gpu_experts in enumerate(L.experts):
-            for k in gpu_experts:
-                p.set_kernel_device(k, gpus[gpu_id])
+        # L.experts is flat: [up0, down0, up1, down1, ...] for N_EXPERTS experts
+        # Group by GPU: expert eid → gpu_id = eid // N_LOCAL_EXPERTS
+        for eid in range(N_LOCAL_EXPERTS * DP):
+            gpu_id = eid // N_LOCAL_EXPERTS
+            up_kernel = L.experts[eid * 2]
+            down_kernel = L.experts[eid * 2 + 1]
+            p.set_kernel_device(up_kernel, gpus[gpu_id])
+            p.set_kernel_device(down_kernel, gpus[gpu_id])
 
         # Expert input locality: placed on destination GPU's HBM
-        for gpu_id, gpu_experts in enumerate(L.experts):
+        for eid in range(N_LOCAL_EXPERTS * DP):
+            gpu_id = eid // N_LOCAL_EXPERTS
             local_mem = hw.find_local_memory(gpus[gpu_id])
-            for eid in range(0, len(gpu_experts), 2):
-                up_kernel = gpu_experts[eid]
-                p.set_tensor_memory(up_kernel.inputs["x"], local_mem)
+            up_kernel = L.experts[eid * 2]
+            p.set_tensor_memory(up_kernel.inputs["x"], local_mem)
 
         # Dispatch RDMA: each copy writes expert outputs to target GPU's HBM
         for copy in L._dispatch_copies:

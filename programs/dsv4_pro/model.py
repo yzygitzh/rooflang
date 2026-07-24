@@ -17,8 +17,8 @@ from rooflang.language.tensor import Tensor
 from rooflang.language.utils import gemm_scale_bytes
 
 from rooflang.programs.dsv4_pro.config import (
-    BATCH, COMPRESS_RATIOS, D, DP, EP, H, HD, INDEX_TOPK, KV_DIM,
-    MOE_INTER, N_EXPERTS, N_LAYERS, N_LOCAL_EXPERTS, O_GROUPS, O_LORA,
+    BATCH, COMPRESS_RATIOS, D, H, HD, INDEX_TOPK, KV_DIM,
+    MOE_INTER, N_EXPERTS, N_LAYERS, O_GROUPS, O_LORA,
     Q_LORA, S_PREFILL, TOPK, V, WINDOW,
 )
 
@@ -90,7 +90,7 @@ class LayerMeta:
     sw_down: Kernel = None
     moe_add: Kernel = None
     ffn_add: Kernel = None
-    experts: List[List[Kernel]] = field(default_factory=list)
+    experts: List[Kernel] = field(default_factory=list)
     # Decode KV chain (set by declare_model after _build_layers)
     kv_acc: Kernel = None
     kv_spawn: Kernel = None
@@ -401,37 +401,32 @@ def _build_layers(g, B, S, context_len, prev_out, has_decode=False):
         g.add_kernel(combine)
         L.combine = combine
 
-        # Expert kernels per GPU (up_proj + down_proj per expert)
+        # Expert kernels (up_proj + down_proj per expert)
         L.experts = []
-        for gpu_id in range(DP):
-            gpu_experts = []
-            for eid in range(N_LOCAL_EXPERTS):
-                global_eid = gpu_id * N_LOCAL_EXPERTS + eid
-                up = StridedGemm(M_e, 2 * MOE_INTER, D, "fp4", "bf16",
-                                 out_elems=M_e * MOE_INTER)
-                up.inputs = {"x": Tensor("bf16", (M_e, D))}
-                up.weights = {"w": Tensor("fp4", (D, 2 * MOE_INTER))}
-                scale_bytes = gemm_scale_bytes(2 * MOE_INTER, D, "fp4")
-                if scale_bytes > 0:
-                    up.weights["s"] = Tensor("ue8m0", (int(scale_bytes),))
-                up.outputs = {"y": Tensor("bf16", (M_e, MOE_INTER))}
-                g.add_kernel(up)
+        for eid in range(N_EXPERTS):
+            up = StridedGemm(M_e, 2 * MOE_INTER, D, "fp4", "bf16",
+                             out_elems=M_e * MOE_INTER)
+            up.inputs = {"x": Tensor("bf16", (M_e, D))}
+            up.weights = {"w": Tensor("fp4", (D, 2 * MOE_INTER))}
+            scale_bytes = gemm_scale_bytes(2 * MOE_INTER, D, "fp4")
+            if scale_bytes > 0:
+                up.weights["s"] = Tensor("ue8m0", (int(scale_bytes),))
+            up.outputs = {"y": Tensor("bf16", (M_e, MOE_INTER))}
+            g.add_kernel(up)
 
-                down = Gemm(M_e, D, MOE_INTER, "fp4", "bf16")
-                down.inputs = {"x": Tensor("bf16", (M_e, MOE_INTER))}
-                down.weights = {"w": Tensor("fp4", (MOE_INTER, D))}
-                scale_bytes = gemm_scale_bytes(D, MOE_INTER, "fp4")
-                if scale_bytes > 0:
-                    down.weights["s"] = Tensor("ue8m0", (int(scale_bytes),))
-                down.outputs = {"y": Tensor("bf16", (M_e, D))}
-                g.add_kernel(down)
-                g.add_data_edge(up, down, {"y": "x"})
-                g.add_data_edge(dispatch, up, {f"o{global_eid}": "x"})
-                g.add_data_edge(down, combine, {"y": f"i{global_eid}"})
+            down = Gemm(M_e, D, MOE_INTER, "fp4", "bf16")
+            down.inputs = {"x": Tensor("bf16", (M_e, MOE_INTER))}
+            down.weights = {"w": Tensor("fp4", (MOE_INTER, D))}
+            scale_bytes = gemm_scale_bytes(D, MOE_INTER, "fp4")
+            if scale_bytes > 0:
+                down.weights["s"] = Tensor("ue8m0", (int(scale_bytes),))
+            down.outputs = {"y": Tensor("bf16", (M_e, D))}
+            g.add_kernel(down)
+            g.add_data_edge(up, down, {"y": "x"})
+            g.add_data_edge(dispatch, up, {f"o{eid}": "x"})
+            g.add_data_edge(down, combine, {"y": f"i{eid}"})
 
-                gpu_experts.extend([up, down])
-
-            L.experts.append(gpu_experts)
+            L.experts.extend([up, down])
 
         # Shared expert (parallel with routed — reads from ffn_fan)
         sw_up = make_gated_up(B, S, MOE_INTER, D, "fp8", "bf16")

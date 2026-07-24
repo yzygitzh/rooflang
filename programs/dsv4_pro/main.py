@@ -39,17 +39,17 @@ def main():
     n_decode_steps = 4 if args.decode else 0
     kv_prefill_len = 8192 if (args.decode and not args.prefill) else None
 
+    # A. Declaration
+    g, layers, decode_steps, emb, read_input, kv_cache_reads, \
+        pfx_out_head = declare_model(
+            seq_prefill=seq_prefill, n_decode_steps=n_decode_steps,
+            kv_prefill_len=kv_prefill_len)
+
+    # B. Visualization
+    if args.visualization and layers:
+        visualize_layer(g, layers[0], extra_seeds={emb, read_input})
+
     if has_sim:
-        # A. Declaration
-        g, layers, decode_steps, emb, read_input, kv_cache_reads, \
-            pfx_out_head = declare_model(
-                seq_prefill=seq_prefill, n_decode_steps=n_decode_steps,
-                kv_prefill_len=kv_prefill_len)
-
-        # B. Visualization
-        if args.visualization and layers:
-            visualize_layer(g, layers[0], extra_seeds={emb, read_input})
-
         # C. Optimization
         if is_superchip:
             g, p = optimize_model_superchip(g, layers, hw, emb)

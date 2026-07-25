@@ -40,7 +40,7 @@ def visualize_layer(g, layer_meta, extra_seeds=None,
     for k in g.topological_sort():
         if k in frozen:
             continue
-        if type(k).__name__ not in ("Spawn", "Concat"):
+        if type(k).__name__ not in ("Spawn", "Concat", "Slice"):
             continue
         neighbors = set(g._dag.predecessors(k)) | set(g._dag.successors(k))
         if neighbors & frozen:

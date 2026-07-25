@@ -459,7 +459,7 @@ class Simulator:
     # ── Resolution helpers ──────────────────────────────────────────
 
     def _resolve(self, kernel: Kernel):
-        if kernel._requires_placement:
+        if kernel._requires_placement or kernel in self._placement._mapping:
             a = self._placement.get_kernel_device(kernel)
             return a.device, a.stream, a.resource_cap, []
         preds = list(self._graph._dag.predecessors(kernel))

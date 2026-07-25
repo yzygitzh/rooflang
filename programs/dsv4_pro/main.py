@@ -45,8 +45,19 @@ def main():
             kv_prefill_len=kv_prefill_len)
 
     # B. Visualization
-    if args.visualization and layers:
-        visualize_layer(g, layers[0], extra_seeds={emb, read_input})
+    if args.visualization:
+        viz_layer = None
+        seeds = {emb, read_input}
+        if layers:
+            viz_layer = layers[0]
+        elif decode_step and decode_step.layers:
+            viz_layer = decode_step.layers[0]
+            seeds = {decode_step.emb, decode_step.read_input}
+            if kv_cache_reads:
+                seeds.add(kv_cache_reads[0])
+        seeds.discard(None)
+        if viz_layer:
+            visualize_layer(g, viz_layer, extra_seeds=seeds)
 
     if has_sim:
         # C. Optimization

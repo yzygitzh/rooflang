@@ -11,7 +11,7 @@ from rooflang.language.kernels.comm import (
     Scatter, Gather, Reduce, Send, Recv,
 )
 from rooflang.language.kernels.optimizer import AdamWStep
-from rooflang.language.kernels.identity import Concat, Move, Spawn
+from rooflang.language.kernels.identity import Concat, Move, Slice, Spawn
 from rooflang.language.hardware.component import Memory
 from rooflang.language.tensor import Tensor
 
@@ -543,6 +543,19 @@ class TestSpawn(TestKernelBase):
 class TestConcat(TestKernelBase):
     __test__ = True
     kernel = Concat()
+    expected_flops = 0.0
+    expected_input_bytes = 0.0
+    expected_weight_bytes = 0.0
+    expected_output_bytes = 0.0
+    expected_transferred_bytes = 0.0
+
+    def test_requires_placement_false(self):
+        assert self.kernel._requires_placement is False
+
+
+class TestSlice(TestKernelBase):
+    __test__ = True
+    kernel = Slice()
     expected_flops = 0.0
     expected_input_bytes = 0.0
     expected_weight_bytes = 0.0

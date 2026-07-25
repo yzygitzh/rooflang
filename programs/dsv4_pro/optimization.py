@@ -256,7 +256,7 @@ def optimize_model(g, layers, hw, emb=None, read_input=None,
     return g, p
 
 
-def optimize_model_superchip(g, layers, hw, emb=None):
+def optimize_model_superchip(g, hw):
     """Place all kernels on the single fused GPU (no splits, no comms)."""
     gpu = [c for c in hw.nodes if isinstance(c, Compute)
            and "nvidia-b300" in c.name][0]

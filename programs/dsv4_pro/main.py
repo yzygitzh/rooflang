@@ -51,7 +51,7 @@ def main():
     if has_sim:
         # C. Optimization
         if is_superchip:
-            g, p = optimize_model_superchip(g, layers, hw, emb)
+            g, p = optimize_model_superchip(g, hw)
         else:
             g, p = optimize_model(g, layers, hw, emb, read_input,
                                   decode_step, kv_cache_reads, pfx_out_head)

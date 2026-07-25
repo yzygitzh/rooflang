@@ -11,7 +11,7 @@ from rooflang.language.kernels.forward import (
     ElementwiseOp, Embedding, Gemm, ReadInput, RMSNorm, Sampling,
     SparseAttn, StridedGemm, TokenCombine, TokenDispatch,
 )
-from rooflang.language.kernels.identity import Concat, Spawn
+from rooflang.language.kernels.identity import Concat, Slice, Spawn
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.tensor import Tensor
 from rooflang.language.utils import gemm_scale_bytes
@@ -94,6 +94,9 @@ class LayerMeta:
     ffn_add: Kernel = None
     experts: List[Kernel] = field(default_factory=list)
     # Decode KV chain (set by declare_model after _build_layers)
+    kv_win_slice: Kernel = None
+    kv_cache_fan: Kernel = None
+    kv_comp_slice: Kernel = None
     kv_acc: Kernel = None
 
 
@@ -556,7 +559,7 @@ def declare_model(batch_size=BATCH, seq_prefill=S_PREFILL,
         if not has_prefill:
             for layer_id in range(N_LAYERS):
                 ratio = COMPRESS_RATIOS[layer_id]
-                cache_len = WINDOW + pfx_len // ratio
+                cache_len = min(WINDOW, pfx_len) + pfx_len // ratio
                 kv_read = ReadInput(B * cache_len * KV_DIM, "bf16")
                 kv_read.inputs = {
                     "kv": Tensor("bf16", (B, cache_len, KV_DIM))}
@@ -569,7 +572,7 @@ def declare_model(batch_size=BATCH, seq_prefill=S_PREFILL,
         prefill_output_head = []  # [slice, norm, logits, sampling]
         if has_prefill:
             S_p = seq_prefill
-            pfx_slice = Concat()
+            pfx_slice = Slice()
             pfx_slice.inputs = {"x": Tensor("bf16", (B, S_p, D))}
             pfx_slice.outputs = {"y": Tensor("bf16", (B, 1, D))}
             g.add_kernel(pfx_slice)
@@ -631,9 +634,9 @@ def declare_model(batch_size=BATCH, seq_prefill=S_PREFILL,
             layers=dec_layers)
 
         # ── KV cache data edges (window + compressed) ────────────────
-        # KV cache = sliding window + all compressed tokens.
-        # When compression fires, the new compressed token from comp_norm
-        # is included in the KV input to attention.
+        # Attention reads: sliding window (last WINDOW tokens) + compressed.
+        # The decode step adds one new KV token to the window (evicting the
+        # oldest if full) and possibly one new compressed token.
         for layer_id in range(N_LAYERS):
             ratio = COMPRESS_RATIOS[layer_id]
             dec_L = decode_step.layers[layer_id]
@@ -642,15 +645,31 @@ def declare_model(batch_size=BATCH, seq_prefill=S_PREFILL,
             total_compressed = (pfx_len + 1) // ratio
             S_kv = min(WINDOW, pfx_len + 1) + total_compressed
 
-            kv_acc = Concat()
+            # Window tokens to keep from previous context (before new token)
+            win_keep = min(WINDOW - 1, pfx_len)
+
             if has_prefill:
                 pfx_L = prefill_layers[layer_id]
                 S_p = seq_prefill
+
+                # Slice prefill KV to extract sliding window portion
+                kv_win_slice = Slice()
+                kv_win_slice.inputs = {
+                    "x": Tensor("bf16", (B, S_p, KV_DIM))}
+                kv_win_slice.outputs = {
+                    "y": Tensor("bf16", (B, win_keep, KV_DIM))}
+                g.add_kernel(kv_win_slice)
+                g.add_data_edge(pfx_L.kv_norm_fan, kv_win_slice,
+                                {"y2": "x"})
+                dec_L.kv_win_slice = kv_win_slice
+
+                # Concat: window + new KV + compressed (+ maybe new comp)
+                kv_acc = Concat()
                 inputs = {
-                    "pfx_kv": Tensor("bf16", (B, S_p, KV_DIM)),
-                    "pfx_comp": Tensor("bf16",
-                                       (B, S_p // ratio, KV_DIM)),
+                    "window": Tensor("bf16", (B, win_keep, KV_DIM)),
                     "kv": Tensor("bf16", (B, 1, KV_DIM)),
+                    "comp_cache": Tensor("bf16",
+                                         (B, S_p // ratio, KV_DIM)),
                 }
                 if has_comp:
                     inputs["comp"] = Tensor("bf16", (B, 1, KV_DIM))
@@ -658,19 +677,58 @@ def declare_model(batch_size=BATCH, seq_prefill=S_PREFILL,
                 kv_acc.outputs = {
                     "y": Tensor("bf16", (B, S_kv, KV_DIM))}
                 g.add_kernel(kv_acc)
-                g.add_data_edge(pfx_L.kv_norm_fan, kv_acc,
-                                {"y2": "pfx_kv"})
-                g.add_data_edge(pfx_L.comp_norm_fan, kv_acc,
-                                {"y2": "pfx_comp"})
+                g.add_data_edge(kv_win_slice, kv_acc, {"y": "window"})
                 g.add_data_edge(dec_L.kv_norm, kv_acc, {"y": "kv"})
+                g.add_data_edge(pfx_L.comp_norm_fan, kv_acc,
+                                {"y2": "comp_cache"})
                 if has_comp:
                     g.add_data_edge(dec_L.comp_norm, kv_acc,
                                     {"y": "comp"})
             else:
-                cache_len = WINDOW + pfx_len // ratio
+                # Decode-only: split cache read into window + compressed
+                cache_len = min(WINDOW, pfx_len) + pfx_len // ratio
+                win_len = min(WINDOW, pfx_len)
+                comp_len = pfx_len // ratio
+
+                kv_cache_fan = Spawn(world=2)
+                kv_cache_fan.inputs = {
+                    "x": Tensor("bf16", (B, cache_len, KV_DIM))}
+                kv_cache_fan.outputs = {
+                    "y": Tensor("bf16", (B, cache_len, KV_DIM)),
+                    "y2": Tensor("bf16", (B, cache_len, KV_DIM))}
+                g.add_kernel(kv_cache_fan)
+                g.add_data_edge(kv_cache_reads[layer_id], kv_cache_fan,
+                                {"y": "x"})
+                dec_L.kv_cache_fan = kv_cache_fan
+
+                # Slice window portion (evict oldest if full)
+                kv_win_slice = Slice()
+                kv_win_slice.inputs = {
+                    "x": Tensor("bf16", (B, cache_len, KV_DIM))}
+                kv_win_slice.outputs = {
+                    "y": Tensor("bf16", (B, win_keep, KV_DIM))}
+                g.add_kernel(kv_win_slice)
+                g.add_data_edge(kv_cache_fan, kv_win_slice, {"y": "x"})
+                dec_L.kv_win_slice = kv_win_slice
+
+                # Slice compressed portion
+                kv_comp_slice = Slice()
+                kv_comp_slice.inputs = {
+                    "x": Tensor("bf16", (B, cache_len, KV_DIM))}
+                kv_comp_slice.outputs = {
+                    "y": Tensor("bf16", (B, comp_len, KV_DIM))}
+                g.add_kernel(kv_comp_slice)
+                g.add_data_edge(kv_cache_fan, kv_comp_slice,
+                                {"y2": "x"})
+                dec_L.kv_comp_slice = kv_comp_slice
+
+                # Concat: window + new KV + compressed (+ maybe new comp)
+                kv_acc = Concat()
                 inputs = {
-                    "a": Tensor("bf16", (B, cache_len, KV_DIM)),
-                    "b": Tensor("bf16", (B, 1, KV_DIM)),
+                    "window": Tensor("bf16", (B, win_keep, KV_DIM)),
+                    "kv": Tensor("bf16", (B, 1, KV_DIM)),
+                    "comp_cache": Tensor("bf16",
+                                         (B, comp_len, KV_DIM)),
                 }
                 if has_comp:
                     inputs["comp"] = Tensor("bf16", (B, 1, KV_DIM))
@@ -678,9 +736,10 @@ def declare_model(batch_size=BATCH, seq_prefill=S_PREFILL,
                 kv_acc.outputs = {
                     "y": Tensor("bf16", (B, S_kv, KV_DIM))}
                 g.add_kernel(kv_acc)
-                g.add_data_edge(kv_cache_reads[layer_id], kv_acc,
-                                {"y": "a"})
-                g.add_data_edge(dec_L.kv_norm, kv_acc, {"y": "b"})
+                g.add_data_edge(kv_win_slice, kv_acc, {"y": "window"})
+                g.add_data_edge(dec_L.kv_norm, kv_acc, {"y": "kv"})
+                g.add_data_edge(kv_comp_slice, kv_acc,
+                                {"y": "comp_cache"})
                 if has_comp:
                     g.add_data_edge(dec_L.comp_norm, kv_acc,
                                     {"y": "comp"})

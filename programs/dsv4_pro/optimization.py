@@ -74,6 +74,15 @@ def optimize_model(g, layers, hw, emb=None, read_input=None,
         if L.kv_acc is not None:
             _, L._kv_acc_copies, _ = g.split_kernel(
                 batch_split, L.kv_acc, DP)
+        if L.kv_win_slice is not None:
+            _, L._kv_win_slice_copies, _ = g.split_kernel(
+                batch_split, L.kv_win_slice, DP)
+        if L.kv_cache_fan is not None:
+            _, L._kv_cache_fan_copies, _ = g.split_kernel(
+                batch_split, L.kv_cache_fan, DP)
+        if L.kv_comp_slice is not None:
+            _, L._kv_comp_slice_copies, _ = g.split_kernel(
+                batch_split, L.kv_comp_slice, DP)
 
     for L in layers:
         _split_layer(L)
@@ -143,6 +152,12 @@ def optimize_model(g, layers, hw, emb=None, read_input=None,
             always_copies.append(L._comp_norm_fan_copies)
         if L.kv_acc is not None:
             always_copies.append(L._kv_acc_copies)
+        if L.kv_win_slice is not None:
+            always_copies.append(L._kv_win_slice_copies)
+        if L.kv_cache_fan is not None:
+            always_copies.append(L._kv_cache_fan_copies)
+        if L.kv_comp_slice is not None:
+            always_copies.append(L._kv_comp_slice_copies)
         for copies in always_copies:
             for i, c in enumerate(copies):
                 p.set_kernel_device(c, gpus[i])

@@ -79,6 +79,40 @@ class Concat(Kernel):
         return 0.0
 
 
+class Slice(Kernel):
+    """Subsequence selection placeholder with zero cost.
+
+    Represents taking a contiguous slice of a tensor along one dimension
+    (e.g., last WINDOW tokens from a KV cache, or last position from a
+    sequence). Zero compute — just models the data dependency.
+    """
+
+    _requires_placement = False
+
+    def __init__(self):
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        return 0.0
+
+    @property
+    def transferred_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def input_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        return 0.0
+
+
 class Move(Kernel):
     """Move a tensor to a different memory location.
 

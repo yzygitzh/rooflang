@@ -10,9 +10,11 @@ from rooflang.language.utils import dtype_bytes
 class Tensor:
     """Descriptor for a tensor slot (input, weight, or output)."""
 
-    def __init__(self, dtype: str, shape: Tuple[int, ...]) -> None:
+    def __init__(self, dtype: str, shape: Tuple[int, ...],
+                 weight_id: str = None) -> None:
         self.dtype = dtype
         self.shape = shape
+        self.weight_id = weight_id
 
     @property
     def n_elements(self) -> int:

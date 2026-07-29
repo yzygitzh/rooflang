@@ -20,7 +20,7 @@ from rooflang.language.kernels.forward import (
     ElementwiseOp, Embedding, Gemm, ReadInput, RMSNorm, Sampling, SparseAttn,
     StridedGemm, TokenCombine, TokenDispatch,
 )
-from rooflang.language.kernels.identity import Concat, Spawn
+from rooflang.language.kernels.identity import Concat, Slice, Spawn
 from rooflang.language.tensor import Tensor
 from rooflang.language.utils import dtype_bytes, gemm_scale_bytes
 
@@ -80,6 +80,14 @@ def _make_reduce(tensor, n, dtype="bf16"):
 # ── column_split / row_split / head_split ──────────────────────────────
 
 
+def _propagate_weight_id(orig_weights, copy_weights, shard_idx, split_type):
+    """Propagate weight_id with shard tag for TP splits."""
+    for port, t in copy_weights.items():
+        orig = orig_weights.get(port)
+        if orig is not None and orig.weight_id is not None:
+            t.weight_id = f"{orig.weight_id}/{split_type}:{shard_idx}"
+
+
 def column_split(kernel, n):
     """Non-contracting output dim (N): Broadcast → Kernels → Gather.
 
@@ -96,7 +104,7 @@ def column_split(kernel, n):
     if isinstance(kernel, StridedGemm):
         shard_out_elems = kernel._out_elems // n
         shard_out_shape = _shard_shape(out_tensor.shape, n, dim=-1)
-        for _ in range(n):
+        for i in range(n):
             c = StridedGemm(kernel.M, shard_n, kernel.K, kernel.w_dtype,
                             kernel.a_dtype, kernel.out_dtype,
                             in_elems=kernel._in_elems, out_elems=shard_out_elems)
@@ -105,11 +113,12 @@ def column_split(kernel, n):
             scale_bytes = gemm_scale_bytes(shard_n, kernel.K, kernel.w_dtype)
             if scale_bytes > 0:
                 c.weights["s"] = Tensor("ue8m0", (int(scale_bytes),))
+            _propagate_weight_id(kernel.weights, c.weights, i, "col")
             c.outputs = {"y": Tensor(kernel.out_dtype, shard_out_shape)}
             copies.append(c)
     else:
         shard_out_shape = _shard_shape(out_tensor.shape, n, dim=-1)
-        for _ in range(n):
+        for i in range(n):
             c = Gemm(kernel.M, shard_n, kernel.K, kernel.w_dtype,
                      kernel.a_dtype, kernel.out_dtype)
             c.inputs = {"x": Tensor(in_tensor.dtype, in_tensor.shape)}
@@ -117,6 +126,7 @@ def column_split(kernel, n):
             scale_bytes = gemm_scale_bytes(shard_n, kernel.K, kernel.w_dtype)
             if scale_bytes > 0:
                 c.weights["s"] = Tensor("ue8m0", (int(scale_bytes),))
+            _propagate_weight_id(kernel.weights, c.weights, i, "col")
             c.outputs = {"y": Tensor(kernel.out_dtype, shard_out_shape)}
             copies.append(c)
 
@@ -140,7 +150,7 @@ def row_split(kernel, n):
 
     copies = []
     if isinstance(kernel, StridedGemm):
-        for _ in range(n):
+        for i in range(n):
             c = StridedGemm(kernel.M, kernel.N, shard_k, kernel.w_dtype,
                             kernel.a_dtype, kernel.out_dtype,
                             in_elems=kernel._in_elems // n,
@@ -150,10 +160,11 @@ def row_split(kernel, n):
             scale_bytes = gemm_scale_bytes(kernel.N, shard_k, kernel.w_dtype)
             if scale_bytes > 0:
                 c.weights["s"] = Tensor("ue8m0", (int(scale_bytes),))
+            _propagate_weight_id(kernel.weights, c.weights, i, "row")
             c.outputs = {"y": Tensor(out_tensor.dtype, out_tensor.shape)}
             copies.append(c)
     else:
-        for _ in range(n):
+        for i in range(n):
             c = Gemm(kernel.M, kernel.N, shard_k, kernel.w_dtype,
                      kernel.a_dtype, kernel.out_dtype)
             c.inputs = {"x": Tensor(in_tensor.dtype, shard_in_shape)}
@@ -161,6 +172,7 @@ def row_split(kernel, n):
             scale_bytes = gemm_scale_bytes(kernel.N, shard_k, kernel.w_dtype)
             if scale_bytes > 0:
                 c.weights["s"] = Tensor("ue8m0", (int(scale_bytes),))
+            _propagate_weight_id(kernel.weights, c.weights, i, "row")
             c.outputs = {"y": Tensor(out_tensor.dtype, out_tensor.shape)}
             copies.append(c)
 
@@ -249,6 +261,8 @@ def _make_batch_copy(kernel, n):
         c = Spawn(world=kernel.world)
     elif isinstance(kernel, Concat):
         c = Concat()
+    elif isinstance(kernel, Slice):
+        c = Slice()
     elif isinstance(kernel, Sampling):
         c = Sampling(kernel.M // n, kernel.V, kernel.dtype_, kernel.out_dtype)
     elif isinstance(kernel, ElementwiseOp):
@@ -263,8 +277,9 @@ def _make_batch_copy(kernel, n):
                  for k, t in kernel.outputs.items()}
     if kernel.weights:
         if isinstance(kernel, Embedding):
-            c.weights = {"emb": Tensor(kernel.w_dtype, (kernel.V, kernel.D))}
+            c.weights = {"emb": Tensor(kernel.w_dtype, (kernel.V, kernel.D),
+                                       weight_id=kernel.weights["emb"].weight_id)}
         else:
-            c.weights = {k: Tensor(t.dtype, t.shape)
+            c.weights = {k: Tensor(t.dtype, t.shape, weight_id=t.weight_id)
                          for k, t in kernel.weights.items()}
     return c

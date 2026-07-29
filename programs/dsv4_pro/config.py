@@ -17,6 +17,6 @@ DP = 8
 EP = 8
 N_LOCAL_EXPERTS = N_EXPERTS // EP
 V = 129280
-BATCH = 64
+BATCH = 512
 S_PREFILL = 8192
 COMPRESS_RATIOS = [128, 128] + [v for _ in range(29) for v in (4, 128)] + [4]

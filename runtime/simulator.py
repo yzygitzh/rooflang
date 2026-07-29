@@ -188,12 +188,19 @@ class Simulator:
                     for real_t in self._passthrough.get(t, [t]):
                         self._out_refcount[real_t] += 1
 
+        _seen_wid = set()
         for kernel in self._graph.kernels:
             for t in kernel.weights.values():
                 mem = self._placement.get_tensor_memory(t)
-                if mem is not None:
-                    self._mem_usage[mem] += t.size_bytes
-                    self._alive[mem].add((t, "weight"))
+                if mem is None:
+                    continue
+                if t.weight_id is not None:
+                    key = (id(mem), t.weight_id)
+                    if key in _seen_wid:
+                        continue
+                    _seen_wid.add(key)
+                self._mem_usage[mem] += t.size_bytes
+                self._alive[mem].add((t, "weight"))
             is_root = not list(self._graph._dag.predecessors(kernel))
             if is_root:
                 inputs_for_kernel = []

@@ -12,7 +12,7 @@ from rooflang.programs.dsv4_pro.config import DP, N_LOCAL_EXPERTS
 
 
 def optimize_model(g, layers, hw, emb=None, read_input=None,
-                   decode_step=None, kv_cache_reads=None,
+                   decode_steps=None, kv_cache_reads=None,
                    prefill_output_head=None):
     """Apply split_kernel for DP, add control edges, and place."""
     gpus = sorted(
@@ -83,23 +83,27 @@ def optimize_model(g, layers, hw, emb=None, read_input=None,
         if L.kv_comp_slice is not None:
             _, L._kv_comp_slice_copies, _ = g.split_kernel(
                 batch_split, L.kv_comp_slice, DP)
+        if L.kv_acc_fan is not None:
+            _, L._kv_acc_fan_copies, _ = g.split_kernel(
+                batch_split, L.kv_acc_fan, DP)
 
     for L in layers:
         _split_layer(L)
 
-    # Split decode step
-    if decode_step:
-        if decode_step.emb is not None:
-            _, decode_step._emb_copies, _ = g.split_kernel(
-                batch_split, decode_step.emb, DP)
-        _, decode_step._final_norm_copies, _ = g.split_kernel(
-            batch_split, decode_step.final_norm, DP)
-        _, decode_step._logits_copies, _ = g.split_kernel(
-            batch_split, decode_step.logits, DP)
-        _, decode_step._sampling_copies, _ = g.split_kernel(
-            batch_split, decode_step.sampling, DP)
-        for L in decode_step.layers:
-            _split_layer(L)
+    # Split decode steps
+    if decode_steps:
+        for decode_step in decode_steps:
+            if decode_step.emb is not None:
+                _, decode_step._emb_copies, _ = g.split_kernel(
+                    batch_split, decode_step.emb, DP)
+            _, decode_step._final_norm_copies, _ = g.split_kernel(
+                batch_split, decode_step.final_norm, DP)
+            _, decode_step._logits_copies, _ = g.split_kernel(
+                batch_split, decode_step.logits, DP)
+            _, decode_step._sampling_copies, _ = g.split_kernel(
+                batch_split, decode_step.sampling, DP)
+            for L in decode_step.layers:
+                _split_layer(L)
 
     # Split prefill output head
     if prefill_output_head:
@@ -158,6 +162,8 @@ def optimize_model(g, layers, hw, emb=None, read_input=None,
             always_copies.append(L._kv_cache_fan_copies)
         if L.kv_comp_slice is not None:
             always_copies.append(L._kv_comp_slice_copies)
+        if L.kv_acc_fan is not None:
+            always_copies.append(L._kv_acc_fan_copies)
         for copies in always_copies:
             for i, c in enumerate(copies):
                 p.set_kernel_device(c, gpus[i])
@@ -212,26 +218,27 @@ def optimize_model(g, layers, hw, emb=None, read_input=None,
     for L in layers:
         _place_layer(L)
 
-    # Place decode step
-    if decode_step:
+    # Place decode steps
+    if decode_steps:
         cpu = [c for c in hw.nodes if isinstance(c, Compute)
                and "intel-xeon" in c.name][0]
         cpu_mem = hw.find_local_memory(cpu)
-        if decode_step.read_input is not None:
-            p.set_kernel_device(decode_step.read_input, gpus[0])
-            p.set_tensor_memory(
-                decode_step.read_input.inputs["tokens"], cpu_mem)
-        if decode_step.emb is not None:
-            for i, c in enumerate(decode_step._emb_copies):
+        for decode_step in decode_steps:
+            if decode_step.read_input is not None:
+                p.set_kernel_device(decode_step.read_input, gpus[0])
+                p.set_tensor_memory(
+                    decode_step.read_input.inputs["tokens"], cpu_mem)
+            if decode_step.emb is not None:
+                for i, c in enumerate(decode_step._emb_copies):
+                    p.set_kernel_device(c, gpus[i])
+            for i, c in enumerate(decode_step._final_norm_copies):
                 p.set_kernel_device(c, gpus[i])
-        for i, c in enumerate(decode_step._final_norm_copies):
-            p.set_kernel_device(c, gpus[i])
-        for i, c in enumerate(decode_step._logits_copies):
-            p.set_kernel_device(c, gpus[i])
-        for i, c in enumerate(decode_step._sampling_copies):
-            p.set_kernel_device(c, gpus[i])
-        for L in decode_step.layers:
-            _place_layer(L)
+            for i, c in enumerate(decode_step._logits_copies):
+                p.set_kernel_device(c, gpus[i])
+            for i, c in enumerate(decode_step._sampling_copies):
+                p.set_kernel_device(c, gpus[i])
+            for L in decode_step.layers:
+                _place_layer(L)
 
     # Place prefill output head
     if prefill_output_head:

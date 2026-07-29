@@ -881,3 +881,67 @@ class TestBatchSplitGraphIntegration:
         k.outputs = {"y": Tensor("bf16", (32, 64))}
         with pytest.raises(TypeError, match="unsupported kernel type"):
             batch_split(k, N)
+
+
+# ── weight_id propagation tests ────────────────────────────────────────
+
+
+class TestWeightIdBatchSplit:
+    """batch_split preserves weight_id unchanged (DP = replicate)."""
+
+    def test_gemm_weight_id_preserved(self):
+        k = Gemm(32, 64, 128, "fp8", "bf16")
+        k.inputs = {"x": Tensor("bf16", (32, 128))}
+        k.weights = {"w": Tensor("fp8", (128, 64),
+                                 weight_id="L0_wq_a_w")}
+        k.outputs = {"y": Tensor("bf16", (32, 64))}
+        _, copies, _ = batch_split(k, N)
+        for c in copies:
+            assert c.weights["w"].weight_id == "L0_wq_a_w"
+
+    def test_embedding_weight_id_preserved(self):
+        k = Embedding(32, 1000, 64)
+        k.inputs = {"idx": Tensor("int32", (32,))}
+        k.weights = {"emb": Tensor("bf16", (1000, 64),
+                                   weight_id="L-1_emb_emb")}
+        k.outputs = {"y": Tensor("bf16", (32, 64))}
+        _, copies, _ = batch_split(k, N)
+        for c in copies:
+            assert c.weights["emb"].weight_id == "L-1_emb_emb"
+
+
+class TestWeightIdColumnSplit:
+    """column_split appends /col:{i} shard tag."""
+
+    def test_gemm_col_tag(self):
+        k = Gemm(32, 64, 128, "fp8", "bf16")
+        k.inputs = {"x": Tensor("bf16", (32, 128))}
+        k.weights = {"w": Tensor("fp8", (128, 64),
+                                 weight_id="L0_wq_b_w")}
+        k.outputs = {"y": Tensor("bf16", (32, 64))}
+        _, copies, _ = column_split(k, N)
+        for i, c in enumerate(copies):
+            assert c.weights["w"].weight_id == f"L0_wq_b_w/col:{i}"
+
+    def test_no_weight_id_stays_none(self):
+        k = Gemm(32, 64, 128, "fp8", "bf16")
+        k.inputs = {"x": Tensor("bf16", (32, 128))}
+        k.weights = {"w": Tensor("fp8", (128, 64))}
+        k.outputs = {"y": Tensor("bf16", (32, 64))}
+        _, copies, _ = column_split(k, N)
+        for c in copies:
+            assert c.weights["w"].weight_id is None
+
+
+class TestWeightIdRowSplit:
+    """row_split appends /row:{i} shard tag."""
+
+    def test_gemm_row_tag(self):
+        k = Gemm(32, 64, 128, "fp8", "bf16")
+        k.inputs = {"x": Tensor("bf16", (32, 128))}
+        k.weights = {"w": Tensor("fp8", (128, 64),
+                                 weight_id="L0_wo_b_w")}
+        k.outputs = {"y": Tensor("bf16", (32, 64))}
+        _, copies, _ = row_split(k, N)
+        for i, c in enumerate(copies):
+            assert c.weights["w"].weight_id == f"L0_wo_b_w/row:{i}"

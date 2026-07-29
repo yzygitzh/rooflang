@@ -27,6 +27,8 @@ def main():
                         help="Run prefill phase")
     parser.add_argument("--decode", action="store_true",
                         help="Run decode phase")
+    parser.add_argument("--n-decode-steps", type=int, default=1,
+                        help="Number of decode steps to unroll (default 1)")
     parser.add_argument("--visualization", action="store_true",
                         help="Export layer graph visualization")
     args = parser.parse_args()
@@ -39,10 +41,11 @@ def main():
     kv_prefill_len = 8192 if (args.decode and not args.prefill) else None
 
     # A. Declaration
-    g, layers, decode_step, emb, read_input, kv_cache_reads, \
+    g, layers, decode_steps, emb, read_input, kv_cache_reads, \
         pfx_out_head = declare_model(
             seq_prefill=seq_prefill, decode=args.decode,
-            kv_prefill_len=kv_prefill_len)
+            kv_prefill_len=kv_prefill_len,
+            n_decode_steps=args.n_decode_steps)
 
     # B. Visualization
     if args.visualization:
@@ -50,9 +53,9 @@ def main():
         seeds = {emb, read_input}
         if layers:
             viz_layer = layers[0]
-        elif decode_step and decode_step.layers:
-            viz_layer = decode_step.layers[0]
-            seeds = {decode_step.emb, decode_step.read_input}
+        elif decode_steps and decode_steps[0].layers:
+            viz_layer = decode_steps[0].layers[0]
+            seeds = {decode_steps[0].emb, decode_steps[0].read_input}
             if kv_cache_reads:
                 seeds.add(kv_cache_reads[0])
         seeds.discard(None)
@@ -65,7 +68,7 @@ def main():
             g, p = optimize_model_superchip(g, hw)
         else:
             g, p = optimize_model(g, layers, hw, emb, read_input,
-                                  decode_step, kv_cache_reads, pfx_out_head)
+                                  decode_steps, kv_cache_reads, pfx_out_head)
 
         # D. Simulation
         mode = []

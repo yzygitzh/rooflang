@@ -234,15 +234,15 @@ def _build_layers(g, B, S, context_len, prev_out, has_decode=False):
                 g.add_data_edge(comp, comp_norm, {"y": "x"})
                 L.comp_norm = comp_norm
 
-            # Sparse attention (prefill: S_kv = S + S//ratio)
+            # Sparse attention (prefill: S_kv = WINDOW + S//ratio)
             k_sel = WINDOW
             if ratio == 128:
                 k_sel = WINDOW + S // 128
             elif ratio == 4:
                 k_sel = WINDOW + INDEX_TOPK
 
-            S_kv = S + S // ratio
             S_comp = S // ratio
+            S_kv = WINDOW + S_comp
             sa = SparseAttn(B, H, 1, S, k_sel, S_kv, HD, "bf16", kv_factor=1)
             sa.inputs = {"q": Tensor("bf16", (B, S, H * HD)),
                          "kv": Tensor("bf16", (B, S_kv, KV_DIM))}
@@ -250,22 +250,32 @@ def _build_layers(g, B, S, context_len, prev_out, has_decode=False):
             g.add_kernel(sa)
             g.add_data_edge(wq_b, sa, {"y": "q"})
 
+            # Window slice: extract last WINDOW tokens from full KV
+            kv_win_slice = Slice()
+            kv_win_slice.inputs = {
+                "x": Tensor("bf16", (B, S, KV_DIM))}
+            kv_win_slice.outputs = {
+                "y": Tensor("bf16", (B, WINDOW, KV_DIM))}
+            g.add_kernel(kv_win_slice)
+            g.add_data_edge(kv_norm, kv_win_slice, {"y": "x"})
+
             # KV cache = concat(window_kv, compressed_kv)
             kv_concat = Concat()
-            kv_concat.inputs = {"a": Tensor("bf16", (B, S, KV_DIM)),
+            kv_concat.inputs = {"a": Tensor("bf16", (B, WINDOW, KV_DIM)),
                                 "b": Tensor("bf16", (B, S_comp, KV_DIM))}
             kv_concat.outputs = {"y": Tensor("bf16", (B, S_kv, KV_DIM))}
             g.add_kernel(kv_concat)
 
             if has_decode:
-                # Fan-out kv_norm and comp_norm: y→kv_concat, y2→decode
+                # Fan window: y→kv_concat (prefill SA), y2→decode
                 kv_norm_fan = Spawn(world=2)
-                kv_norm_fan.inputs = {"x": Tensor("bf16", (B, S, KV_DIM))}
+                kv_norm_fan.inputs = {
+                    "x": Tensor("bf16", (B, WINDOW, KV_DIM))}
                 kv_norm_fan.outputs = {
-                    "y": Tensor("bf16", (B, S, KV_DIM)),
-                    "y2": Tensor("bf16", (B, S, KV_DIM))}
+                    "y": Tensor("bf16", (B, WINDOW, KV_DIM)),
+                    "y2": Tensor("bf16", (B, WINDOW, KV_DIM))}
                 g.add_kernel(kv_norm_fan)
-                g.add_data_edge(kv_norm, kv_norm_fan, {"y": "x"})
+                g.add_data_edge(kv_win_slice, kv_norm_fan, {"y": "x"})
                 g.add_data_edge(kv_norm_fan, kv_concat, {"y": "a"})
                 L.kv_norm_fan = kv_norm_fan
 
@@ -280,11 +290,12 @@ def _build_layers(g, B, S, context_len, prev_out, has_decode=False):
                 g.add_data_edge(comp_norm_fan, kv_concat, {"y": "b"})
                 L.comp_norm_fan = comp_norm_fan
             else:
-                g.add_data_edge(kv_norm, kv_concat, {"y": "a"})
+                g.add_data_edge(kv_win_slice, kv_concat, {"y": "a"})
                 g.add_data_edge(comp_norm, kv_concat, {"y": "b"})
 
             g.add_data_edge(kv_concat, sa, {"y": "kv"})
 
+            L.kv_win_slice = kv_win_slice
             L.kv_concat = kv_concat
         else:
             # Decode: window + compressed KV cache
@@ -591,13 +602,13 @@ def _build_decode_steps(g, B, pfx_len, n_steps, prefill_layers=None,
             win_keep = min(WINDOW - 1, context_len)
 
             if step_idx == 0 and has_prefill:
-                # Step 0 prefill+decode: KV from prefill fan-out
+                # Step 0 prefill+decode: KV from prefill window fan-out
                 pfx_L = prefill_layers[layer_id]
                 S_p = pfx_len  # seq_prefill
 
                 kv_win_slice = Slice()
                 kv_win_slice.inputs = {
-                    "x": Tensor("bf16", (B, S_p, KV_DIM))}
+                    "x": Tensor("bf16", (B, WINDOW, KV_DIM))}
                 kv_win_slice.outputs = {
                     "y": Tensor("bf16", (B, win_keep, KV_DIM))}
                 g.add_kernel(kv_win_slice)

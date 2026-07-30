@@ -27,6 +27,8 @@ def main():
                         help="Run prefill phase")
     parser.add_argument("--decode", action="store_true",
                         help="Run decode phase")
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Batch size (default: config BATCH)")
     parser.add_argument("--n-decode-steps", type=int, default=1,
                         help="Number of decode steps to unroll (default 1)")
     parser.add_argument("--visualization", action="store_true",
@@ -41,11 +43,14 @@ def main():
     kv_prefill_len = 8192 if (args.decode and not args.prefill) else None
 
     # A. Declaration
+    decl_kwargs = dict(
+        seq_prefill=seq_prefill, decode=args.decode,
+        kv_prefill_len=kv_prefill_len,
+        n_decode_steps=args.n_decode_steps)
+    if args.batch_size is not None:
+        decl_kwargs["batch_size"] = args.batch_size
     g, layers, decode_steps, emb, read_input, kv_cache_reads, \
-        pfx_out_head = declare_model(
-            seq_prefill=seq_prefill, decode=args.decode,
-            kv_prefill_len=kv_prefill_len,
-            n_decode_steps=args.n_decode_steps)
+        pfx_out_head = declare_model(**decl_kwargs)
 
     # B. Visualization
     if args.visualization:

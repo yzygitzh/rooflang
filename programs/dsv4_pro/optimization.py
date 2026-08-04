@@ -11,14 +11,32 @@ from rooflang.language.placement import Placement
 from rooflang.programs.dsv4_pro.config import DP, N_LOCAL_EXPERTS
 
 
-def optimize_model(g, layers, hw, emb=None, read_input=None,
-                   decode_steps=None, kv_cache_reads=None,
-                   prefill_output_head=None):
-    """Apply split_kernel for DP, add control edges, and place."""
+def _node_resources(hw, node_id):
+    """Return the eight B300 GPUs and first CPU belonging to one node."""
+    prefix = f"n{node_id}-"
     gpus = sorted(
         [c for c in hw.nodes if isinstance(c, Compute)
-         and "nvidia-b300" in c.name],
+         and c.name.startswith(prefix) and "nvidia-b300" in c.name],
         key=lambda c: c.name)
+    cpus = sorted(
+        [c for c in hw.nodes if isinstance(c, Compute)
+         and c.name.startswith(prefix) and "intel-xeon" in c.name],
+        key=lambda c: c.name)
+    if len(gpus) != DP or not cpus:
+        raise ValueError(
+            f"B300 node {node_id} requires {DP} GPUs and at least one CPU; "
+            f"found {len(gpus)} GPUs and {len(cpus)} CPUs")
+    return gpus, cpus[0]
+
+
+def _optimize_model_b300_cluster_a(
+    g, layers, hw, emb=None, read_input=None, decode_steps=None,
+    kv_cache_reads=None, prefill_output_head=None,
+    prefill_node=0, decode_node=0,
+):
+    """Apply cluster DP/EP splits and place each phase on its node."""
+    prefill_gpus, prefill_cpu = _node_resources(hw, prefill_node)
+    decode_gpus, decode_cpu = _node_resources(hw, decode_node)
 
     # ── Phase 1: DP splits (batch dim) ───────────────────────────────
     emb_copies = None
@@ -124,16 +142,14 @@ def optimize_model(g, layers, hw, emb=None, read_input=None,
 
     if emb_copies is not None:
         for i, c in enumerate(emb_copies):
-            p.set_kernel_device(c, gpus[i])
+            p.set_kernel_device(c, prefill_gpus[i])
 
     if read_input is not None:
-        p.set_kernel_device(read_input, gpus[0])
-        cpu = [c for c in hw.nodes if isinstance(c, Compute)
-               and "intel-xeon" in c.name][0]
-        cpu_mem = hw.find_local_memory(cpu)
-        p.set_tensor_memory(read_input.inputs["tokens"], cpu_mem)
+        p.set_kernel_device(read_input, prefill_gpus[0])
+        prefill_cpu_mem = hw.find_local_memory(prefill_cpu)
+        p.set_tensor_memory(read_input.inputs["tokens"], prefill_cpu_mem)
 
-    def _place_layer(L):
+    def _place_layer(L, gpus):
         """Place all DP copies of a layer onto their respective GPUs."""
         always_copies = [L._bridge_copies,
                          L._attn_norm_copies,
@@ -216,45 +232,41 @@ def optimize_model(g, layers, hw, emb=None, read_input=None,
                         copy.inputs[f"i{global_eid}"], local_mem)
 
     for L in layers:
-        _place_layer(L)
+        _place_layer(L, prefill_gpus)
 
     # Place decode steps
     if decode_steps:
-        cpu = [c for c in hw.nodes if isinstance(c, Compute)
-               and "intel-xeon" in c.name][0]
-        cpu_mem = hw.find_local_memory(cpu)
+        decode_cpu_mem = hw.find_local_memory(decode_cpu)
         for decode_step in decode_steps:
             if decode_step.read_input is not None:
-                p.set_kernel_device(decode_step.read_input, gpus[0])
+                p.set_kernel_device(decode_step.read_input, decode_gpus[0])
                 p.set_tensor_memory(
-                    decode_step.read_input.inputs["tokens"], cpu_mem)
+                    decode_step.read_input.inputs["tokens"], decode_cpu_mem)
             if decode_step.emb is not None:
                 for i, c in enumerate(decode_step._emb_copies):
-                    p.set_kernel_device(c, gpus[i])
+                    p.set_kernel_device(c, decode_gpus[i])
             for i, c in enumerate(decode_step._final_norm_copies):
-                p.set_kernel_device(c, gpus[i])
+                p.set_kernel_device(c, decode_gpus[i])
             for i, c in enumerate(decode_step._logits_copies):
-                p.set_kernel_device(c, gpus[i])
+                p.set_kernel_device(c, decode_gpus[i])
             for i, c in enumerate(decode_step._sampling_copies):
-                p.set_kernel_device(c, gpus[i])
+                p.set_kernel_device(c, decode_gpus[i])
             for L in decode_step.layers:
-                _place_layer(L)
+                _place_layer(L, decode_gpus)
 
     # Place prefill output head
     if prefill_output_head:
         for layer_copies in _pfx_out_copies:
             for i, c in enumerate(layer_copies):
-                p.set_kernel_device(c, gpus[i])
+                p.set_kernel_device(c, prefill_gpus[i])
 
     # Place KV cache reads (decode-only)
     if kv_cache_reads:
-        cpu = [c for c in hw.nodes if isinstance(c, Compute)
-               and "intel-xeon" in c.name][0]
-        cpu_mem = hw.find_local_memory(cpu)
+        decode_cpu_mem = hw.find_local_memory(decode_cpu)
         for layer_copies in _kv_read_copies:
             for i, c in enumerate(layer_copies):
-                p.set_kernel_device(c, gpus[i])
-                p.set_tensor_memory(c.inputs["kv"], cpu_mem)
+                p.set_kernel_device(c, decode_gpus[i])
+                p.set_tensor_memory(c.inputs["kv"], decode_cpu_mem)
 
     optimize_comms(g, p)
 
@@ -263,7 +275,27 @@ def optimize_model(g, layers, hw, emb=None, read_input=None,
     return g, p
 
 
-def optimize_model_superchip(g, hw):
+def optimize_model_b300_cluster_a_1node(
+    g, layers, hw, emb=None, read_input=None, decode_steps=None,
+    kv_cache_reads=None, prefill_output_head=None,
+):
+    """Place both prefill and decode on node 0 of B300 Cluster A."""
+    return _optimize_model_b300_cluster_a(
+        g, layers, hw, emb, read_input, decode_steps, kv_cache_reads,
+        prefill_output_head, prefill_node=0, decode_node=0)
+
+
+def optimize_model_b300_cluster_a_2node(
+    g, layers, hw, emb=None, read_input=None, decode_steps=None,
+    kv_cache_reads=None, prefill_output_head=None,
+):
+    """Place prefill on node 0 and decode on node 1."""
+    return _optimize_model_b300_cluster_a(
+        g, layers, hw, emb, read_input, decode_steps, kv_cache_reads,
+        prefill_output_head, prefill_node=0, decode_node=1)
+
+
+def optimize_model_b300_superchip_a(g, hw):
     """Place all kernels on the single fused GPU (no splits, no comms)."""
     gpu = [c for c in hw.nodes if isinstance(c, Compute)
            and "nvidia-b300" in c.name][0]

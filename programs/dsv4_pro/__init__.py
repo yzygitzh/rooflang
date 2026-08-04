@@ -2,7 +2,7 @@
 
 Three-phase structure:
   A. declare_model() — build logical compute graph (add_kernel + add_data_edge)
-  B. optimize_model() — split_kernel for DP, control edges, placement
+  B. optimize_model_*() — split_kernel for DP, control edges, placement
   C. simulate() — DES execution + trace export
 """
 
@@ -12,7 +12,9 @@ from rooflang.programs.dsv4_pro.model import (
     make_norm,
 )
 from rooflang.programs.dsv4_pro.optimization import (
-    optimize_model, optimize_model_superchip,
+    optimize_model_b300_cluster_a_1node,
+    optimize_model_b300_cluster_a_2node,
+    optimize_model_b300_superchip_a,
 )
 from rooflang.programs.dsv4_pro.simulation import simulate
 from rooflang.programs.dsv4_pro.visualization import visualize_layer

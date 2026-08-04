@@ -6,14 +6,17 @@ from rooflang.programs.presets.b300 import B300ClusterA, B300SuperChipA
 
 from rooflang.programs.dsv4_pro.model import declare_model
 from rooflang.programs.dsv4_pro.optimization import (
-    optimize_model, optimize_model_superchip,
+    optimize_model_b300_cluster_a_1node,
+    optimize_model_b300_cluster_a_2node,
+    optimize_model_b300_superchip_a,
 )
 from rooflang.programs.dsv4_pro.simulation import simulate
 from rooflang.programs.dsv4_pro.visualization import visualize_layer
 
 
 HARDWARE_MAP = {
-    "B300ClusterA": lambda: B300ClusterA(n_nodes=1),
+    "B300ClusterA1Node": lambda: B300ClusterA(n_nodes=1),
+    "B300ClusterA2Node": lambda: B300ClusterA(n_nodes=2),
     "B300SuperChipA": lambda: B300SuperChipA(),
 }
 
@@ -36,7 +39,6 @@ def main():
     args = parser.parse_args()
 
     hw = HARDWARE_MAP[args.hardware]()
-    is_superchip = args.hardware == "B300SuperChipA"
 
     has_sim = args.prefill or args.decode
     seq_prefill = 8192 if args.prefill else None
@@ -69,11 +71,16 @@ def main():
 
     if has_sim:
         # C. Optimization
-        if is_superchip:
-            g, p = optimize_model_superchip(g, hw)
+        if args.hardware == "B300SuperChipA":
+            g, p = optimize_model_b300_superchip_a(g, hw)
+        elif args.hardware == "B300ClusterA2Node":
+            g, p = optimize_model_b300_cluster_a_2node(
+                g, layers, hw, emb, read_input, decode_steps,
+                kv_cache_reads, pfx_out_head)
         else:
-            g, p = optimize_model(g, layers, hw, emb, read_input,
-                                  decode_steps, kv_cache_reads, pfx_out_head)
+            g, p = optimize_model_b300_cluster_a_1node(
+                g, layers, hw, emb, read_input, decode_steps,
+                kv_cache_reads, pfx_out_head)
 
         # D. Simulation
         mode = []

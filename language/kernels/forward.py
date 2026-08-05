@@ -43,6 +43,19 @@ class ReadInput(Kernel):
         return self.n_elements * dtype_bytes(self.dtype_)
 
 
+class Slice(Kernel):
+    """Materialize a contiguous slice into a compact output allocation.
+
+    The graph builder supplies the full source tensor as the input and the
+    selected region as the output.  The generic Kernel byte accounting reads
+    the input tensor and writes the compact output tensor.  Unlike a view,
+    the output does not alias or pin the source allocation.
+    """
+
+    def __init__(self):
+        super().__init__()
+
+
 class Embedding(Kernel):
     """Token embedding lookup: gather M rows from a V×D table.
 

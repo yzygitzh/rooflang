@@ -18,9 +18,9 @@ Each next_comm has n inputs ("i0".."i{n-1}") and 1 output ("y").
 from rooflang.language.kernels.comm import Broadcast, Gather, Reduce, Scatter
 from rooflang.language.kernels.forward import (
     ElementwiseOp, Embedding, Gemm, ReadInput, RMSNorm, Sampling, SparseAttn,
-    StridedGemm, TokenCombine, TokenDispatch,
+    Slice, StridedGemm, TokenCombine, TokenDispatch,
 )
-from rooflang.language.kernels.identity import Concat, Slice, Spawn
+from rooflang.language.kernels.identity import Concat, Spawn
 from rooflang.language.tensor import Tensor
 from rooflang.language.utils import dtype_bytes, gemm_scale_bytes
 

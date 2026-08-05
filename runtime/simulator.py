@@ -366,7 +366,7 @@ class Simulator:
     def _build_passthrough(self) -> Dict[Tensor, list]:
         """Map comm/structural identity outputs to upstream storage tensors."""
         pt: Dict[Tensor, list] = {}
-        for kernel in self._graph.kernels:
+        for kernel in self._graph.topological_sort():
             if kernel._requires_placement:
                 continue
             all_sources = []

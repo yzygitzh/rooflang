@@ -2,12 +2,13 @@
 split by phase:
 
   kernel.py     — Kernel base class + TensorDesc
-  forward.py    — Gemm, StridedGemm, RMSNorm, LayerNorm, RoPE, Attn, SparseAttn
+  forward.py    — Slice, Gemm, StridedGemm, RMSNorm, LayerNorm, RoPE,
+                  Attn, SparseAttn
   backward.py   — GemmDX, GemmDW, StridedGemmDX, StridedGemmDW,
                    RMSNorm, LayerNorm, RoPE, Attn, SparseAttn
   optimizer.py  — AdamWStep
   comm.py       — AllReduce, ReduceScatter, AllGather, AllToAll, Broadcast, SendRecv
-  identity.py   — Spawn, Concat, Slice, Move
+  identity.py   — Spawn, Concat, Move
 
 Forward and backward share class names; disambiguate via module:
     from rooflang.language.kernels import forward, backward

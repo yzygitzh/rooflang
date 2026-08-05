@@ -35,7 +35,7 @@ def visualize_layer(g, layer_meta, extra_seeds=None,
     kernels = _collect_kernels(layer_meta)
     if extra_seeds:
         kernels.update(extra_seeds)
-    # Include Spawn/Concat identity kernels adjacent to collected kernels
+    # Include adjacent structural kernels needed to understand the data flow.
     frozen = frozenset(kernels)
     for k in g.topological_sort():
         if k in frozen:

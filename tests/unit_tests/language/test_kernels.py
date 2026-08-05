@@ -3,7 +3,7 @@
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.kernels.forward import (
     ElementwiseOp, Embedding, Gemm, ReadInput, RMSNorm, LayerNorm, RoPE,
-    Attn, SparseAttn, Sampling, TokenDispatch, TokenCombine,
+    Attn, Slice, SparseAttn, Sampling, TokenDispatch, TokenCombine,
 )
 from rooflang.language.kernels import backward
 from rooflang.language.kernels.comm import (
@@ -11,7 +11,7 @@ from rooflang.language.kernels.comm import (
     Scatter, Gather, Reduce, Send, Recv,
 )
 from rooflang.language.kernels.optimizer import AdamWStep
-from rooflang.language.kernels.identity import Concat, Move, Slice, Spawn
+from rooflang.language.kernels.identity import Concat, Move, Spawn
 from rooflang.language.hardware.component import Memory
 from rooflang.language.tensor import Tensor
 
@@ -109,6 +109,20 @@ class TestReadInput(TestKernelBase):
     expected_input_bytes = 64 * 8192 * 4.0
     expected_weight_bytes = 0.0
     expected_output_bytes = 64 * 8192 * 4.0
+
+
+class TestSlice(TestKernelBase):
+    __test__ = True
+    kernel = Slice()
+    kernel.inputs = {"x": Tensor("bf16", (16,))}
+    kernel.outputs = {"y": Tensor("bf16", (4,))}
+    expected_flops = 0.0
+    expected_input_bytes = 16 * 2.0
+    expected_weight_bytes = 0.0
+    expected_output_bytes = 4 * 2.0
+
+    def test_requires_placement_true(self):
+        assert self.kernel._requires_placement is True
 
 
 class TestEmbedding(TestKernelBase):
@@ -543,19 +557,6 @@ class TestSpawn(TestKernelBase):
 class TestConcat(TestKernelBase):
     __test__ = True
     kernel = Concat()
-    expected_flops = 0.0
-    expected_input_bytes = 0.0
-    expected_weight_bytes = 0.0
-    expected_output_bytes = 0.0
-    expected_transferred_bytes = 0.0
-
-    def test_requires_placement_false(self):
-        assert self.kernel._requires_placement is False
-
-
-class TestSlice(TestKernelBase):
-    __test__ = True
-    kernel = Slice()
     expected_flops = 0.0
     expected_input_bytes = 0.0
     expected_weight_bytes = 0.0

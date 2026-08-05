@@ -9,9 +9,9 @@ from typing import List
 from rooflang.language.graph import ComputeGraph
 from rooflang.language.kernels.forward import (
     ElementwiseOp, Embedding, Gemm, ReadInput, RMSNorm, Sampling,
-    SparseAttn, StridedGemm, TokenCombine, TokenDispatch,
+    Slice, SparseAttn, StridedGemm, TokenCombine, TokenDispatch,
 )
-from rooflang.language.kernels.identity import Concat, Slice, Spawn
+from rooflang.language.kernels.identity import Concat, Spawn
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.tensor import Tensor
 from rooflang.language.utils import gemm_scale_bytes

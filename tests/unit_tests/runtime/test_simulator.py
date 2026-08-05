@@ -6,7 +6,8 @@ from rooflang.language.graph import ComputeGraph, FabricEdge, HardwareGraph
 from rooflang.language.hardware.component import Compute, Memory
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.kernels.comm import AllReduce, Gather, Scatter
-from rooflang.language.kernels.identity import Move, Slice
+from rooflang.language.kernels.forward import Slice
+from rooflang.language.kernels.identity import Concat, Move, Spawn
 from rooflang.language.placement import Placement
 from rooflang.language.tensor import Tensor
 from rooflang.runtime.simulator import Bound, OOMError, Simulator
@@ -378,6 +379,45 @@ class TestEdgeCases:
         assert result.trace == []
 
 
+class TestMaterializedSlice:
+    def test_allocates_compact_output_and_charges_memory_io(self):
+        hw, gpu, hbm = _hw(read_bw=1.0, write_bw=1.0, tflops=1.0)
+        materialize = Slice()
+        materialize.inputs = {"x": Tensor("bf16", (1000,))}
+        materialize.outputs = {"y": Tensor("bf16", (100,))}
+        g = ComputeGraph()
+        g.add_kernel(materialize)
+        p = Placement(hardware=hw, graph=g)
+        p.set_kernel_device(materialize, gpu)
+
+        result = _sim(g, p, hw)
+
+        assert result.total_time_us == pytest.approx(2.2)
+        assert result.peak_memory[hbm] == 2200.0
+
+
+class TestPassthroughResolution:
+    def test_transitive_aliases_resolve_to_storage_source(self):
+        source = SyntheticKernel(outputs={"y": Tensor("bf16", (4,))})
+        fan1 = Spawn(world=1)
+        fan1.inputs = {"x": Tensor("bf16", (4,))}
+        fan1.outputs = {"y": Tensor("bf16", (4,))}
+        fan2 = Spawn(world=1)
+        fan2.inputs = {"x": Tensor("bf16", (4,))}
+        fan2.outputs = {"y": Tensor("bf16", (4,))}
+        g = ComputeGraph()
+        for kernel in (source, fan1, fan2):
+            g.add_kernel(kernel)
+        g.add_data_edge(source, fan1, {"y": "x"})
+        g.add_data_edge(fan1, fan2, {"y": "x"})
+
+        passthrough = Simulator(
+            g, Placement(), HardwareGraph())._build_passthrough()
+
+        assert passthrough[fan1.outputs["y"]] == [source.outputs["y"]]
+        assert passthrough[fan2.outputs["y"]] == [source.outputs["y"]]
+
+
 # ── OOM detection ───────────────────────────────────────────────────
 
 
@@ -521,7 +561,7 @@ class TestExplicitIdentityPlacement:
         """A comm may be adjacent to explicitly placed zero-cost kernels."""
         hw, gpus, _ = _hw_multi_gpu(n_gpus=2)
 
-        source = Slice()
+        source = Concat()
         source.inputs = {"x": Tensor("bf16", (2,))}
         source.outputs = {"y": Tensor("bf16", (2,))}
 
@@ -534,7 +574,7 @@ class TestExplicitIdentityPlacement:
 
         sinks = []
         for _ in range(2):
-            sink = Slice()
+            sink = Concat()
             sink.inputs = {"x": Tensor("bf16", (1,))}
             sink.outputs = {"y": Tensor("bf16", (1,))}
             sinks.append(sink)

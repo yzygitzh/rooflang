@@ -9,7 +9,7 @@ from rooflang.language.kernels.comm import (
     ReduceScatter, Scatter, Send, Recv,
 )
 from rooflang.language.kernels.forward import (
-    Embedding, Gemm, ReadInput, RMSNorm, SparseAttn, StridedGemm,
+    Embedding, Gemm, ReadInput, RMSNorm, Slice, SparseAttn, StridedGemm,
     TokenCombine, TokenDispatch,
 )
 from rooflang.language.kernels.identity import Concat, Spawn
@@ -748,6 +748,22 @@ class TestBatchSplitConcat:
         assert "y" in self.nxt
         assert self.nxt["y"].inputs["i0"].shape == (12, 64)
         assert self.nxt["y"].outputs["y"].shape == (48, 64)
+
+
+class TestBatchSplitSlice:
+    def setup_method(self):
+        self.kernel = Slice()
+        self.kernel.inputs = {"x": Tensor("bf16", (32, 64))}
+        self.kernel.outputs = {"y": Tensor("bf16", (32, 8))}
+        self.prev, self.copies, self.nxt = batch_split(self.kernel, N)
+
+    def test_copies(self):
+        assert len(self.copies) == N
+        for copy in self.copies:
+            assert isinstance(copy, Slice)
+            assert copy.inputs["x"].shape == (8, 64)
+            assert copy.outputs["y"].shape == (8, 8)
+            assert copy._requires_placement is True
 
 
 class TestBatchSplitTokenDispatch:

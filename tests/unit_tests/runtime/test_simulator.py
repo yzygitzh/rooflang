@@ -5,8 +5,8 @@ import pytest
 from rooflang.language.graph import ComputeGraph, FabricEdge, HardwareGraph
 from rooflang.language.hardware.component import Compute, Memory
 from rooflang.language.kernels.kernel import Kernel
-from rooflang.language.kernels.comm import AllReduce, Gather
-from rooflang.language.kernels.identity import Move
+from rooflang.language.kernels.comm import AllReduce, Gather, Scatter
+from rooflang.language.kernels.identity import Move, Slice
 from rooflang.language.placement import Placement
 from rooflang.language.tensor import Tensor
 from rooflang.runtime.simulator import Bound, OOMError, Simulator
@@ -514,6 +514,48 @@ def _hw_multi_gpu(n_gpus=2, hbm_bw=1000.0, link_bw=100.0, tflops=1000.0):
         gpus.append(gpu)
         hbms.append(hbm)
     return hw, gpus, hbms
+
+
+class TestExplicitIdentityPlacement:
+    def test_comm_resolves_placed_identity_neighbors(self):
+        """A comm may be adjacent to explicitly placed zero-cost kernels."""
+        hw, gpus, _ = _hw_multi_gpu(n_gpus=2)
+
+        source = Slice()
+        source.inputs = {"x": Tensor("bf16", (2,))}
+        source.outputs = {"y": Tensor("bf16", (2,))}
+
+        scatter = Scatter(total_bytes=4.0, world=2)
+        scatter.inputs = {"x": Tensor("bf16", (2,))}
+        scatter.outputs = {
+            "o0": Tensor("bf16", (1,)),
+            "o1": Tensor("bf16", (1,)),
+        }
+
+        sinks = []
+        for _ in range(2):
+            sink = Slice()
+            sink.inputs = {"x": Tensor("bf16", (1,))}
+            sink.outputs = {"y": Tensor("bf16", (1,))}
+            sinks.append(sink)
+
+        g = ComputeGraph()
+        g.add_kernel(source)
+        g.add_kernel(scatter)
+        for sink in sinks:
+            g.add_kernel(sink)
+        g.add_data_edge(source, scatter, {"y": "x"})
+        g.add_data_edge(scatter, sinks[0], {"o0": "x"})
+        g.add_data_edge(scatter, sinks[1], {"o1": "x"})
+
+        p = Placement(hardware=hw, graph=g)
+        p.set_kernel_device(source, gpus[0])
+        for sink in sinks:
+            p.set_kernel_device(sink, gpus[1])
+
+        result = _sim(g, p, hw)
+        scatter_entries = [e for e in result.trace if e.kernel is scatter]
+        assert {e.device for e in scatter_entries} == set(gpus)
 
 
 class TestCrossDeviceFabric:

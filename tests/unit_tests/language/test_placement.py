@@ -6,7 +6,7 @@ from rooflang.language.placement import Placement, DeviceAssignment
 from rooflang.language.hardware.component import Compute, Memory
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.kernels.comm import AllReduce
-from rooflang.language.kernels.identity import Move
+from rooflang.language.kernels.identity import Concat, Move, Slice, Spawn
 from rooflang.language.graph import ComputeGraph, FabricEdge, HardwareGraph
 from rooflang.language.tensor import Tensor
 
@@ -165,6 +165,46 @@ class TestPlacementValidate:
         g.add_kernel(ar)
         p.set_kernel_device(k, gpu)
         p.validate(g)
+
+    @pytest.mark.parametrize(
+        "identity", [Spawn(world=1), Concat(), Slice()],
+        ids=["spawn", "concat", "slice"],
+    )
+    def test_identity_tensors_in_same_memory_pass(self, identity):
+        hw, gpu, _ = _simple_hw()
+        identity.inputs = {"x": Tensor("bf16", (4,))}
+        identity.outputs = {"y": Tensor("bf16", (4,))}
+        g = ComputeGraph()
+        g.add_kernel(identity)
+        p = Placement(hardware=hw, graph=g)
+        p.set_kernel_device(identity, gpu)
+        p.validate(g)
+
+    def test_identity_tensor_without_memory_raises(self):
+        identity = Slice()
+        identity.inputs = {"x": Tensor("bf16", (4,))}
+        identity.outputs = {"y": Tensor("bf16", (4,))}
+        g = ComputeGraph()
+        g.add_kernel(identity)
+
+        with pytest.raises(ValueError, match="Slice.*has no memory"):
+            Placement().validate(g)
+
+    def test_identity_tensors_in_different_memories_raise(self):
+        hw, gpu, hbm = _simple_hw()
+        other_hbm = Memory(name="hbm1", capacity_gb=288.0)
+        identity = Slice()
+        identity.inputs = {"x": Tensor("bf16", (4,))}
+        identity.outputs = {"y": Tensor("bf16", (4,))}
+        g = ComputeGraph()
+        g.add_kernel(identity)
+        p = Placement(hardware=hw, graph=g)
+        p.set_tensor_memory(identity.inputs["x"], hbm)
+        p.set_tensor_memory(identity.outputs["y"], other_hbm)
+        p.set_kernel_device(identity, gpu)
+
+        with pytest.raises(ValueError, match="must share one memory"):
+            p.validate(g)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────

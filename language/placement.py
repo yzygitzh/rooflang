@@ -88,7 +88,7 @@ class Placement:
 
     def validate(self, graph: ComputeGraph) -> None:
         """Verify placement, tensor memory, and data-edge consistency."""
-        from rooflang.language.kernels.kernel import Kernel as K
+        from rooflang.language.kernels.identity import Concat, Slice, Spawn
 
         required = {k for k in graph.kernels if k._requires_placement}
         unplaced = required - self.placed_kernels
@@ -112,6 +112,25 @@ class Placement:
                 if t not in self._memory:
                     raise ValueError(
                         f"Tensor '{name}' (output of {kernel}) has no memory")
+
+        identity_types = (Spawn, Concat, Slice)
+        for kernel in graph.kernels:
+            if not isinstance(kernel, identity_types):
+                continue
+            ports = list(kernel.inputs.items()) + list(kernel.outputs.items())
+            memories = []
+            for name, tensor in ports:
+                memory = self._memory.get(tensor)
+                if memory is None:
+                    raise ValueError(
+                        f"Tensor '{name}' of {type(kernel).__name__} "
+                        "has no memory")
+                memories.append(memory)
+            if memories and any(m is not memories[0] for m in memories[1:]):
+                names = ", ".join(sorted({m.name for m in memories}))
+                raise ValueError(
+                    f"{type(kernel).__name__} input/output tensors must "
+                    f"share one memory, found: {names}")
 
         for src in graph.kernels:
             for edge in graph._out_edges(src):

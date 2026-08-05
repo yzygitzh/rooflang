@@ -364,7 +364,7 @@ class Simulator:
     # ── Memory tracking ────────────────────────────────────────────
 
     def _build_passthrough(self) -> Dict[Tensor, list]:
-        """Map CommKernel outputs → upstream source tensors (inplace)."""
+        """Map comm/structural identity outputs to upstream storage tensors."""
         pt: Dict[Tensor, list] = {}
         for kernel in self._graph.kernels:
             if kernel._requires_placement:
@@ -471,10 +471,14 @@ class Simulator:
             return a.device, a.stream, a.resource_cap, []
         preds = list(self._graph._dag.predecessors(kernel))
         succs = list(self._graph._dag.successors(kernel))
+
+        def is_placed(k):
+            return k._requires_placement or k in self._placement._mapping
+
         pd = [self._placement.get_kernel_device(p).device
-              for p in preds if p._requires_placement]
+              for p in preds if is_placed(p)]
         sd = [self._placement.get_kernel_device(s).device
-              for s in succs if s._requires_placement]
+              for s in succs if is_placed(s)]
         seen: Set[Compute] = set()
         devs: List[Compute] = []
         for d in pd + sd:
@@ -487,7 +491,7 @@ class Simulator:
                 f"Cannot resolve device for kernel: no placed neighbors")
         stream = 0
         for p in preds:
-            if p._requires_placement:
+            if is_placed(p):
                 stream = self._placement.get_kernel_device(p).stream
                 break
 

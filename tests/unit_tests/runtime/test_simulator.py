@@ -713,6 +713,47 @@ class TestCrossDeviceFabric:
         assert result.total_time_us == pytest.approx(2.2, rel=1e-2)
 
 
+class TestCollectiveFabricSharing:
+    def test_parallel_collectives_share_fabric(self):
+        """Concurrent collectives on the same links divide fabric bandwidth."""
+        hw, gpus, _ = _hw_multi_gpu(n_gpus=2, hbm_bw=1000.0,
+                                    link_bw=100.0, tflops=1000.0)
+        graph = ComputeGraph()
+        placement = Placement(hardware=hw, graph=graph)
+        scatters = []
+
+        for stream in range(2):
+            pred = SyntheticKernel(
+                flops_val=0.0, outputs={"y": Tensor("bf16", (1,))})
+            scatter = Scatter(total_bytes=200000.0, world=2)
+            scatter.inputs = {"x": Tensor("bf16", (1,))}
+            scatter.outputs = {
+                "o0": Tensor("bf16", (1,)),
+                "o1": Tensor("bf16", (1,)),
+            }
+            succ = SyntheticKernel(
+                flops_val=0.0, inputs={"x": Tensor("bf16", (1,))})
+
+            graph.add_kernel(pred)
+            graph.add_kernel(scatter)
+            graph.add_kernel(succ)
+            graph.add_data_edge(pred, scatter, {"y": "x"})
+            graph.add_data_edge(scatter, succ, {"o1": "x"})
+            placement.set_kernel_device(pred, gpus[0], stream=stream)
+            placement.set_kernel_device(succ, gpus[1], stream=stream)
+            scatters.append(scatter)
+
+        result = _sim(graph, placement, hw)
+
+        # Each scatter transfers (W-1)/W * 200 KB = 100 KB.  Its isolated
+        # duration is 1 us at 100 GB/s; two concurrent scatters take 2 us.
+        for scatter in scatters:
+            entries = [e for e in result.trace if e.kernel is scatter]
+            assert len(entries) == 2
+            duration = entries[0].end_us - entries[0].start_us
+            assert duration == pytest.approx(2.0, rel=1e-3)
+
+
 class TestMultiStreamComm:
     """Tests for multi-stream collective comm blocking and retry."""
 

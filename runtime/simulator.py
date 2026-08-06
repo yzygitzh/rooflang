@@ -441,6 +441,17 @@ class Simulator:
                 worst_time = max(worst_time, link_time)
             if worst_time > 0:
                 p.net_share = p.network_transfer_time / worst_time
+            elif isinstance(p.kernel, CommKernel):
+                # Collectives model transfer time using an aggregate bandwidth,
+                # so their link_data entries identify occupied fabric links but
+                # intentionally carry no per-link byte counts.  Treat the whole
+                # payload phase as occupying every registered link; otherwise
+                # concurrent collectives (or remote reads/writes) see the links
+                # in _on_fab but never contend with them.
+                max_users = max(
+                    len(self._on_fab.get(key, [])) for key in p.fabric_keys
+                )
+                p.net_share = 1.0 / max(1, max_users)
             else:
                 p.net_share = 1.0
 

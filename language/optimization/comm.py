@@ -9,12 +9,18 @@ split_kernel and rewrites them into single fused collectives:
     Reduce  + Scatter             → ReduceScatter
     Reduce  + Broadcast           → AllReduce
 
-Preconditions for fusion:
+Preconditions for intra-device-set fusion:
   - The collector's sole data successor is the distributor.
   - The distributor's sole data predecessor is the collector.
   - Both have the same world.
   - The device set of the collector's predecessors matches the device set
     of the distributor's successors (checked via Placement).
+
+Any adjacent communication kernels with different device sets use an explicit
+whitelist.  Currently only a same-dimension Gather → Scatter pair is supported;
+corresponding ranks are wired directly when their tensors share a memory, with
+a Move inserted otherwise.  Other cross-device-set pairs raise instead of
+silently omitting the group-to-group transfer.
 
 Also eliminates dead communication nodes (single-edge Broadcast/Scatter/
 Gather/Reduce left after fuse_kernels).
@@ -28,6 +34,7 @@ from rooflang.language.kernels.comm import (
     AllGather, AllReduce, AllToAll, Broadcast, CommKernel, Gather, Reduce,
     ReduceScatter, Scatter,
 )
+from rooflang.language.kernels.identity import Move
 
 if TYPE_CHECKING:
     from rooflang.language.graph import ComputeGraph
@@ -85,9 +92,21 @@ def _fuse_pairs(graph: ComputeGraph, placement: Placement) -> bool:
     while True:
         pairs = []
         for kernel in list(graph._dag.nodes):
+            out_edges = graph._out_edges(kernel)
+
+            # Check every adjacent pair of communication kernels before any
+            # ordinary fusion guards, so cross-device traffic cannot be
+            # silently skipped by the more specific fusion patterns below.
+            if isinstance(kernel, CommKernel):
+                for edge in out_edges:
+                    successor = edge.dst
+                    if isinstance(successor, CommKernel) \
+                       and not _same_device_set(
+                           graph, kernel, successor, placement):
+                        pairs.append((kernel, successor, True))
+
             if not isinstance(kernel, (Gather, Reduce)):
                 continue
-            out_edges = graph._out_edges(kernel)
             if len(out_edges) != 1:
                 continue
             successor = out_edges[0].dst
@@ -102,14 +121,18 @@ def _fuse_pairs(graph: ComputeGraph, placement: Placement) -> bool:
                 continue
             if not _same_device_set(graph, kernel, successor, placement):
                 continue
-            pairs.append((kernel, successor))
+            pairs.append((kernel, successor, False))
 
         if not pairs:
             break
 
         did_change = True
-        for kernel, successor in pairs:
+        for kernel, successor, cross_device_bypass in pairs:
             if not graph._dag.has_node(kernel) or not graph._dag.has_node(successor):
+                continue
+            if cross_device_bypass:
+                _bypass_cross_device_pair(
+                    graph, kernel, successor, placement)
                 continue
             collective = _create_collective(kernel, successor)
             if collective is None:
@@ -122,6 +145,62 @@ def _fuse_pairs(graph: ComputeGraph, placement: Placement) -> bool:
                 _replace_pair(graph, kernel, successor, collective)
 
     return did_change
+
+
+def _bypass_cross_device_pair(
+    graph: ComputeGraph,
+    collector: Kernel,
+    distributor: Kernel,
+    placement: Placement,
+) -> None:
+    """Apply the cross-device-set whitelist or reject the pair."""
+    if (
+        isinstance(collector, Gather)
+        and isinstance(distributor, Scatter)
+        and collector.dim == distributor.dim
+    ):
+        sources = {}
+        for edge in graph._in_edges(collector):
+            for src_out, collector_in in edge.mapping.items():
+                sources[collector_in] = (edge.src, src_out)
+
+        destinations = {}
+        for edge in graph._out_edges(distributor):
+            for distributor_out, dst_in in edge.mapping.items():
+                destinations[distributor_out] = (edge.dst, dst_in)
+
+        collector_ports = list(collector.inputs)
+        distributor_ports = list(distributor.outputs)
+        for collector_in, distributor_out in zip(
+                collector_ports, distributor_ports):
+            src_kernel, src_out = sources[collector_in]
+            dst_kernel, dst_in = destinations[distributor_out]
+            src_tensor = src_kernel.outputs[src_out]
+            dst_tensor = dst_kernel.inputs[dst_in]
+            src_memory = placement.get_tensor_memory(src_tensor)
+            dst_memory = placement.get_tensor_memory(dst_tensor)
+            if src_memory is None or dst_memory is None \
+               or src_memory is dst_memory:
+                graph.add_data_edge(src_kernel, dst_kernel, {src_out: dst_in})
+                continue
+
+            move = Move(src_tensor, dst_location=dst_memory)
+            graph.add_kernel(move)
+            graph.add_data_edge(src_kernel, move, {src_out: "src"})
+            graph.add_data_edge(move, dst_kernel, {"dst": dst_in})
+            placement.set_tensor_memory(move.inputs["src"], src_memory)
+            placement.set_tensor_memory(move.outputs["dst"], dst_memory)
+            assignment = placement.get_kernel_device(src_kernel)
+            placement.set_kernel_device(
+                move, assignment.device, stream=assignment.stream)
+
+        graph.remove_kernel(collector)
+        graph.remove_kernel(distributor)
+    else:
+        raise ValueError(
+            "Unsupported cross-device-set communication pair: "
+            f"{type(collector).__name__} -> "
+            f"{type(distributor).__name__}")
 
 
 def _replace_pair(

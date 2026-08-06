@@ -12,10 +12,10 @@ from rooflang.language.kernels.forward import (
     Embedding, Gemm, ReadInput, RMSNorm, Slice, SparseAttn, StridedGemm,
     TokenCombine, TokenDispatch,
 )
-from rooflang.language.kernels.identity import Concat, Spawn
+from rooflang.language.kernels.identity import Concat, Move, Spawn
 from rooflang.language.tensor import Tensor
 from rooflang.language.placement import Placement
-from rooflang.language.hardware.component import Compute
+from rooflang.language.hardware.component import Compute, Memory
 from rooflang.language.optimization.comm import optimize_comms
 from rooflang.language.optimization.split import (
     batch_split, column_split, head_split, row_split,
@@ -134,14 +134,101 @@ class TestBypass:
         assert g._out_edges(preds[0])[0].dst is succs[0]
 
 
-class TestNoFusionDiffDevices:
-    def test_diff_devices_no_fusion(self):
-        r = Reduce(total_bytes=32, world=4, dtype="bf16")
-        b = Broadcast(total_bytes=32, world=4)
-        g, p, preds, succs = _build_chain(r, b, n=4, same_devices=False)
+class TestCrossDeviceSetWhitelist:
+    def test_gather_scatter_becomes_rank_direct_edges(self):
+        gather = Gather(total_bytes=128, world=4, dim=0)
+        scatter = Scatter(total_bytes=128, world=4, dim=0)
+        g, p, preds, succs = _build_chain(
+            gather, scatter, n=4, same_devices=False)
+
         optimize_comms(g, p)
-        assert r in g.kernels
-        assert b in g.kernels
+
+        assert g.kernels == frozenset(preds + succs)
+        assert gather not in g.kernels
+        assert scatter not in g.kernels
+        for pred, succ in zip(preds, succs):
+            assert g._out_edges(pred)[0].dst is succ
+            assert g._in_edges(succ)[0].src is pred
+
+    def test_different_memories_insert_move(self):
+        shard = Tensor("bf16", (4, 4))
+        pred = Kernel(outputs={"y": Tensor("bf16", shard.shape)})
+        gather = Gather(total_bytes=shard.size_bytes, world=1, dim=0)
+        gather.inputs = {"i0": Tensor("bf16", shard.shape)}
+        gather.outputs = {"y": Tensor("bf16", shard.shape)}
+        scatter = Scatter(total_bytes=shard.size_bytes, world=1, dim=0)
+        scatter.inputs = {"x": Tensor("bf16", shard.shape)}
+        scatter.outputs = {"o0": Tensor("bf16", shard.shape)}
+        succ = Kernel(inputs={"x": Tensor("bf16", shard.shape)})
+
+        graph = ComputeGraph()
+        for kernel in (pred, gather, scatter, succ):
+            graph.add_kernel(kernel)
+        graph.add_data_edge(pred, gather, {"y": "i0"})
+        graph.add_data_edge(gather, scatter, {"y": "x"})
+        graph.add_data_edge(scatter, succ, {"o0": "x"})
+
+        src_mem = Memory(name="src-hbm", capacity_gb=1.0)
+        dst_mem = Memory(name="dst-hbm", capacity_gb=1.0)
+        placement = Placement()
+        placement.set_kernel_device(pred, Compute(name="src-gpu"))
+        placement.set_kernel_device(succ, Compute(name="dst-gpu"))
+        placement.set_tensor_memory(pred.outputs["y"], src_mem)
+        placement.set_tensor_memory(succ.inputs["x"], dst_mem)
+
+        optimize_comms(graph, placement)
+
+        moves = [k for k in graph.kernels if isinstance(k, Move)]
+        assert len(moves) == 1
+        move = moves[0]
+        assert graph.kernels == frozenset({pred, move, succ})
+        assert graph._out_edges(pred)[0].dst is move
+        assert graph._out_edges(move)[0].dst is succ
+        assert placement.get_tensor_memory(pred.outputs["y"]) is src_mem
+        assert placement.get_tensor_memory(move.outputs["dst"]) is dst_mem
+        assert placement.get_tensor_memory(succ.inputs["x"]) is dst_mem
+        assert placement.get_kernel_device(move).device \
+            is placement.get_kernel_device(pred).device
+        placement.validate(graph)
+
+    def test_same_memory_uses_direct_edge(self):
+        gather = Gather(total_bytes=128, world=1, dim=0)
+        scatter = Scatter(total_bytes=128, world=1, dim=0)
+        graph, placement, preds, succs = _build_chain(
+            gather, scatter, n=1, same_devices=False)
+        shared = Memory(name="shared", capacity_gb=1.0)
+        placement.set_tensor_memory(preds[0].outputs["y"], shared)
+        placement.set_tensor_memory(succs[0].inputs["a"], shared)
+
+        optimize_comms(graph, placement)
+
+        assert graph.kernels == frozenset(preds + succs)
+        assert graph._out_edges(preds[0])[0].dst is succs[0]
+
+    def test_unsupported_pair_raises(self):
+        first = AllGather(total_bytes=32, world=4)
+        second = AllReduce(total_bytes=32, world=4, dtype="bf16")
+        g, p, _, _ = _build_chain(
+            first, second, n=4, same_devices=False)
+        with pytest.raises(
+                ValueError, match="Unsupported cross-device-set"):
+            optimize_comms(g, p)
+
+    def test_gather_scatter_different_dims_raises(self):
+        gather = Gather(total_bytes=128, world=4, dim=0)
+        scatter = Scatter(total_bytes=128, world=4, dim=1)
+        g, p, _, _ = _build_chain(
+            gather, scatter, n=4, same_devices=False)
+        with pytest.raises(ValueError, match="Unsupported cross-device-set"):
+            optimize_comms(g, p)
+
+    def test_gather_scatter_different_worlds_not_defensively_rejected(self):
+        gather = Gather(total_bytes=128, world=4, dim=0)
+        scatter = Scatter(total_bytes=128, world=2, dim=0)
+        g, p, preds, succs = _build_chain(
+            gather, scatter, n=4, same_devices=False)
+        optimize_comms(g, p)
+        assert g.kernels == frozenset(preds + succs)
 
 
 class TestEliminateDead:
@@ -205,6 +292,23 @@ class TestEliminateDead:
 
 
 class TestFusePairsGuards:
+    def test_cross_device_multi_successor_bypasses_before_fuse_guards(self):
+        gather = Gather(total_bytes=128.0, world=2, dim=0)
+        scatter = Scatter(total_bytes=128.0, world=2, dim=0)
+        graph, placement, preds, succs = _build_chain(
+            gather, scatter, n=2, same_devices=False)
+        gather.outputs["extra"] = SHARD
+        extra = Kernel(inputs={"x": SHARD})
+        graph.add_kernel(extra)
+        graph.add_data_edge(gather, extra, {"extra": "x"})
+        source_device = placement.get_kernel_device(preds[0]).device
+        placement.set_kernel_device(extra, source_device)
+
+        optimize_comms(graph, placement)
+        assert gather not in graph.kernels
+        assert scatter not in graph.kernels
+        assert set(preds + succs + [extra]) == graph.kernels
+
     def test_collector_multi_out_edges_no_fuse(self):
         g = ComputeGraph()
         gpus = [Compute(name=f"gpu{i}") for i in range(2)]
@@ -292,7 +396,7 @@ class TestFusePairsGuards:
         assert r in g.kernels
         assert b in g.kernels
 
-    def test_pred_succ_length_mismatch_no_fuse(self):
+    def test_pred_succ_length_mismatch_raises(self):
         g = ComputeGraph()
         gpus = [Compute(name=f"gpu{i}") for i in range(3)]
         preds = [Kernel(outputs={"y": SHARD}) for _ in range(3)]
@@ -315,9 +419,9 @@ class TestFusePairsGuards:
             p.set_kernel_device(pred, gpus[i])
         for i, s in enumerate(succs):
             p.set_kernel_device(s, gpus[i])
-        optimize_comms(g, p)
-        assert r in g.kernels
-        assert b in g.kernels
+        with pytest.raises(
+                ValueError, match="Unsupported cross-device-set"):
+            optimize_comms(g, p)
 
 
 # ═══════════════════════════════════════════════════════════════════════

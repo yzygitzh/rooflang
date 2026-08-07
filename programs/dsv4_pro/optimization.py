@@ -29,7 +29,7 @@ def _node_resources(hw, node_id):
     return gpus, cpus[0]
 
 
-def _optimize_model_b300_cluster_a(
+def _optimize_model_b300_cluster_a_dp8_ep8(
     g, layers, hw, emb=None, read_input=None, decode_steps=None,
     kv_cache_reads=None, prefill_output_head=None,
     prefill_node=0, decode_node=0,
@@ -275,22 +275,22 @@ def _optimize_model_b300_cluster_a(
     return g, p
 
 
-def optimize_model_b300_cluster_a_1node(
+def optimize_model_b300_cluster_a_dp8_ep8_1node(
     g, layers, hw, emb=None, read_input=None, decode_steps=None,
     kv_cache_reads=None, prefill_output_head=None,
 ):
     """Place both prefill and decode on node 0 of B300 Cluster A."""
-    return _optimize_model_b300_cluster_a(
+    return _optimize_model_b300_cluster_a_dp8_ep8(
         g, layers, hw, emb, read_input, decode_steps, kv_cache_reads,
         prefill_output_head, prefill_node=0, decode_node=0)
 
 
-def optimize_model_b300_cluster_a_2node(
+def optimize_model_b300_cluster_a_dp8_ep8_2node(
     g, layers, hw, emb=None, read_input=None, decode_steps=None,
     kv_cache_reads=None, prefill_output_head=None,
 ):
     """Place prefill on node 0 and decode on node 1."""
-    return _optimize_model_b300_cluster_a(
+    return _optimize_model_b300_cluster_a_dp8_ep8(
         g, layers, hw, emb, read_input, decode_steps, kv_cache_reads,
         prefill_output_head, prefill_node=0, decode_node=1)
 

@@ -6,8 +6,8 @@ from rooflang.programs.presets.b300 import B300ClusterA, B300SuperChipA
 
 from rooflang.programs.dsv4_pro.model import declare_model
 from rooflang.programs.dsv4_pro.optimization import (
-    optimize_model_b300_cluster_a_1node,
-    optimize_model_b300_cluster_a_2node,
+    optimize_model_b300_cluster_a_dp8_ep8_1node,
+    optimize_model_b300_cluster_a_dp8_ep8_2node,
     optimize_model_b300_superchip_a,
 )
 from rooflang.programs.dsv4_pro.simulation import simulate
@@ -74,11 +74,11 @@ def main():
         if args.hardware == "B300SuperChipA":
             g, p = optimize_model_b300_superchip_a(g, hw)
         elif args.hardware == "B300ClusterA2Node":
-            g, p = optimize_model_b300_cluster_a_2node(
+            g, p = optimize_model_b300_cluster_a_dp8_ep8_2node(
                 g, layers, hw, emb, read_input, decode_steps,
                 kv_cache_reads, pfx_out_head)
         else:
-            g, p = optimize_model_b300_cluster_a_1node(
+            g, p = optimize_model_b300_cluster_a_dp8_ep8_1node(
                 g, layers, hw, emb, read_input, decode_steps,
                 kv_cache_reads, pfx_out_head)
 

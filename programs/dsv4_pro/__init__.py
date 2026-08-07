@@ -12,8 +12,8 @@ from rooflang.programs.dsv4_pro.model import (
     make_norm,
 )
 from rooflang.programs.dsv4_pro.optimization import (
-    optimize_model_b300_cluster_a_1node,
-    optimize_model_b300_cluster_a_2node,
+    optimize_model_b300_cluster_a_dp8_ep8_1node,
+    optimize_model_b300_cluster_a_dp8_ep8_2node,
     optimize_model_b300_superchip_a,
 )
 from rooflang.programs.dsv4_pro.simulation import simulate

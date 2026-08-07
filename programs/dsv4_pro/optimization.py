@@ -1,17 +1,14 @@
-"""DeepSeek V4 Pro inference — Optimization Phase.
-
-Applies split_kernel for DP, control edges, and placement.
-"""
+"""DeepSeek V4 Pro inference — graph splitting and placement strategies."""
 
 from rooflang.language.hardware.component import Compute
 from rooflang.language.optimization.comm import optimize_comms
-from rooflang.language.optimization.split import batch_split
+from rooflang.language.optimization.split import batch_split, context_split
 from rooflang.language.placement import Placement
 
-from rooflang.programs.dsv4_pro.config import DP, N_LOCAL_EXPERTS
+from rooflang.programs.dsv4_pro.config import CP, DP, EP, N_LOCAL_EXPERTS
 
 
-def _node_resources(hw, node_id):
+def _node_resources(hw, node_id, world):
     """Return the eight B300 GPUs and first CPU belonging to one node."""
     prefix = f"n{node_id}-"
     gpus = sorted(
@@ -22,9 +19,9 @@ def _node_resources(hw, node_id):
         [c for c in hw.nodes if isinstance(c, Compute)
          and c.name.startswith(prefix) and "intel-xeon" in c.name],
         key=lambda c: c.name)
-    if len(gpus) != DP or not cpus:
+    if len(gpus) != world or not cpus:
         raise ValueError(
-            f"B300 node {node_id} requires {DP} GPUs and at least one CPU; "
+            f"B300 node {node_id} requires {world} GPUs and at least one CPU; "
             f"found {len(gpus)} GPUs and {len(cpus)} CPUs")
     return gpus, cpus[0]
 
@@ -35,8 +32,8 @@ def _optimize_model_b300_cluster_a_dp8_ep8(
     prefill_node=0, decode_node=0,
 ):
     """Apply cluster DP/EP splits and place each phase on its node."""
-    prefill_gpus, prefill_cpu = _node_resources(hw, prefill_node)
-    decode_gpus, decode_cpu = _node_resources(hw, decode_node)
+    prefill_gpus, prefill_cpu = _node_resources(hw, prefill_node, DP)
+    decode_gpus, decode_cpu = _node_resources(hw, decode_node, DP)
 
     # ── Phase 1: DP splits (batch dim) ───────────────────────────────
     emb_copies = None
@@ -293,6 +290,98 @@ def optimize_model_b300_cluster_a_dp8_ep8_2node(
     return _optimize_model_b300_cluster_a_dp8_ep8(
         g, layers, hw, emb, read_input, decode_steps, kv_cache_reads,
         prefill_output_head, prefill_node=0, decode_node=1)
+
+
+def optimize_model_b300_cluster_a_cp8_ep8_1node(
+    g, layers, hw, emb=None, read_input=None, decode_steps=None,
+    kv_cache_reads=None, prefill_output_head=None,
+):
+    """Ring CP=8 plus EP=8 prefill on one B300 Cluster A node.
+
+    Decode is intentionally unsupported: its sequence dimension is one and
+    cannot be split across CP ranks.
+    """
+    if decode_steps or kv_cache_reads or prefill_output_head:
+        raise ValueError(
+            "optimize_model_b300_cluster_a_cp8_ep8_1node supports "
+            "prefill only; decode sequence length cannot be CP-sharded")
+
+    gpus, cpu = _node_resources(hw, 0, CP)
+    if EP != len(gpus):
+        raise ValueError(
+            f"CP8/EP8 placement requires {EP} colocated EP ranks; "
+            f"found {len(gpus)} GPUs")
+
+    emb_copies = None
+    if emb is not None:
+        _, emb_copies, _ = g.split_kernel(context_split, emb, CP)
+
+    layer_fields = (
+        "bridge", "attn_norm", "attn_fan", "comp", "comp_norm",
+        "wq_a", "q_norm", "wq_b", "wkv", "kv_norm", "kv_concat",
+        "sa", "kv_win_slice", "wo_a", "wo_b", "attn_add",
+        "ffn_bridge", "ffn_norm", "ffn_fan", "gate", "dispatch",
+        "combine", "sw_up", "sw_down", "moe_add", "ffn_add",
+    )
+    for layer in layers:
+        for name in layer_fields:
+            kernel = getattr(layer, name)
+            if kernel is None:
+                continue
+            _, copies, _ = g.split_kernel(context_split, kernel, CP)
+            setattr(layer, f"_{name}_copies", copies)
+
+    placement = Placement(hardware=hw, graph=g)
+    if emb_copies is not None:
+        for rank, copy in enumerate(emb_copies):
+            placement.set_kernel_device(copy, gpus[rank])
+
+    if read_input is not None:
+        placement.set_kernel_device(read_input, gpus[0])
+        placement.set_tensor_memory(
+            read_input.inputs["tokens"],
+            hw.find_local_memory(cpu))
+
+    for layer in layers:
+        for name in layer_fields:
+            copies = getattr(layer, f"_{name}_copies", None)
+            if copies is None:
+                continue
+            for rank, copy in enumerate(copies):
+                placement.set_kernel_device(copy, gpus[rank])
+
+        # Expert kernels are EP-sharded, not copied by context split.
+        for eid in range(N_LOCAL_EXPERTS * EP):
+            gpu_id = eid // N_LOCAL_EXPERTS
+            up_kernel = layer.experts[eid * 2]
+            down_kernel = layer.experts[eid * 2 + 1]
+            placement.set_kernel_device(up_kernel, gpus[gpu_id])
+            placement.set_kernel_device(down_kernel, gpus[gpu_id])
+
+            local_mem = hw.find_local_memory(gpus[gpu_id])
+            placement.set_tensor_memory(up_kernel.inputs["x"], local_mem)
+
+        # Dispatch writes and Combine reads expert shards in the owner rank.
+        for copy in layer._dispatch_copies:
+            for gpu_id in range(EP):
+                local_mem = hw.find_local_memory(gpus[gpu_id])
+                for local_eid in range(N_LOCAL_EXPERTS):
+                    global_eid = gpu_id * N_LOCAL_EXPERTS + local_eid
+                    placement.set_tensor_memory(
+                        copy.outputs[f"o{global_eid}"], local_mem)
+
+        for copy in layer._combine_copies:
+            for gpu_id in range(EP):
+                local_mem = hw.find_local_memory(gpus[gpu_id])
+                for local_eid in range(N_LOCAL_EXPERTS):
+                    global_eid = gpu_id * N_LOCAL_EXPERTS + local_eid
+                    placement.set_tensor_memory(
+                        copy.inputs[f"i{global_eid}"], local_mem)
+
+    optimize_comms(g, placement)
+    g.validate()
+    placement.validate(g)
+    return g, placement
 
 
 def optimize_model_b300_superchip_a(g, hw):

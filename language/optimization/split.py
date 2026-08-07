@@ -17,8 +17,8 @@ Each next_comm has n inputs ("i0".."i{n-1}") and 1 output ("y").
 
 from rooflang.language.kernels.comm import Broadcast, Gather, Reduce, Scatter
 from rooflang.language.kernels.forward import (
-    ElementwiseOp, Embedding, Gemm, ReadInput, RMSNorm, Sampling, SparseAttn,
-    Slice, StridedGemm, TokenCombine, TokenDispatch,
+    Attn, ElementwiseOp, Embedding, Gemm, ReadInput, RMSNorm, Sampling,
+    SparseAttn, Slice, StridedGemm, TokenCombine, TokenDispatch,
 )
 from rooflang.language.kernels.identity import Concat, Spawn
 from rooflang.language.tensor import Tensor
@@ -211,6 +211,149 @@ def head_split(kernel, n):
     next_comms = {"y": _make_gather(out_tensor, n, dim=-1)}
 
     return prev_comms, copies, next_comms
+
+
+# ── context_split ─────────────────────────────────────────────────────
+
+
+def context_split(kernel, n):
+    """Shard token work along sequence dim 1 while preserving batch size.
+
+    Expert-token tensors produced by TokenDispatch and consumed by
+    TokenCombine are flattened as (M_e, D), so those ports shard dim 0.
+    Attention receives a logical full-KV input through AllGather.  Simulator
+    passthrough keeps its physical storage backed by the distributed source
+    shards, while each rank accounts for processing all KV blocks in the ring.
+    """
+    if isinstance(kernel, (Attn, SparseAttn)):
+        return _context_split_attn(kernel, n)
+
+    prev_comms = {
+        port: _make_scatter(
+            tensor, n, dim=_context_port_dim(kernel, port, is_input=True))
+        for port, tensor in kernel.inputs.items()
+    }
+    copies = [_make_context_copy(kernel, n) for _ in range(n)]
+    next_comms = {
+        port: _make_gather(
+            tensor, n, dim=_context_port_dim(kernel, port, is_input=False))
+        for port, tensor in kernel.outputs.items()
+    }
+    return prev_comms, copies, next_comms
+
+
+def _context_port_dim(kernel, port, *, is_input):
+    """Return the physical tensor axis carrying sequence-sharded tokens."""
+    if isinstance(kernel, TokenDispatch) and not is_input:
+        return 0
+    if isinstance(kernel, TokenCombine) and is_input:
+        return 0
+    return 1
+
+
+def _context_split_attn(kernel, n):
+    """Context/ring split for dense and sparse attention."""
+    q_tensor = kernel.inputs["q"]
+    kv_tensor = kernel.inputs["kv"]
+    out_tensor = kernel.outputs["y"]
+    q_shard = _shard_shape(q_tensor.shape, n, dim=1)
+    out_shard = _shard_shape(out_tensor.shape, n, dim=1)
+
+    prev_comms = {
+        "q": _make_scatter(q_tensor, n, dim=1),
+        "kv": _make_broadcast(kv_tensor, n),
+    }
+
+    copies = []
+    for _ in range(n):
+        if isinstance(kernel, SparseAttn):
+            c = SparseAttn(
+                kernel.B, kernel.H, kernel.H_kv, kernel.S_q // n,
+                kernel.k_sel, kernel.S_kv, kernel.Hd, kernel.dtype_,
+                kernel.kv_factor)
+        else:
+            c = Attn(
+                kernel.B, kernel.H, kernel.H_kv, kernel.S_q // n,
+                kernel.S_kv, kernel.Hd, kernel.dtype_, kernel.causal)
+        c.inputs = {
+            "q": Tensor(q_tensor.dtype, q_shard),
+            "kv": Tensor(kv_tensor.dtype, kv_tensor.shape),
+        }
+        c.outputs = {"y": Tensor(out_tensor.dtype, out_shard)}
+        copies.append(c)
+
+    next_comms = {"y": _make_gather(out_tensor, n, dim=1)}
+    return prev_comms, copies, next_comms
+
+
+def _make_context_copy(kernel, n):
+    """Construct one context-sharded copy of a non-attention kernel."""
+    if isinstance(kernel, StridedGemm):
+        c = StridedGemm(
+            kernel.M // n, kernel.N, kernel.K, kernel.w_dtype,
+            kernel.a_dtype, kernel.out_dtype,
+            in_elems=kernel._in_elems // n,
+            out_elems=kernel._out_elems // n)
+    elif isinstance(kernel, Gemm):
+        c = Gemm(kernel.M // n, kernel.N, kernel.K, kernel.w_dtype,
+                 kernel.a_dtype, kernel.out_dtype)
+    elif isinstance(kernel, RMSNorm):
+        c = RMSNorm(kernel.M // n, kernel.D, kernel.dtype_)
+    elif isinstance(kernel, Embedding):
+        c = Embedding(kernel.M // n, kernel.V, kernel.D, kernel.w_dtype,
+                      kernel.idx_dtype, kernel.out_dtype)
+    elif isinstance(kernel, ReadInput):
+        c = ReadInput(kernel.n_elements // n, kernel.dtype_)
+    elif isinstance(kernel, TokenDispatch):
+        c = TokenDispatch(kernel.M // n, kernel.D, kernel.N_experts,
+                          kernel.topk, kernel.a_dtype)
+    elif isinstance(kernel, TokenCombine):
+        c = TokenCombine(kernel.M // n, kernel.D, kernel.N_experts,
+                         kernel.topk, kernel.a_dtype)
+    elif isinstance(kernel, Spawn):
+        c = Spawn(world=kernel.world)
+    elif isinstance(kernel, Concat):
+        c = Concat()
+    elif isinstance(kernel, Slice):
+        c = Slice()
+    elif isinstance(kernel, Sampling):
+        c = Sampling(kernel.M // n, kernel.V, kernel.dtype_, kernel.out_dtype)
+    elif isinstance(kernel, ElementwiseOp):
+        c = ElementwiseOp(kernel.M // n, kernel.D, kernel.dtype_, kernel.op)
+    else:
+        raise TypeError(
+            f"context_split: unsupported kernel type "
+            f"{type(kernel).__name__}")
+
+    c.inputs = {
+        port: Tensor(
+            tensor.dtype,
+            _shard_shape(
+                tensor.shape, n,
+                _context_port_dim(kernel, port, is_input=True)))
+        for port, tensor in kernel.inputs.items()
+    }
+    c.outputs = {
+        port: Tensor(
+            tensor.dtype,
+            _shard_shape(
+                tensor.shape, n,
+                _context_port_dim(kernel, port, is_input=False)))
+        for port, tensor in kernel.outputs.items()
+    }
+    if kernel.weights:
+        if isinstance(kernel, Embedding):
+            c.weights = {
+                "emb": Tensor(
+                    kernel.w_dtype, (kernel.V, kernel.D),
+                    weight_id=kernel.weights["emb"].weight_id)}
+        else:
+            c.weights = {
+                port: Tensor(
+                    tensor.dtype, tensor.shape, weight_id=tensor.weight_id)
+                for port, tensor in kernel.weights.items()
+            }
+    return c
 
 
 # ── batch_split ────────────────────────────────────────────────────────

@@ -9,8 +9,8 @@ from rooflang.language.kernels.comm import (
     ReduceScatter, Scatter, Send, Recv,
 )
 from rooflang.language.kernels.forward import (
-    Embedding, Gemm, ReadInput, RMSNorm, Slice, SparseAttn, StridedGemm,
-    TokenCombine, TokenDispatch,
+    Attn, Embedding, Gemm, ReadInput, RMSNorm, Slice, SparseAttn,
+    StridedGemm, TokenCombine, TokenDispatch,
 )
 from rooflang.language.kernels.identity import Concat, Move, Spawn
 from rooflang.language.tensor import Tensor
@@ -18,7 +18,7 @@ from rooflang.language.placement import Placement
 from rooflang.language.hardware.component import Compute, Memory
 from rooflang.language.optimization.comm import optimize_comms
 from rooflang.language.optimization.split import (
-    batch_split, column_split, head_split, row_split,
+    batch_split, column_split, context_split, head_split, row_split,
 )
 from rooflang.language.utils import gemm_scale_bytes
 
@@ -652,6 +652,84 @@ class TestHeadSplit:
         g.add_data_edge(k, succ, {"y": "inp"})
         g.split_kernel(head_split, k, N)
         g.validate()
+
+
+# ── context_split ─────────────────────────────────────────────────────
+
+
+class TestContextSplitGemm:
+    def setup_method(self):
+        self.kernel = Gemm(32, 128, 64, "bf16", "bf16")
+        self.kernel.inputs = {"x": Tensor("bf16", (2, 16, 64))}
+        self.kernel.weights = {"w": Tensor("bf16", (64, 128))}
+        self.kernel.outputs = {"y": Tensor("bf16", (2, 16, 128))}
+        self.prev, self.copies, self.nxt = context_split(self.kernel, N)
+
+    def test_context_axis_and_kernel_work_are_sharded(self):
+        assert isinstance(self.prev["x"], Scatter)
+        assert self.prev["x"].dim == 1
+        assert self.prev["x"].outputs["o0"].shape == (2, 4, 64)
+        for copy in self.copies:
+            assert copy.M == 8
+            assert copy.inputs["x"].shape == (2, 4, 64)
+            assert copy.outputs["y"].shape == (2, 4, 128)
+        assert isinstance(self.nxt["y"], Gather)
+        assert self.nxt["y"].dim == 1
+
+
+@pytest.mark.parametrize("attn_cls", [Attn, SparseAttn])
+def test_context_split_attention_uses_full_logical_kv(attn_cls):
+    kwargs = dict(B=2, H=8, H_kv=1, S_q=16, S_kv=24, Hd=64,
+                  dtype="bf16")
+    if attn_cls is SparseAttn:
+        kwargs["k_sel"] = 8
+        kwargs["kv_factor"] = 1
+    kernel = attn_cls(**kwargs)
+    kv_width = 64 if attn_cls is SparseAttn else 2 * 64
+    kernel.inputs = {
+        "q": Tensor("bf16", (2, 16, 8 * 64)),
+        "kv": Tensor("bf16", (2, 24, kv_width)),
+    }
+    kernel.outputs = {"y": Tensor("bf16", (2, 16, 8 * 64))}
+
+    prev, copies, nxt = context_split(kernel, N)
+
+    assert isinstance(prev["q"], Scatter)
+    assert isinstance(prev["kv"], Broadcast)
+    assert prev["kv"].outputs["o0"].shape == (2, 24, kv_width)
+    assert isinstance(nxt["y"], Gather)
+    assert sum(copy.flops for copy in copies) == kernel.flops
+    for copy in copies:
+        assert copy.S_q == 4
+        assert copy.S_kv == 24
+        assert copy.inputs["q"].shape == (2, 4, 8 * 64)
+        assert copy.inputs["kv"].shape == (2, 24, kv_width)
+        assert copy.outputs["y"].shape == (2, 4, 8 * 64)
+        assert copy.input_bytes == sum(
+            tensor.size_bytes for tensor in copy.inputs.values())
+
+
+def test_context_split_dispatch_and_combine_port_axes():
+    dispatch = TokenDispatch(32, 64, 8, 2)
+    dispatch.inputs = {
+        "x": Tensor("bf16", (2, 16, 64)),
+        "routing": Tensor("fp32", (2, 16, 8)),
+    }
+    dispatch.outputs = {
+        f"o{i}": Tensor("bf16", (8, 64)) for i in range(8)}
+    _, dispatch_copies, dispatch_next = context_split(dispatch, N)
+    assert dispatch_copies[0].inputs["x"].shape == (2, 4, 64)
+    assert dispatch_copies[0].outputs["o0"].shape == (2, 64)
+    assert dispatch_next["o0"].dim == 0
+
+    combine = TokenCombine(32, 64, 8, 2)
+    combine.inputs = {
+        f"i{i}": Tensor("bf16", (8, 64)) for i in range(8)}
+    combine.outputs = {"y": Tensor("bf16", (2, 16, 64))}
+    combine_prev, combine_copies, _ = context_split(combine, N)
+    assert combine_prev["i0"].dim == 0
+    assert combine_copies[0].inputs["i0"].shape == (2, 64)
+    assert combine_copies[0].outputs["y"].shape == (2, 4, 64)
 
 
 # ── batch_split ────────────────────────────────────────────────────────

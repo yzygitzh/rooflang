@@ -32,6 +32,10 @@ def _optimize_model_b300_cluster_a_dp8_ep8(
     prefill_node=0, decode_node=0,
 ):
     """Apply cluster DP/EP splits and place each phase on its node."""
+    if DP != EP:
+        raise ValueError(
+            f"DP/EP placement requires DP == EP; got DP={DP}, EP={EP}")
+
     prefill_gpus, prefill_cpu = _node_resources(hw, prefill_node, DP)
     decode_gpus, decode_cpu = _node_resources(hw, decode_node, DP)
 
@@ -193,10 +197,10 @@ def _optimize_model_b300_cluster_a_dp8_ep8(
             for i, c in enumerate(L._comp_norm_copies):
                 p.set_kernel_device(c, gpus[i])
 
-        # Expert kernels → respective GPUs
+        # Expert kernels are EP-sharded, not copied by batch split.
         # L.experts is flat: [up0, down0, up1, down1, ...] for N_EXPERTS experts
         # Group by GPU: expert eid → gpu_id = eid // N_LOCAL_EXPERTS
-        for eid in range(N_LOCAL_EXPERTS * DP):
+        for eid in range(N_LOCAL_EXPERTS * EP):
             gpu_id = eid // N_LOCAL_EXPERTS
             up_kernel = L.experts[eid * 2]
             down_kernel = L.experts[eid * 2 + 1]
@@ -204,7 +208,7 @@ def _optimize_model_b300_cluster_a_dp8_ep8(
             p.set_kernel_device(down_kernel, gpus[gpu_id])
 
         # Expert input locality: placed on destination GPU's HBM
-        for eid in range(N_LOCAL_EXPERTS * DP):
+        for eid in range(N_LOCAL_EXPERTS * EP):
             gpu_id = eid // N_LOCAL_EXPERTS
             local_mem = hw.find_local_memory(gpus[gpu_id])
             up_kernel = L.experts[eid * 2]
@@ -212,7 +216,7 @@ def _optimize_model_b300_cluster_a_dp8_ep8(
 
         # Dispatch RDMA: each copy writes expert outputs to target GPU's HBM
         for copy in L._dispatch_copies:
-            for gpu_id in range(DP):
+            for gpu_id in range(EP):
                 local_mem = hw.find_local_memory(gpus[gpu_id])
                 for local_eid in range(N_LOCAL_EXPERTS):
                     global_eid = gpu_id * N_LOCAL_EXPERTS + local_eid
@@ -221,7 +225,7 @@ def _optimize_model_b300_cluster_a_dp8_ep8(
 
         # Combine RDMA: each copy reads expert outputs from source GPU's HBM
         for copy in L._combine_copies:
-            for gpu_id in range(DP):
+            for gpu_id in range(EP):
                 local_mem = hw.find_local_memory(gpus[gpu_id])
                 for local_eid in range(N_LOCAL_EXPERTS):
                     global_eid = gpu_id * N_LOCAL_EXPERTS + local_eid
@@ -306,11 +310,11 @@ def optimize_model_b300_cluster_a_cp8_ep8_1node(
             "optimize_model_b300_cluster_a_cp8_ep8_1node supports "
             "prefill only; decode sequence length cannot be CP-sharded")
 
-    gpus, cpu = _node_resources(hw, 0, CP)
-    if EP != len(gpus):
+    if CP != EP:
         raise ValueError(
-            f"CP8/EP8 placement requires {EP} colocated EP ranks; "
-            f"found {len(gpus)} GPUs")
+            f"CP/EP placement requires CP == EP; got CP={CP}, EP={EP}")
+
+    gpus, cpu = _node_resources(hw, 0, CP)
 
     emb_copies = None
     if emb is not None:

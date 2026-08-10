@@ -12,6 +12,32 @@ from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.utils import dtype_bytes, gemm_scale_bytes
 
 
+class Nop(Kernel):
+    """Zero-cost dependency kernel with arbitrary tensor ports."""
+
+    _requires_placement = False
+
+    @property
+    def flops(self) -> float:
+        return 0.0
+
+    @property
+    def input_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def weight_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def output_bytes(self) -> float:
+        return 0.0
+
+    @property
+    def transferred_bytes(self) -> float:
+        return 0.0
+
+
 class ReadInput(Kernel):
     """Host-to-device transfer: read token indices from CPU memory to GPU.
 

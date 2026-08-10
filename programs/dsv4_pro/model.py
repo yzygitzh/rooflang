@@ -8,10 +8,10 @@ from typing import List
 
 from rooflang.language.graph import ComputeGraph
 from rooflang.language.kernels.forward import (
-    ElementwiseOp, Embedding, Gemm, ReadInput, RMSNorm, Sampling,
+    ElementwiseOp, Embedding, Gemm, Nop, ReadInput, RMSNorm, Sampling,
     Slice, SparseAttn, StridedGemm, TokenCombine, TokenDispatch,
 )
-from rooflang.language.kernels.identity import Concat, Move, Spawn
+from rooflang.language.kernels.identity import Concat, Spawn
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.tensor import Tensor
 from rooflang.language.utils import gemm_scale_bytes
@@ -99,9 +99,9 @@ class LayerMeta:
     kv_comp_slice: Kernel = None
     kv_acc: Kernel = None
     kv_acc_fan: Kernel = None
-    # Optional prefill KV offload chain.
-    kv_offload_fan: Kernel = None
-    kv_offload_move: Kernel = None
+    persist_kv_cache: bool = False
+    kv_persist_fan: Kernel = None
+    kv_persist_barrier: Kernel = None
 
 
 @dataclass
@@ -341,17 +341,17 @@ def _build_layers(
                 g.add_data_edge(comp_norm, kv_concat, {"y": "b"})
 
             if capture_kv_cache:
-                kv_offload_fan = Spawn(world=2)
-                kv_offload_fan.inputs = {
+                kv_persist_fan = Spawn(world=2)
+                kv_persist_fan.inputs = {
                     "x": Tensor("bf16", (B, S_kv, KV_DIM))}
-                kv_offload_fan.outputs = {
+                kv_persist_fan.outputs = {
                     "y": Tensor("bf16", (B, S_kv, KV_DIM)),
                     "y2": Tensor("bf16", (B, S_kv, KV_DIM)),
                 }
-                g.add_kernel(kv_offload_fan)
-                g.add_data_edge(kv_concat, kv_offload_fan, {"y": "x"})
-                g.add_data_edge(kv_offload_fan, sa, {"y": "kv"})
-                L.kv_offload_fan = kv_offload_fan
+                g.add_kernel(kv_persist_fan)
+                g.add_data_edge(kv_concat, kv_persist_fan, {"y": "x"})
+                g.add_data_edge(kv_persist_fan, sa, {"y": "kv"})
+                L.kv_persist_fan = kv_persist_fan
             else:
                 g.add_data_edge(kv_concat, sa, {"y": "kv"})
 
@@ -771,9 +771,8 @@ def declare_model(
         kv_prefill_len: for decode-only mode, the original prefill length
             that generated the KV cache. Ignored when seq_prefill is set.
         n_decode_steps: number of decode steps to unroll (default 1).
-        persist_kv_cache: whether one multi-tensor Move should retain every
-            compact prefill KV cache. Its destination is assigned later by
-            the placement optimizer.
+        persist_kv_cache: whether the placement optimizer should retain every
+            compact prefill KV cache until prefill completes.
 
     Returns:
         (g, prefill_layers, decode_steps, emb, read_input, kv_cache_reads,
@@ -820,25 +819,32 @@ def declare_model(
         prefill_layers, prefill_last = _build_layers(
             g, B, S_p, None, emb, has_decode=has_decode,
             capture_kv_cache=persist_kv_cache)
-
+        for layer in prefill_layers:
+            layer.persist_kv_cache = persist_kv_cache
         if persist_kv_cache:
-            tensors = [
-                layer.kv_offload_fan.outputs["y2"]
-                for layer in prefill_layers
-            ]
-            move = Move()
-            move.inputs = {
-                f"src{i}": tensor for i, tensor in enumerate(tensors)
+            barrier = Nop()
+            barrier.inputs = {
+                f"kv{layer_id}": Tensor(
+                    layer.kv_persist_fan.outputs["y2"].dtype,
+                    layer.kv_persist_fan.outputs["y2"].shape,
+                )
+                for layer_id, layer in enumerate(prefill_layers)
             }
-            move.outputs = {
-                f"dst{i}": Tensor(tensor.dtype, tensor.shape)
-                for i, tensor in enumerate(tensors)
-            }
-            g.add_kernel(move)
-            for port, layer in enumerate(prefill_layers):
+            barrier.inputs["prefill_output"] = Tensor(
+                prefill_last.outputs["y"].dtype,
+                prefill_last.outputs["y"].shape,
+            )
+            barrier.outputs = {"done": Tensor("int32", (1,))}
+            g.add_kernel(barrier)
+            for layer_id, layer in enumerate(prefill_layers):
                 g.add_data_edge(
-                    layer.kv_offload_fan, move, {"y2": f"src{port}"})
-                layer.kv_offload_move = move
+                    layer.kv_persist_fan, barrier,
+                    {"y2": f"kv{layer_id}"},
+                )
+            g.add_data_edge(
+                prefill_last, barrier, {"y": "prefill_output"})
+            for layer in prefill_layers:
+                layer.kv_persist_barrier = barrier
 
     # ── Decode steps ─────────────────────────────────────────────
     if has_decode:

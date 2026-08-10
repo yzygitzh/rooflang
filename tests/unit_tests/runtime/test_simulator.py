@@ -6,7 +6,7 @@ from rooflang.language.graph import ComputeGraph, FabricEdge, HardwareGraph
 from rooflang.language.hardware.component import Compute, Memory
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.kernels.comm import AllReduce, Gather, Scatter
-from rooflang.language.kernels.forward import Slice
+from rooflang.language.kernels.forward import Nop, Slice
 from rooflang.language.kernels.identity import Concat, Move, Spawn
 from rooflang.language.optimization.comm import optimize_comms
 from rooflang.language.placement import Placement
@@ -403,6 +403,36 @@ class TestMaterializedSlice:
 
         assert result.total_time_us == pytest.approx(2.2)
         assert result.peak_memory[hbm] == 2200.0
+
+
+class TestNop:
+    def test_preserves_dependencies_without_timing_cost(self):
+        hw, gpu, hbm = _hw(read_bw=1.0, write_bw=1.0, tflops=1.0)
+        source = SyntheticKernel(outputs={"y": Tensor("bf16", (1000,))})
+        nop = Nop(
+            inputs={"payload": Tensor("bf16", (1000,))},
+            outputs={"done": Tensor("int32", (7,))},
+        )
+        sink = SyntheticKernel(inputs={"x": Tensor("int32", (7,))})
+        g = ComputeGraph()
+        for kernel in (source, nop, sink):
+            g.add_kernel(kernel)
+        g.add_data_edge(source, nop, {"y": "payload"})
+        g.add_data_edge(nop, sink, {"done": "x"})
+        p = Placement(hardware=hw, graph=g)
+        p.set_kernel_device(source, gpu)
+        p.set_kernel_device(sink, gpu)
+        p.set_tensor_memory(nop.inputs["payload"], hbm)
+        p.set_tensor_memory(nop.outputs["done"], hbm)
+        g.validate()
+        p.validate(g)
+
+        result = _sim(g, p, hw)
+
+        entries = {entry.kernel: entry for entry in result.trace}
+        assert entries[source].end_us <= entries[nop].start_us
+        assert entries[nop].start_us == entries[nop].end_us
+        assert entries[nop].end_us <= entries[sink].start_us
 
 
 class TestPassthroughResolution:

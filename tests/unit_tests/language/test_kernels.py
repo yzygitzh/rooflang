@@ -4,7 +4,7 @@ import pytest
 
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.kernels.forward import (
-    ElementwiseOp, Embedding, Gemm, ReadInput, RMSNorm, LayerNorm, RoPE,
+    ElementwiseOp, Embedding, Gemm, Nop, ReadInput, RMSNorm, LayerNorm, RoPE,
     Attn, Slice, SparseAttn, Sampling, TokenDispatch, TokenCombine,
 )
 from rooflang.language.kernels import backward
@@ -101,6 +101,28 @@ class TestKernelBase:
 
 
 # ── Forward kernels ──────────────────────────────────────────────────
+
+
+class TestNop(TestKernelBase):
+    __test__ = True
+    kernel = Nop(
+        inputs={
+            "x": Tensor("bf16", (4, 8)),
+            "meta": Tensor("int32", (3,)),
+        },
+        outputs={
+            "done": Tensor("fp32", (7,)),
+            "token": Tensor("int32", (1,)),
+        },
+    )
+    expected_flops = 0.0
+    expected_input_bytes = 0.0
+    expected_weight_bytes = 0.0
+    expected_output_bytes = 0.0
+    expected_transferred_bytes = 0.0
+
+    def test_requires_no_placement(self):
+        assert self.kernel._requires_placement is False
 
 
 class TestReadInput(TestKernelBase):
@@ -225,6 +247,22 @@ class TestSampling(TestKernelBase):
 
 
 # ── Backward kernels ─────────────────────────────────────────────────
+
+
+class TestBwdNop(TestKernelBase):
+    __test__ = True
+    kernel = backward.Nop(
+        inputs={"dx": Tensor("bf16", (2, 3))},
+        outputs={"done": Tensor("int32", (5,))},
+    )
+    expected_flops = 0.0
+    expected_input_bytes = 0.0
+    expected_weight_bytes = 0.0
+    expected_output_bytes = 0.0
+    expected_transferred_bytes = 0.0
+
+    def test_requires_no_placement(self):
+        assert self.kernel._requires_placement is False
 
 
 class TestBwdReadInput(TestKernelBase):

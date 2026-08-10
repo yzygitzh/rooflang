@@ -8,6 +8,7 @@ from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.kernels.comm import AllReduce, Gather, Scatter
 from rooflang.language.kernels.forward import Slice
 from rooflang.language.kernels.identity import Concat, Move, Spawn
+from rooflang.language.optimization.comm import optimize_comms
 from rooflang.language.placement import Placement
 from rooflang.language.tensor import Tensor
 from rooflang.runtime.simulator import Bound, OOMError, Simulator
@@ -44,6 +45,13 @@ def _hw(read_bw=1.0, write_bw=1.0, tflops=1.0):
 
 def _sim(graph, placement, hardware):
     return Simulator(graph, placement, hardware).run()
+
+
+def _place_comm_tensors(placement, kernel, memories):
+    """Assign comm ports round-robin to their participant memories."""
+    tensors = list(kernel.inputs.values()) + list(kernel.outputs.values())
+    for index, tensor in enumerate(tensors):
+        placement.set_tensor_memory(tensor, memories[index % len(memories)])
 
 
 # ── Single kernel timing ─────────────────────────────────────────────
@@ -290,6 +298,7 @@ class TestAlphaSeparation:
         p = Placement(hardware=hw)
         p.set_kernel_device(k_pred, gpu0)
         p.set_kernel_device(k_succ, gpu1)
+        _place_comm_tensors(p, ar, [hbm0, hbm1])
 
         result = _sim(g, p, hw)
         # Find the AllReduce trace entries (one per participant)
@@ -557,9 +566,9 @@ def _hw_multi_gpu(n_gpus=2, hbm_bw=1000.0, link_bw=100.0, tflops=1000.0):
 
 
 class TestExplicitIdentityPlacement:
-    def test_comm_resolves_placed_identity_neighbors(self):
-        """A comm may be adjacent to explicitly placed zero-cost kernels."""
-        hw, gpus, _ = _hw_multi_gpu(n_gpus=2)
+    def test_simulator_uses_explicit_comm_tensor_placement(self):
+        """Comm participants come from explicitly placed tensor ports."""
+        hw, gpus, hbms = _hw_multi_gpu(n_gpus=2)
 
         source = Concat()
         source.inputs = {"x": Tensor("bf16", (2,))}
@@ -590,8 +599,13 @@ class TestExplicitIdentityPlacement:
 
         p = Placement(hardware=hw, graph=g)
         p.set_kernel_device(source, gpus[0])
-        for sink in sinks:
-            p.set_kernel_device(sink, gpus[1])
+        for rank, sink in enumerate(sinks):
+            p.set_kernel_device(sink, gpus[rank])
+        p.set_tensor_memory(scatter.inputs["x"], hbms[0])
+        for rank in range(2):
+            p.set_tensor_memory(scatter.outputs[f"o{rank}"], hbms[rank])
+        optimize_comms(g, p)
+        p.validate(g)
 
         result = _sim(g, p, hw)
         scatter_entries = [e for e in result.trace if e.kernel is scatter]
@@ -664,10 +678,13 @@ class TestCrossDeviceFabric:
                                        link_bw=100.0, tflops=1000.0)
         # Move on GPU0 writes output to HBM1 (remote)
         t_src = Tensor("bf16", (50000,))  # 100KB
-        move = Move(t_src, dst_location=hbms[1])
+        move = Move()
+        move.inputs = {"src0": t_src}
+        move.outputs = {"dst0": Tensor(t_src.dtype, t_src.shape)}
         g = ComputeGraph()
         g.add_kernel(move)
         p = Placement(hardware=hw, graph=g)
+        p.set_tensor_memory(move.outputs["dst0"], hbms[1])
         p.set_kernel_device(move, gpus[0])
         result = _sim(g, p, hw)
 
@@ -687,18 +704,24 @@ class TestCrossDeviceFabric:
                              outputs={"a": t1_a, "b": t1_b})
         # move1 on GPU1, move2 on GPU2: both write to HBM0 (remote)
         t_src1 = Tensor("bf16", (50000,))
-        move1 = Move(t_src1, dst_location=hbms[0])
+        move1 = Move()
+        move1.inputs = {"src0": t_src1}
+        move1.outputs = {"dst0": Tensor(t_src1.dtype, t_src1.shape)}
         t_src2 = Tensor("bf16", (50000,))
-        move2 = Move(t_src2, dst_location=hbms[0])
+        move2 = Move()
+        move2.inputs = {"src0": t_src2}
+        move2.outputs = {"dst0": Tensor(t_src2.dtype, t_src2.shape)}
 
         g = ComputeGraph()
         g.add_kernel(k1)
         g.add_kernel(move1)
         g.add_kernel(move2)
-        g.add_data_edge(k1, move1, {"a": "src"})
-        g.add_data_edge(k1, move2, {"b": "src"})
+        g.add_data_edge(k1, move1, {"a": "src0"})
+        g.add_data_edge(k1, move2, {"b": "src0"})
         p = Placement(hardware=hw, graph=g)
         p.set_kernel_device(k1, gpus[0])
+        p.set_tensor_memory(move1.outputs["dst0"], hbms[0])
+        p.set_tensor_memory(move2.outputs["dst0"], hbms[0])
         p.set_kernel_device(move1, gpus[1])
         p.set_kernel_device(move2, gpus[2])
         result = _sim(g, p, hw)
@@ -716,8 +739,8 @@ class TestCrossDeviceFabric:
 class TestCollectiveFabricSharing:
     def test_parallel_collectives_share_fabric(self):
         """Concurrent collectives on the same links divide fabric bandwidth."""
-        hw, gpus, _ = _hw_multi_gpu(n_gpus=2, hbm_bw=1000.0,
-                                    link_bw=100.0, tflops=1000.0)
+        hw, gpus, hbms = _hw_multi_gpu(n_gpus=2, hbm_bw=1000.0,
+                                       link_bw=100.0, tflops=1000.0)
         graph = ComputeGraph()
         placement = Placement(hardware=hw, graph=graph)
         scatters = []
@@ -741,6 +764,7 @@ class TestCollectiveFabricSharing:
             graph.add_data_edge(scatter, succ, {"o1": "x"})
             placement.set_kernel_device(pred, gpus[0], stream=stream)
             placement.set_kernel_device(succ, gpus[1], stream=stream)
+            _place_comm_tensors(placement, scatter, hbms)
             scatters.append(scatter)
 
         result = _sim(graph, placement, hw)
@@ -811,6 +835,7 @@ class TestMultiStreamComm:
         p.set_kernel_device(k_long, gpu1)
         p.set_kernel_device(k_pred, gpu0)
         p.set_kernel_device(k_succ, gpu1)
+        _place_comm_tensors(p, ar, [hbm0, hbm1])
 
         result = _sim(g, p, hw)
         # AR starts at t≈10 (after k_long frees GPU1/stream0)
@@ -868,6 +893,7 @@ class TestMultiStreamComm:
         p = Placement(hardware=hw, graph=g)
         p.set_kernel_device(k0, gpu0)
         p.set_kernel_device(k_after, gpu1)
+        _place_comm_tensors(p, ar, [hbm0, hbm1])
 
         result = _sim(g, p, hw)
         # AR: xfer = 100000/(100*1e3) = 1.0 us
@@ -912,6 +938,7 @@ class TestLocalComm:
         p.set_tensor_memory(k_pred.outputs["y"], hbm)
         p.set_tensor_memory(gather.outputs["y"], hbm)
         p.set_tensor_memory(k_succ.inputs["x"], hbm)
+        _place_comm_tensors(p, gather, [hbm])
 
         result = _sim(g, p, hw)
         # Gather resolved to local: mt = max(total_bytes/read_bw, total_bytes/write_bw)
@@ -1028,8 +1055,24 @@ class TestInferDtype:
         assert len(result.trace) == 1
 
 
-class TestFindLocalCommDevice:
-    """Tests for _find_local_comm_device optimization."""
+class TestInferCommDevices:
+    """Tests for standard comm-device inference from tensor memory."""
+
+    def test_infers_without_neighbor_kernel_placement(self):
+        hw, gpus, hbms = _hw_multi_gpu(n_gpus=2)
+        comm = AllReduce(total_bytes=2.0, world=2, dtype="bf16")
+        comm.inputs = {"x": Tensor("bf16", (1,))}
+        comm.outputs = {"y": Tensor("bf16", (1,))}
+        graph = ComputeGraph()
+        graph.add_kernel(comm)
+        placement = Placement(hardware=hw, graph=graph)
+        placement.set_tensor_memory(comm.inputs["x"], hbms[0])
+        placement.set_tensor_memory(comm.outputs["y"], hbms[1])
+
+        devices = Simulator(
+            graph, placement, hw)._infer_comm_devices(comm)
+
+        assert devices == gpus
 
     def test_comm_resolved_to_local_when_all_data_in_same_memory(self):
         """CommKernel between 2 GPUs resolves to local when all tensors in one memory."""
@@ -1071,6 +1114,7 @@ class TestFindLocalCommDevice:
         p.set_kernel_device(k_succ, gpu1)
         p.set_tensor_memory(t_pred_out, hbm)
         p.set_tensor_memory(k_succ.inputs["x"], hbm)
+        _place_comm_tensors(p, ar, [hbm])
 
         result = _sim(g, p, hw)
         # AR resolved to local device (gpu1 has highest BW=1000 to hbm)
@@ -1107,6 +1151,7 @@ class TestFindLocalCommDevice:
         p.set_kernel_device(k_succ, gpus[1])
         p.set_tensor_memory(t_pred_out, hbms[0])
         p.set_tensor_memory(k_succ.inputs["x"], hbms[1])
+        _place_comm_tensors(p, ar, hbms)
 
         result = _sim(g, p, hw)
         ar_entries = [e for e in result.trace if e.kernel is ar]
@@ -1160,6 +1205,7 @@ class TestHalfDuplexCollective:
         p = Placement(hardware=hw, graph=g)
         p.set_kernel_device(k_pred, gpu0)
         p.set_kernel_device(k_succ, gpu1)
+        _place_comm_tensors(p, ar, [hbm0, hbm1])
 
         result = _sim(g, p, hw)
         # AR xfer = 100000 / (50*1e3) = 2.0 us
@@ -1230,6 +1276,7 @@ class TestExtraParticipantStreamPending:
         p.set_kernel_device(k_ar_succ, gpu1)
         p.set_kernel_device(k_indep_pred, gpu1, stream=1)
         p.set_kernel_device(k_pending, gpu1, stream=0)
+        _place_comm_tensors(p, ar, [hbm0, hbm1])
 
         result = _sim(g, p, hw)
         # AR xfer = 200000/(100*1e3) = 2 us. AR blocks GPU1/stream0.

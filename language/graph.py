@@ -708,6 +708,24 @@ class HardwareGraph:
             raise ValueError(f"No memory attached to device: {device.name}")
         return best_mem
 
+    @lru_cache(maxsize=None)
+    def find_local_device(self, memory: Memory) -> Compute:
+        """Find the Compute node connected to memory with highest bandwidth."""
+        best_device: Optional[Compute] = None
+        best_bw = 0.0
+        for neighbor in self._graph.neighbors(memory):
+            if not isinstance(neighbor, Compute):
+                continue
+            for fab in self._graph.edges[memory, neighbor]["fabrics"]:
+                bw = (fab.src_to_dst_bandwidth_gbs if fab.src is neighbor
+                      else fab.dst_to_src_bandwidth_gbs)
+                if bw > best_bw:
+                    best_bw = bw
+                    best_device = neighbor
+        if best_device is None:
+            raise ValueError(f"No device attached to memory: {memory.name}")
+        return best_device
+
     def find_aggregate_bandwidth(self, devices: List[Compute]) -> float:
         """Aggregate bandwidth for ring/tree collectives among devices.
 

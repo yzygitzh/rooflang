@@ -35,6 +35,7 @@ from rooflang.language.kernels.comm import (
     ReduceScatter, Scatter,
 )
 from rooflang.language.kernels.identity import Move
+from rooflang.language.tensor import Tensor
 
 if TYPE_CHECKING:
     from rooflang.language.graph import ComputeGraph
@@ -53,14 +54,12 @@ def optimize_comms(graph: ComputeGraph, placement: Placement) -> None:
         changed |= _eliminate_dead(graph)
 
 
-def _same_device_set(graph: ComputeGraph, collector: Kernel,
-                     distributor: Kernel, placement: Placement) -> bool:
-    """Check if collector's predecessors and distributor's successors share the same devices."""
-    preds = sorted((placement.get_kernel_device(e.src).device for e in graph._in_edges(collector)), key=id)
-    succs = sorted((placement.get_kernel_device(e.dst).device for e in graph._out_edges(distributor)), key=id)
-    if len(preds) != len(succs):
-        return False
-    return all(a is b for a, b in zip(preds, succs))
+def _same_device_set(
+    collector: Kernel, distributor: Kernel, placement: Placement,
+) -> bool:
+    """Check whether two comm kernels use the same participant devices."""
+    return set(placement.infer_comm_devices(collector)) \
+        == set(placement.infer_comm_devices(distributor))
 
 
 def _create_collective(collector: Kernel, distributor: Kernel) -> Kernel | None:
@@ -100,9 +99,10 @@ def _fuse_pairs(graph: ComputeGraph, placement: Placement) -> bool:
             if isinstance(kernel, CommKernel):
                 for edge in out_edges:
                     successor = edge.dst
-                    if isinstance(successor, CommKernel) \
-                       and not _same_device_set(
-                           graph, kernel, successor, placement):
+                    if not isinstance(successor, CommKernel):
+                        continue
+                    if not _same_device_set(
+                            kernel, successor, placement):
                         pairs.append((kernel, successor, True))
 
             if not isinstance(kernel, (Gather, Reduce)):
@@ -119,19 +119,19 @@ def _fuse_pairs(graph: ComputeGraph, placement: Placement) -> bool:
                 continue
             if kernel.world != successor.world:
                 continue
-            if not _same_device_set(graph, kernel, successor, placement):
+            if not _same_device_set(kernel, successor, placement):
                 continue
             pairs.append((kernel, successor, False))
 
         if not pairs:
             break
 
-        did_change = True
+        round_changed = False
         for kernel, successor, cross_device_bypass in pairs:
             if not graph._dag.has_node(kernel) or not graph._dag.has_node(successor):
                 continue
             if cross_device_bypass:
-                _bypass_cross_device_pair(
+                round_changed |= _bypass_cross_device_pair(
                     graph, kernel, successor, placement)
                 continue
             collective = _create_collective(kernel, successor)
@@ -142,7 +142,13 @@ def _fuse_pairs(graph: ComputeGraph, placement: Placement) -> bool:
                     continue
                 _bypass_pair(graph, kernel, successor)
             else:
-                _replace_pair(graph, kernel, successor, collective)
+                _replace_pair(
+                    graph, kernel, successor, collective, placement)
+            round_changed = True
+
+        did_change |= round_changed
+        if not round_changed:
+            break
 
     return did_change
 
@@ -152,8 +158,48 @@ def _bypass_cross_device_pair(
     collector: Kernel,
     distributor: Kernel,
     placement: Placement,
-) -> None:
+) -> bool:
     """Apply the cross-device-set whitelist or reject the pair."""
+    # Sequential one-dimensional splits intentionally retain hierarchical
+    # collectors/distributors. Each level has its own world and cost.
+    if (
+        isinstance(collector, Gather)
+        and isinstance(distributor, Gather)
+    ) or (
+        isinstance(collector, Scatter)
+        and isinstance(distributor, Scatter)
+    ):
+        if isinstance(collector, Gather):
+            memory = next((
+                placement.get_tensor_memory(tensor)
+                for tensor in collector.inputs.values()
+                if placement.get_tensor_memory(tensor) is not None
+            ), None)
+        else:
+            memory = next((
+                placement.get_tensor_memory(tensor)
+                for tensor in distributor.outputs.values()
+                if placement.get_tensor_memory(tensor) is not None
+            ), None)
+        if memory is not None:
+            for edge in graph._out_edges(collector):
+                if edge.dst is not distributor:
+                    continue
+                for out_name, in_name in edge.mapping.items():
+                    placement.set_tensor_memory(
+                        collector.outputs[out_name], memory)
+                    placement.set_tensor_memory(
+                        distributor.inputs[in_name], memory)
+                    if isinstance(collector, Gather) \
+                            and in_name == next(iter(distributor.inputs)):
+                        for tensor in distributor.outputs.values():
+                            placement.set_tensor_memory(tensor, memory)
+                    elif isinstance(collector, Scatter) \
+                            and out_name == next(iter(collector.outputs)):
+                        for tensor in collector.inputs.values():
+                            placement.set_tensor_memory(tensor, memory)
+        return False
+
     if (
         isinstance(collector, Gather)
         and isinstance(distributor, Scatter)
@@ -184,18 +230,25 @@ def _bypass_cross_device_pair(
                 graph.add_data_edge(src_kernel, dst_kernel, {src_out: dst_in})
                 continue
 
-            move = Move(src_tensor, dst_location=dst_memory)
+            move = Move()
+            move.inputs = {"src0": src_tensor}
+            move.outputs = {
+                "dst0": Tensor(src_tensor.dtype, src_tensor.shape),
+            }
             graph.add_kernel(move)
-            graph.add_data_edge(src_kernel, move, {src_out: "src"})
-            graph.add_data_edge(move, dst_kernel, {"dst": dst_in})
-            placement.set_tensor_memory(move.inputs["src"], src_memory)
-            placement.set_tensor_memory(move.outputs["dst"], dst_memory)
-            assignment = placement.get_kernel_device(src_kernel)
+            graph.add_data_edge(src_kernel, move, {src_out: "src0"})
+            graph.add_data_edge(move, dst_kernel, {"dst0": dst_in})
+            placement.set_tensor_memory(move.inputs["src0"], src_memory)
+            placement.set_tensor_memory(move.outputs["dst0"], dst_memory)
+            stream = 0
+            if src_kernel in placement.placed_kernels:
+                stream = placement.get_kernel_device(src_kernel).stream
             placement.set_kernel_device(
-                move, assignment.device, stream=assignment.stream)
+                move, placement.get_tensor_device(src_tensor), stream=stream)
 
         graph.remove_kernel(collector)
         graph.remove_kernel(distributor)
+        return True
     else:
         raise ValueError(
             "Unsupported cross-device-set communication pair: "
@@ -204,12 +257,25 @@ def _bypass_cross_device_pair(
 
 
 def _replace_pair(
-    graph: ComputeGraph,
-    collector: Kernel, distributor: Kernel, collective: Kernel,
+    graph: ComputeGraph, collector: Kernel, distributor: Kernel,
+    collective: Kernel, placement: Placement,
 ) -> None:
     """Replace (collector, distributor) with a fused collective."""
-    collective.inputs = dict(collector.inputs)
-    collective.outputs = dict(distributor.outputs)
+    collective.inputs = {
+        name: Tensor(tensor.dtype, tensor.shape)
+        for name, tensor in collector.inputs.items()
+    }
+    collective.outputs = {
+        name: Tensor(tensor.dtype, tensor.shape)
+        for name, tensor in distributor.outputs.items()
+    }
+    for old_tensor, new_tensor in zip(
+        list(collector.inputs.values()) + list(distributor.outputs.values()),
+        list(collective.inputs.values()) + list(collective.outputs.values()),
+    ):
+        memory = placement.get_tensor_memory(old_tensor)
+        if memory is not None:
+            placement.set_tensor_memory(new_tensor, memory)
     graph.add_kernel(collective)
 
     for edge in graph._in_edges(collector):

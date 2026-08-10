@@ -477,6 +477,17 @@ class Simulator:
     # ── Resolution helpers ──────────────────────────────────────────
 
     def _resolve(self, kernel: Kernel):
+        if isinstance(kernel, CommKernel):
+            devices = self._infer_comm_devices(kernel)
+            stream = 0
+            for predecessor in self._graph._dag.predecessors(kernel):
+                if predecessor._requires_placement \
+                        or predecessor in self._placement._mapping:
+                    stream = self._placement.get_kernel_device(
+                        predecessor).stream
+                    break
+            return devices[0], stream, 1.0, devices
+
         if kernel._requires_placement or kernel in self._placement._mapping:
             a = self._placement.get_kernel_device(kernel)
             return a.device, a.stream, a.resource_cap, []
@@ -506,49 +517,11 @@ class Simulator:
                 stream = self._placement.get_kernel_device(p).stream
                 break
 
-        if isinstance(kernel, CommKernel) and len(devs) > 1:
-            local_dev = self._find_local_comm_device(kernel)
-            if local_dev is not None:
-                return local_dev, stream, 1.0, [local_dev]
-
         return primary, stream, 1.0, devs
 
-    def _find_local_comm_device(self, kernel: Kernel) -> Optional[Compute]:
-        """If all input/output data is in the same memory, return the closest device."""
-        target_mem = None
-        for edge in self._graph._in_edges(kernel):
-            for out_name in edge.mapping:
-                mem = self._placement.get_tensor_memory(edge.src.outputs[out_name])
-                if mem is None:
-                    return None
-                if target_mem is None:
-                    target_mem = mem
-                elif mem is not target_mem:
-                    return None
-        for edge in self._graph._out_edges(kernel):
-            for _, in_name in edge.mapping.items():
-                mem = self._placement.get_tensor_memory(edge.dst.inputs[in_name])
-                if mem is None:
-                    return None
-                if target_mem is None:
-                    target_mem = mem
-                elif mem is not target_mem:
-                    return None
-        if target_mem is None:
-            return None
-        best_dev, best_bw = None, 0.0
-        for node in self._hardware.nodes:
-            if not isinstance(node, Compute):
-                continue
-            try:
-                fab = self._hardware.find_fabric(node, target_mem)
-            except (ValueError, KeyError):
-                continue
-            bw = max(fab.src_to_dst_bandwidth_gbs, fab.dst_to_src_bandwidth_gbs)
-            if bw > best_bw:
-                best_bw = bw
-                best_dev = node
-        return best_dev
+    def _infer_comm_devices(self, kernel: CommKernel) -> List[Compute]:
+        """Infer communication devices from the kernel's placed buffers."""
+        return self._placement.infer_comm_devices(kernel)
 
     def _base_times(self, kernel: Kernel, device: Compute,
                     participants: List[Compute]):

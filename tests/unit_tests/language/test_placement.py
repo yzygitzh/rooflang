@@ -5,7 +5,7 @@ import pytest
 from rooflang.language.placement import Placement, DeviceAssignment
 from rooflang.language.hardware.component import Compute, Memory
 from rooflang.language.kernels.kernel import Kernel
-from rooflang.language.kernels.comm import AllReduce
+from rooflang.language.kernels.comm import AllReduce, Scatter
 from rooflang.language.kernels.forward import Slice
 from rooflang.language.kernels.identity import Concat, Move, Spawn
 from rooflang.language.graph import ComputeGraph, FabricEdge, HardwareGraph
@@ -167,6 +167,16 @@ class TestPlacementValidate:
         p.set_kernel_device(k, gpu)
         p.validate(g)
 
+    def test_unplaced_comm_kernel_tensor_memory_is_checked(self):
+        comm = AllReduce(total_bytes=8.0, world=2, dtype="bf16")
+        comm.inputs = {"i0": Tensor("bf16", (4,))}
+        comm.outputs = {"o0": Tensor("bf16", (4,))}
+        graph = ComputeGraph()
+        graph.add_kernel(comm)
+
+        with pytest.raises(ValueError, match="input.*has no memory"):
+            Placement().validate(graph)
+
     @pytest.mark.parametrize(
         "kernel", [Spawn(world=1), Concat(), Slice()],
         ids=["spawn", "concat", "slice"],
@@ -244,15 +254,37 @@ class TestPlacementTensorMemory:
         assert p.get_tensor_memory(t_w) is hbm
         assert p.get_tensor_memory(t_out) is hbm
 
-    def test_output_follows_move_dst(self):
+    def test_move_output_defaults_to_kernel_local_memory(self):
         hw, gpu, hbm = _simple_hw()
-        nvme = Memory(name="nvme", capacity_gb=3840.0)
         t_src = Tensor("bf16", (1024,))
-        m = Move(t_src, dst_location=nvme)
+        m = Move()
+        m.inputs = {"src0": t_src}
+        m.outputs = {"dst0": Tensor(t_src.dtype, t_src.shape)}
         p = Placement(hardware=hw)
         p.set_kernel_device(m, gpu)
-        assert p.get_tensor_memory(m.outputs["dst"]) is nvme
+        assert p.get_tensor_memory(m.outputs["dst0"]) is hbm
         assert p.get_tensor_memory(t_src) is hbm
+
+    def test_move_output_preserves_explicit_placement(self):
+        hw, gpu, hbm = _simple_hw()
+        nvme = Memory(name="nvme", capacity_gb=3840.0)
+        inputs = [Tensor("bf16", (1024,)), Tensor("bf16", (2048,))]
+        move = Move()
+        move.inputs = {
+            f"src{i}": tensor for i, tensor in enumerate(inputs)
+        }
+        move.outputs = {
+            f"dst{i}": Tensor(tensor.dtype, tensor.shape)
+            for i, tensor in enumerate(inputs)
+        }
+        placement = Placement(hardware=hw)
+
+        placement.set_tensor_memory(move.outputs["dst0"], hbm)
+        placement.set_tensor_memory(move.outputs["dst1"], nvme)
+        placement.set_kernel_device(move, gpu)
+
+        assert placement.get_tensor_memory(move.outputs["dst0"]) is hbm
+        assert placement.get_tensor_memory(move.outputs["dst1"]) is nvme
 
     def test_input_follows_predecessor_output(self):
         hw, gpu, hbm = _simple_hw()
@@ -278,6 +310,24 @@ class TestPlacementTensorMemory:
         p.set_kernel_device(k2, gpu)
         # k2's input "x" should follow k1's output "y" memory (hbm)
         assert p.get_tensor_memory(t_in2) is hbm
+
+    def test_kernel_placement_does_not_fill_adjacent_comm_ports(self):
+        hw, gpu, _ = _simple_hw()
+        source = Kernel(outputs={"y": Tensor("bf16", (4,))})
+        scatter = Scatter(total_bytes=8.0, world=1)
+        scatter.inputs = {"x": Tensor("bf16", (4,))}
+        scatter.outputs = {"o0": Tensor("bf16", (4,))}
+        graph = ComputeGraph()
+        graph.add_kernel(source)
+        graph.add_kernel(scatter)
+        graph.add_data_edge(source, scatter, {"y": "x"})
+        placement = Placement(hardware=hw, graph=graph)
+
+        placement.set_kernel_device(source, gpu)
+
+        assert placement.get_tensor_memory(scatter.inputs["x"]) is None
+        with pytest.raises(ValueError, match="input.*has no memory"):
+            placement.validate(graph)
 
     def test_set_tensor_memory_overrides(self):
         hw, gpu, hbm = _simple_hw()

@@ -147,3 +147,37 @@ class TestFindLocalMemory:
                                dst_to_src_bandwidth_gbs=7750.0,
                                is_full_duplex=False))
         assert hw.find_local_memory(g) is fast
+
+
+class TestFindLocalDevice:
+    def test_finds_attached_device(self):
+        hw, g0, _, _, hbm0, _, _, _ = _two_gpu_graph()
+        assert hw.find_local_device(hbm0) is g0
+
+    def test_no_device_raises(self):
+        memory = Memory(name="memory", capacity_gb=1.0)
+        hw = HardwareGraph()
+        hw.add_node(memory)
+        with pytest.raises(ValueError, match="No device"):
+            hw.find_local_device(memory)
+
+    def test_picks_higher_bw_when_multiple(self):
+        slow = Compute(name="slow")
+        fast = Compute(name="fast")
+        memory = Memory(name="shared", capacity_gb=1.0)
+        hw = HardwareGraph()
+        for component in (slow, fast, memory):
+            hw.add_node(component)
+        hw.add_edge(FabricEdge(
+            name="slow-link", src=slow, dst=memory,
+            src_to_dst_bandwidth_gbs=500.0,
+            dst_to_src_bandwidth_gbs=500.0,
+            is_full_duplex=False,
+        ))
+        hw.add_edge(FabricEdge(
+            name="fast-link", src=fast, dst=memory,
+            src_to_dst_bandwidth_gbs=1000.0,
+            dst_to_src_bandwidth_gbs=1000.0,
+            is_full_duplex=False,
+        ))
+        assert hw.find_local_device(memory) is fast

@@ -1,5 +1,7 @@
 """Unit tests for rooflang.language.kernels (Kernel base + all subclasses)."""
 
+import pytest
+
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.kernels.forward import (
     ElementwiseOp, Embedding, Gemm, ReadInput, RMSNorm, LayerNorm, RoPE,
@@ -12,7 +14,6 @@ from rooflang.language.kernels.comm import (
 )
 from rooflang.language.kernels.optimizer import AdamWStep
 from rooflang.language.kernels.identity import Concat, Move, Spawn
-from rooflang.language.hardware.component import Memory
 from rooflang.language.tensor import Tensor
 
 
@@ -463,21 +464,42 @@ class TestAdamWStep(TestKernelBase):
 
 class TestMove(TestKernelBase):
     __test__ = True
-    _nvme = Memory(name="nvme", capacity_gb=3840.0)
-    kernel = Move(Tensor("bf16", (4, 4)), _nvme)
+    _tensor = Tensor("bf16", (4, 4))
+    kernel = Move()
+    kernel.inputs = {"src0": _tensor}
+    kernel.outputs = {"dst0": Tensor(_tensor.dtype, _tensor.shape)}
     expected_flops = 0.0
     expected_input_bytes = 16 * 2.0
     expected_weight_bytes = 0.0
     expected_output_bytes = 16 * 2.0
 
-    def test_dst_location(self):
-        assert self.kernel.dst_location is self._nvme
-
     def test_preserves_shape_and_dtype(self):
-        hbm = Memory(name="hbm", capacity_gb=288.0)
-        m = Move(Tensor("fp32", (8, 16)), hbm)
-        assert m.outputs["dst"].dtype == "fp32"
-        assert m.outputs["dst"].shape == (8, 16)
+        tensor = Tensor("fp32", (8, 16))
+        m = Move()
+        m.inputs = {"src0": tensor}
+        m.outputs = {"dst0": Tensor(tensor.dtype, tensor.shape)}
+        assert m.outputs["dst0"].dtype == "fp32"
+        assert m.outputs["dst0"].shape == (8, 16)
+
+    def test_multiple_tensors(self):
+        tensors = [Tensor("bf16", (4, 4)), Tensor("fp32", (2, 8))]
+        m = Move()
+        m.inputs = {f"src{i}": tensor for i, tensor in enumerate(tensors)}
+        m.outputs = {
+            f"dst{i}": Tensor(tensor.dtype, tensor.shape)
+            for i, tensor in enumerate(tensors)
+        }
+        assert list(m.inputs) == ["src0", "src1"]
+        assert list(m.outputs) == ["dst0", "dst1"]
+        assert m.input_bytes == 4 * 4 * 2 + 2 * 8 * 4
+        assert m.output_bytes == m.input_bytes
+
+    def test_empty_initialization(self):
+        move = Move()
+        assert move.inputs == {}
+        assert move.outputs == {}
+        assert move.input_bytes == 0
+        assert move.output_bytes == 0
 
 
 # ── MoE dispatch/combine kernels ────────────────────────────────────

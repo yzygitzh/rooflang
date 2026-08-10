@@ -2,7 +2,7 @@
 
 import pytest
 
-from rooflang.language.graph import ComputeGraph
+from rooflang.language.graph import ComputeGraph, FabricEdge, HardwareGraph
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.kernels.comm import (
     AllGather, AllReduce, AllToAll, Broadcast, CommKernel, Gather, Reduce,
@@ -31,13 +31,19 @@ def _build_chain(collector, distributor, n, same_devices=True):
     g = ComputeGraph()
     gpus = [Compute(name=f"gpu{i}") for i in range(n)]
 
-    preds = [Kernel(outputs={"y": SHARD}) for _ in range(n)]
-    succs = [Kernel(inputs={"a": SHARD}) for _ in range(n)]
+    preds = [Kernel(outputs={"y": Tensor("bf16", SHARD.shape)})
+             for _ in range(n)]
+    succs = [Kernel(inputs={"a": Tensor("bf16", SHARD.shape)})
+             for _ in range(n)]
 
-    collector.inputs = {f"x{i}": SHARD for i in range(n)}
-    collector.outputs = {"z": SHARD}
-    distributor.inputs = {"z": SHARD}
-    distributor.outputs = {f"y{i}": SHARD for i in range(n)}
+    collector.inputs = {
+        f"x{i}": Tensor("bf16", SHARD.shape) for i in range(n)
+    }
+    collector.outputs = {"z": Tensor("bf16", SHARD.shape)}
+    distributor.inputs = {"z": Tensor("bf16", SHARD.shape)}
+    distributor.outputs = {
+        f"y{i}": Tensor("bf16", SHARD.shape) for i in range(n)
+    }
 
     for k in preds + [collector, distributor] + succs:
         g.add_kernel(k)
@@ -47,16 +53,42 @@ def _build_chain(collector, distributor, n, same_devices=True):
     for i, s in enumerate(succs):
         g.add_data_edge(distributor, s, {f"y{i}": "a"})
 
-    placement = Placement()
+    other_gpus = []
+    if not same_devices:
+        other_gpus = [Compute(name=f"other{i}") for i in range(n)]
+    hw = HardwareGraph()
+    memories = {}
+    for device in gpus + other_gpus:
+        memory = Memory(name=f"{device.name}-hbm", capacity_gb=1.0)
+        hw.add_node(device)
+        hw.add_node(memory)
+        hw.add_edge(FabricEdge(
+            name=f"{device.name}-hbm", src=device, dst=memory,
+            src_to_dst_bandwidth_gbs=1.0,
+            dst_to_src_bandwidth_gbs=1.0,
+            is_full_duplex=False,
+        ))
+        memories[device] = memory
+
+    placement = Placement(hardware=hw, graph=g)
     for i, p in enumerate(preds):
         placement.set_kernel_device(p, gpus[i])
     if same_devices:
         for i, s in enumerate(succs):
             placement.set_kernel_device(s, gpus[i])
+        successor_devices = gpus
     else:
-        other_gpus = [Compute(name=f"other{i}") for i in range(n)]
         for i, s in enumerate(succs):
             placement.set_kernel_device(s, other_gpus[i])
+        successor_devices = other_gpus
+
+    for i, tensor in enumerate(collector.inputs.values()):
+        placement.set_tensor_memory(tensor, memories[gpus[i]])
+    placement.set_tensor_memory(collector.outputs["z"], memories[gpus[0]])
+    placement.set_tensor_memory(distributor.inputs["z"], memories[gpus[0]])
+    for device, tensor in zip(
+            successor_devices, distributor.outputs.values()):
+        placement.set_tensor_memory(tensor, memories[device])
 
     return g, placement, preds, succs
 
@@ -98,6 +130,30 @@ class TestFuseWorld4:
         assert len(comms) == 1
         assert isinstance(next(iter(comms)), AllToAll)
 
+    def test_fused_collective_inherits_outer_tensor_memories(self):
+        gather = Gather(total_bytes=128, world=2, dim=0)
+        broadcast = Broadcast(total_bytes=128, world=2)
+        graph, placement, preds, succs = _build_chain(
+            gather, broadcast, n=2)
+        memories = [
+            placement.get_tensor_memory(tensor)
+            for tensor in gather.inputs.values()
+        ]
+
+        optimize_comms(graph, placement)
+
+        collective = next(
+            kernel for kernel in graph.kernels if isinstance(kernel, AllGather)
+        )
+        assert [
+            placement.get_tensor_memory(tensor)
+            for tensor in collective.inputs.values()
+        ] == memories
+        assert [
+            placement.get_tensor_memory(tensor)
+            for tensor in collective.outputs.values()
+        ] == memories
+
 
 class TestFuseWorld1Eliminated:
     def test_reduce_broadcast_world1_eliminated(self):
@@ -135,6 +191,19 @@ class TestBypass:
 
 
 class TestCrossDeviceSetWhitelist:
+    @pytest.mark.parametrize("comm_cls", [Gather, Scatter])
+    def test_same_direction_hierarchy_is_preserved(self, comm_cls):
+        first = comm_cls(total_bytes=128, world=4, dim=0)
+        second = comm_cls(total_bytes=128, world=2, dim=1)
+        graph, placement, preds, succs = _build_chain(
+            first, second, n=4, same_devices=False)
+
+        optimize_comms(graph, placement)
+
+        assert first in graph.kernels
+        assert second in graph.kernels
+        assert set(preds + succs + [first, second]) == graph.kernels
+
     def test_gather_scatter_becomes_rank_direct_edges(self):
         gather = Gather(total_bytes=128, world=4, dim=0)
         scatter = Scatter(total_bytes=128, world=4, dim=0)
@@ -143,38 +212,23 @@ class TestCrossDeviceSetWhitelist:
 
         optimize_comms(g, p)
 
-        assert g.kernels == frozenset(preds + succs)
+        moves = [kernel for kernel in g.kernels if isinstance(kernel, Move)]
+        assert len(moves) == 4
         assert gather not in g.kernels
         assert scatter not in g.kernels
         for pred, succ in zip(preds, succs):
-            assert g._out_edges(pred)[0].dst is succ
-            assert g._in_edges(succ)[0].src is pred
+            move = g._out_edges(pred)[0].dst
+            assert isinstance(move, Move)
+            assert g._out_edges(move)[0].dst is succ
 
     def test_different_memories_insert_move(self):
-        shard = Tensor("bf16", (4, 4))
-        pred = Kernel(outputs={"y": Tensor("bf16", shard.shape)})
-        gather = Gather(total_bytes=shard.size_bytes, world=1, dim=0)
-        gather.inputs = {"i0": Tensor("bf16", shard.shape)}
-        gather.outputs = {"y": Tensor("bf16", shard.shape)}
-        scatter = Scatter(total_bytes=shard.size_bytes, world=1, dim=0)
-        scatter.inputs = {"x": Tensor("bf16", shard.shape)}
-        scatter.outputs = {"o0": Tensor("bf16", shard.shape)}
-        succ = Kernel(inputs={"x": Tensor("bf16", shard.shape)})
-
-        graph = ComputeGraph()
-        for kernel in (pred, gather, scatter, succ):
-            graph.add_kernel(kernel)
-        graph.add_data_edge(pred, gather, {"y": "i0"})
-        graph.add_data_edge(gather, scatter, {"y": "x"})
-        graph.add_data_edge(scatter, succ, {"o0": "x"})
-
-        src_mem = Memory(name="src-hbm", capacity_gb=1.0)
-        dst_mem = Memory(name="dst-hbm", capacity_gb=1.0)
-        placement = Placement()
-        placement.set_kernel_device(pred, Compute(name="src-gpu"))
-        placement.set_kernel_device(succ, Compute(name="dst-gpu"))
-        placement.set_tensor_memory(pred.outputs["y"], src_mem)
-        placement.set_tensor_memory(succ.inputs["x"], dst_mem)
+        gather = Gather(total_bytes=SHARD.size_bytes, world=1, dim=0)
+        scatter = Scatter(total_bytes=SHARD.size_bytes, world=1, dim=0)
+        graph, placement, preds, succs = _build_chain(
+            gather, scatter, n=1, same_devices=False)
+        pred, succ = preds[0], succs[0]
+        src_mem = placement.get_tensor_memory(pred.outputs["y"])
+        dst_mem = placement.get_tensor_memory(succ.inputs["a"])
 
         optimize_comms(graph, placement)
 
@@ -185,8 +239,8 @@ class TestCrossDeviceSetWhitelist:
         assert graph._out_edges(pred)[0].dst is move
         assert graph._out_edges(move)[0].dst is succ
         assert placement.get_tensor_memory(pred.outputs["y"]) is src_mem
-        assert placement.get_tensor_memory(move.outputs["dst"]) is dst_mem
-        assert placement.get_tensor_memory(succ.inputs["x"]) is dst_mem
+        assert placement.get_tensor_memory(move.outputs["dst0"]) is dst_mem
+        assert placement.get_tensor_memory(succ.inputs["a"]) is dst_mem
         assert placement.get_kernel_device(move).device \
             is placement.get_kernel_device(pred).device
         placement.validate(graph)
@@ -228,7 +282,9 @@ class TestCrossDeviceSetWhitelist:
         g, p, preds, succs = _build_chain(
             gather, scatter, n=4, same_devices=False)
         optimize_comms(g, p)
-        assert g.kernels == frozenset(preds + succs)
+        assert len([k for k in g.kernels if isinstance(k, Move)]) == 4
+        assert gather not in g.kernels
+        assert scatter not in g.kernels
 
 
 class TestEliminateDead:
@@ -303,122 +359,63 @@ class TestFusePairsGuards:
         graph.add_data_edge(gather, extra, {"extra": "x"})
         source_device = placement.get_kernel_device(preds[0]).device
         placement.set_kernel_device(extra, source_device)
+        placement.set_tensor_memory(
+            gather.outputs["extra"],
+            placement.get_tensor_memory(extra.inputs["x"]))
 
         optimize_comms(graph, placement)
         assert gather not in graph.kernels
         assert scatter not in graph.kernels
-        assert set(preds + succs + [extra]) == graph.kernels
+        moves = [kernel for kernel in graph.kernels if isinstance(kernel, Move)]
+        assert len(moves) == 2
+        assert set(preds + succs + [extra] + moves) == graph.kernels
 
     def test_collector_multi_out_edges_no_fuse(self):
-        g = ComputeGraph()
-        gpus = [Compute(name=f"gpu{i}") for i in range(2)]
-        preds = [Kernel(outputs={"y": SHARD}) for _ in range(2)]
         r = Reduce(total_bytes=128.0, world=2, dtype="bf16")
-        r.inputs = {"x0": SHARD, "x1": SHARD}
-        r.outputs = {"z": SHARD, "z2": SHARD}
         b = Broadcast(total_bytes=128.0, world=2)
-        b.inputs = {"z": SHARD}
-        b.outputs = {"y0": SHARD, "y1": SHARD}
-        extra = Kernel(inputs={"q": SHARD})
-        succs = [Kernel(inputs={"a": SHARD}) for _ in range(2)]
-        for k in preds + [r, b, extra] + succs:
-            g.add_kernel(k)
-        for i, p in enumerate(preds):
-            g.add_data_edge(p, r, {"y": f"x{i}"})
-        g.add_data_edge(r, b, {"z": "z"})
+        g, p, preds, succs = _build_chain(r, b, n=2)
+        r.outputs["z2"] = Tensor("bf16", SHARD.shape)
+        extra = Kernel(inputs={"q": Tensor("bf16", SHARD.shape)})
+        g.add_kernel(extra)
         g.add_data_edge(r, extra, {"z2": "q"})
-        for i, s in enumerate(succs):
-            g.add_data_edge(b, s, {f"y{i}": "a"})
-        p = Placement()
-        for i, pred in enumerate(preds):
-            p.set_kernel_device(pred, gpus[i])
-        for i, s in enumerate(succs):
-            p.set_kernel_device(s, gpus[i])
-        p.set_kernel_device(extra, gpus[0])
+        device = p.get_kernel_device(preds[0]).device
+        p.set_kernel_device(extra, device)
+        p.set_tensor_memory(
+            r.outputs["z2"], p.get_tensor_memory(extra.inputs["q"]))
         optimize_comms(g, p)
         assert r in g.kernels
         assert b in g.kernels
 
     def test_succ_multi_in_edges_no_fuse(self):
-        g = ComputeGraph()
-        gpus = [Compute(name=f"gpu{i}") for i in range(2)]
-        preds = [Kernel(outputs={"y": SHARD}) for _ in range(2)]
         r = Reduce(total_bytes=128.0, world=2, dtype="bf16")
-        r.inputs = {"x0": SHARD, "x1": SHARD}
-        r.outputs = {"z": SHARD}
         b = Broadcast(total_bytes=128.0, world=2)
-        b.inputs = {"z": SHARD, "q": SHARD}
-        b.outputs = {"y0": SHARD, "y1": SHARD}
-        extra = Kernel(outputs={"q": SHARD})
-        succs = [Kernel(inputs={"a": SHARD}) for _ in range(2)]
-        for k in preds + [r, b, extra] + succs:
-            g.add_kernel(k)
-        for i, p in enumerate(preds):
-            g.add_data_edge(p, r, {"y": f"x{i}"})
-        g.add_data_edge(r, b, {"z": "z"})
+        g, p, preds, succs = _build_chain(r, b, n=2)
+        b.inputs["q"] = Tensor("bf16", SHARD.shape)
+        extra = Kernel(outputs={"q": Tensor("bf16", SHARD.shape)})
+        g.add_kernel(extra)
         g.add_data_edge(extra, b, {"q": "q"})
-        for i, s in enumerate(succs):
-            g.add_data_edge(b, s, {f"y{i}": "a"})
-        p = Placement()
-        for i, pred in enumerate(preds):
-            p.set_kernel_device(pred, gpus[i])
-        for i, s in enumerate(succs):
-            p.set_kernel_device(s, gpus[i])
-        p.set_kernel_device(extra, gpus[0])
+        device = p.get_kernel_device(preds[0]).device
+        p.set_kernel_device(extra, device)
+        p.set_tensor_memory(
+            b.inputs["q"], p.get_tensor_memory(extra.outputs["q"]))
         optimize_comms(g, p)
         assert r in g.kernels
         assert b in g.kernels
 
     def test_world_mismatch_no_fuse(self):
-        g = ComputeGraph()
-        gpus = [Compute(name=f"gpu{i}") for i in range(2)]
-        preds = [Kernel(outputs={"y": SHARD}) for _ in range(2)]
         r = Reduce(total_bytes=128.0, world=2, dtype="bf16")
-        r.inputs = {"x0": SHARD, "x1": SHARD}
-        r.outputs = {"z": SHARD}
         b = Broadcast(total_bytes=128.0, world=4)
-        b.inputs = {"z": SHARD}
-        b.outputs = {"y0": SHARD, "y1": SHARD}
-        succs = [Kernel(inputs={"a": SHARD}) for _ in range(2)]
-        for k in preds + [r, b] + succs:
-            g.add_kernel(k)
-        for i, p in enumerate(preds):
-            g.add_data_edge(p, r, {"y": f"x{i}"})
-        g.add_data_edge(r, b, {"z": "z"})
-        for i, s in enumerate(succs):
-            g.add_data_edge(b, s, {f"y{i}": "a"})
-        p = Placement()
-        for i, pred in enumerate(preds):
-            p.set_kernel_device(pred, gpus[i])
-        for i, s in enumerate(succs):
-            p.set_kernel_device(s, gpus[i])
+        g, p, _, _ = _build_chain(r, b, n=2)
         optimize_comms(g, p)
         assert r in g.kernels
         assert b in g.kernels
 
     def test_pred_succ_length_mismatch_raises(self):
-        g = ComputeGraph()
-        gpus = [Compute(name=f"gpu{i}") for i in range(3)]
-        preds = [Kernel(outputs={"y": SHARD}) for _ in range(3)]
         r = Reduce(total_bytes=128.0, world=3, dtype="bf16")
-        r.inputs = {f"x{i}": SHARD for i in range(3)}
-        r.outputs = {"z": SHARD}
         b = Broadcast(total_bytes=128.0, world=3)
-        b.inputs = {"z": SHARD}
-        b.outputs = {"y0": SHARD, "y1": SHARD}
-        succs = [Kernel(inputs={"a": SHARD}) for _ in range(2)]
-        for k in preds + [r, b] + succs:
-            g.add_kernel(k)
-        for i, p in enumerate(preds):
-            g.add_data_edge(p, r, {"y": f"x{i}"})
-        g.add_data_edge(r, b, {"z": "z"})
-        for i, s in enumerate(succs):
-            g.add_data_edge(b, s, {f"y{i}": "a"})
-        p = Placement()
-        for i, pred in enumerate(preds):
-            p.set_kernel_device(pred, gpus[i])
-        for i, s in enumerate(succs):
-            p.set_kernel_device(s, gpus[i])
+        g, p, _, succs = _build_chain(r, b, n=3)
+        g.remove_kernel(succs[2])
+        del b.outputs["y2"]
         with pytest.raises(
                 ValueError, match="Unsupported cross-device-set"):
             optimize_comms(g, p)
@@ -946,6 +943,36 @@ class TestBatchSplitSlice:
             assert copy.inputs["x"].shape == (8, 64)
             assert copy.outputs["y"].shape == (8, 8)
             assert copy._requires_placement is True
+
+
+class TestBatchAndContextSplitMove:
+    def setup_method(self):
+        tensors = [Tensor("bf16", (8, 16, 64)),
+                   Tensor("bf16", (8, 32, 64))]
+        self.move = Move()
+        self.move.inputs = {
+            f"src{i}": tensor for i, tensor in enumerate(tensors)
+        }
+        self.move.outputs = {
+            f"dst{i}": Tensor(tensor.dtype, tensor.shape)
+            for i, tensor in enumerate(tensors)
+        }
+
+    def test_batch_split(self):
+        _, copies, _ = batch_split(self.move, N)
+        assert len(copies) == N
+        for copy in copies:
+            assert copy.inputs["src0"].shape == (2, 16, 64)
+            assert copy.inputs["src1"].shape == (2, 32, 64)
+            assert copy.input_bytes == copy.output_bytes
+
+    def test_context_split(self):
+        _, copies, _ = context_split(self.move, N)
+        assert len(copies) == N
+        for copy in copies:
+            assert copy.inputs["src0"].shape == (8, 4, 64)
+            assert copy.inputs["src1"].shape == (8, 8, 64)
+            assert copy.input_bytes == copy.output_bytes
 
 
 class TestBatchSplitTokenDispatch:

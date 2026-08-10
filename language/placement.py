@@ -2,14 +2,14 @@
 
 The placement pass produces a Placement object that maps each compute kernel
 to a (device, stream, resource_cap) triple, and each tensor to a Memory node.
-Communication kernels do not require placement — their cost is attributed to
-adjacent compute kernels.
+Communication kernels do not require device placement. Their participant
+devices are inferred from the memory placement of their input/output tensors.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, FrozenSet, Optional
+from typing import TYPE_CHECKING, Dict, FrozenSet, List, Optional
 
 from rooflang.language.graph import HardwareGraph
 
@@ -77,6 +77,36 @@ class Placement:
         """Get the memory location for a tensor, or None if unset."""
         return self._memory.get(tensor)
 
+    def infer_comm_devices(self, kernel: Kernel) -> List[Compute]:
+        """Infer comm participants solely from its placed tensor ports."""
+        if self._hardware is None:
+            raise ValueError("Cannot infer comm devices without hardware")
+
+        devices = []
+        for tensor in (*kernel.inputs.values(), *kernel.outputs.values()):
+            memory = self.get_tensor_memory(tensor)
+            if memory is None:
+                raise ValueError(
+                    f"Cannot infer device for {type(kernel).__name__}: "
+                    "an input/output tensor has no memory placement")
+            device = self._hardware.find_local_device(memory)
+            if device not in devices:
+                devices.append(device)
+        if not devices:
+            raise ValueError(
+                f"Cannot infer device for {type(kernel).__name__}: "
+                "kernel has no input/output tensors")
+        return devices
+
+    def get_tensor_device(self, tensor: Tensor) -> Compute:
+        """Return the local compute device for one placed tensor."""
+        if self._hardware is None:
+            raise ValueError("Cannot infer tensor device without hardware")
+        memory = self.get_tensor_memory(tensor)
+        if memory is None:
+            raise ValueError("Tensor has no memory placement")
+        return self._hardware.find_local_device(memory)
+
     # ── Query ────────────────────────────────────────────────────────
 
     @property
@@ -100,7 +130,7 @@ class Placement:
             raise ValueError(
                 f"Extraneous placements (not in graph): {extraneous}")
 
-        for kernel in self.placed_kernels:
+        for kernel in graph.kernels:
             for name, t in kernel.inputs.items():
                 if t not in self._memory:
                     raise ValueError(
@@ -149,8 +179,6 @@ class Placement:
     # ── Internal ─────────────────────────────────────────────────────
 
     def _assign_tensor_memory(self, kernel: Kernel, device: Compute) -> None:
-        from rooflang.language.kernels.identity import Move
-
         mem = self._hardware.find_local_memory(device)
 
         for t in kernel.weights.values():
@@ -167,10 +195,7 @@ class Placement:
         for t in kernel.outputs.values():
             if t in self._memory:
                 continue
-            if isinstance(kernel, Move):
-                self._memory[t] = kernel.dst_location
-            else:
-                self._memory[t] = mem
+            self._memory[t] = mem
 
     def _predecessor_output_memory(
         self, kernel: Kernel, input_name: str

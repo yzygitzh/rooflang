@@ -11,7 +11,7 @@ from rooflang.language.kernels.forward import (
     ElementwiseOp, Embedding, Gemm, ReadInput, RMSNorm, Sampling,
     Slice, SparseAttn, StridedGemm, TokenCombine, TokenDispatch,
 )
-from rooflang.language.kernels.identity import Concat, Spawn
+from rooflang.language.kernels.identity import Concat, Move, Spawn
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.tensor import Tensor
 from rooflang.language.utils import gemm_scale_bytes
@@ -99,6 +99,9 @@ class LayerMeta:
     kv_comp_slice: Kernel = None
     kv_acc: Kernel = None
     kv_acc_fan: Kernel = None
+    # Optional prefill KV offload chain.
+    kv_offload_fan: Kernel = None
+    kv_offload_move: Kernel = None
 
 
 @dataclass
@@ -159,7 +162,10 @@ def _build_output_head(g, B, hidden_src):
     return final_norm, logits, sampling
 
 
-def _build_layers(g, B, S, context_len, prev_out, has_decode=False):
+def _build_layers(
+    g, B, S, context_len, prev_out, has_decode=False,
+    capture_kv_cache=False,
+):
     """Build N_LAYERS transformer layers into graph g.
 
     Args:
@@ -334,7 +340,20 @@ def _build_layers(g, B, S, context_len, prev_out, has_decode=False):
                 g.add_data_edge(kv_win_slice, kv_concat, {"y": "a"})
                 g.add_data_edge(comp_norm, kv_concat, {"y": "b"})
 
-            g.add_data_edge(kv_concat, sa, {"y": "kv"})
+            if capture_kv_cache:
+                kv_offload_fan = Spawn(world=2)
+                kv_offload_fan.inputs = {
+                    "x": Tensor("bf16", (B, S_kv, KV_DIM))}
+                kv_offload_fan.outputs = {
+                    "y": Tensor("bf16", (B, S_kv, KV_DIM)),
+                    "y2": Tensor("bf16", (B, S_kv, KV_DIM)),
+                }
+                g.add_kernel(kv_offload_fan)
+                g.add_data_edge(kv_concat, kv_offload_fan, {"y": "x"})
+                g.add_data_edge(kv_offload_fan, sa, {"y": "kv"})
+                L.kv_offload_fan = kv_offload_fan
+            else:
+                g.add_data_edge(kv_concat, sa, {"y": "kv"})
 
             L.kv_win_slice = kv_win_slice
             L.kv_concat = kv_concat
@@ -735,8 +754,14 @@ def _build_decode_steps(g, B, pfx_len, n_steps, prefill_layers=None,
     return steps
 
 
-def declare_model(batch_size=BATCH, seq_prefill=S_PREFILL,
-                  decode=False, kv_prefill_len=None, n_decode_steps=1):
+def declare_model(
+    batch_size=BATCH,
+    seq_prefill=S_PREFILL,
+    decode=False,
+    kv_prefill_len=None,
+    n_decode_steps=1,
+    persist_kv_cache=False,
+):
     """Build compute graph for prefill, decode, or both.
 
     Args:
@@ -746,6 +771,9 @@ def declare_model(batch_size=BATCH, seq_prefill=S_PREFILL,
         kv_prefill_len: for decode-only mode, the original prefill length
             that generated the KV cache. Ignored when seq_prefill is set.
         n_decode_steps: number of decode steps to unroll (default 1).
+        persist_kv_cache: whether one multi-tensor Move should retain every
+            compact prefill KV cache. Its destination is assigned later by
+            the placement optimizer.
 
     Returns:
         (g, prefill_layers, decode_steps, emb, read_input, kv_cache_reads,
@@ -762,6 +790,8 @@ def declare_model(batch_size=BATCH, seq_prefill=S_PREFILL,
     B = batch_size
     has_prefill = seq_prefill is not None
     has_decode = decode
+    if persist_kv_cache and not has_prefill:
+        raise ValueError("persist_kv_cache requires a prefill graph")
 
     prefill_layers = []
     decode_steps = []
@@ -788,7 +818,27 @@ def declare_model(batch_size=BATCH, seq_prefill=S_PREFILL,
         _tag_weights(emb, -1, "emb")
 
         prefill_layers, prefill_last = _build_layers(
-            g, B, S_p, None, emb, has_decode=has_decode)
+            g, B, S_p, None, emb, has_decode=has_decode,
+            capture_kv_cache=persist_kv_cache)
+
+        if persist_kv_cache:
+            tensors = [
+                layer.kv_offload_fan.outputs["y2"]
+                for layer in prefill_layers
+            ]
+            move = Move()
+            move.inputs = {
+                f"src{i}": tensor for i, tensor in enumerate(tensors)
+            }
+            move.outputs = {
+                f"dst{i}": Tensor(tensor.dtype, tensor.shape)
+                for i, tensor in enumerate(tensors)
+            }
+            g.add_kernel(move)
+            for port, layer in enumerate(prefill_layers):
+                g.add_data_edge(
+                    layer.kv_offload_fan, move, {"y2": f"src{port}"})
+                layer.kv_offload_move = move
 
     # ── Decode steps ─────────────────────────────────────────────
     if has_decode:

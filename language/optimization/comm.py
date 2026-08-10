@@ -169,38 +169,8 @@ def _bypass_cross_device_pair(
         isinstance(collector, Scatter)
         and isinstance(distributor, Scatter)
     ):
-        if isinstance(collector, Gather):
-            memory = next((
-                placement.get_tensor_memory(tensor)
-                for tensor in collector.inputs.values()
-                if placement.get_tensor_memory(tensor) is not None
-            ), None)
-        else:
-            memory = next((
-                placement.get_tensor_memory(tensor)
-                for tensor in distributor.outputs.values()
-                if placement.get_tensor_memory(tensor) is not None
-            ), None)
-        if memory is not None:
-            for edge in graph._out_edges(collector):
-                if edge.dst is not distributor:
-                    continue
-                for out_name, in_name in edge.mapping.items():
-                    placement.set_tensor_memory(
-                        collector.outputs[out_name], memory)
-                    placement.set_tensor_memory(
-                        distributor.inputs[in_name], memory)
-                    if isinstance(collector, Gather) \
-                            and in_name == next(iter(distributor.inputs)):
-                        for tensor in distributor.outputs.values():
-                            placement.set_tensor_memory(tensor, memory)
-                    elif isinstance(collector, Scatter) \
-                            and out_name == next(iter(collector.outputs)):
-                        for tensor in collector.inputs.values():
-                            placement.set_tensor_memory(tensor, memory)
         return False
-
-    if (
+    elif (
         isinstance(collector, Gather)
         and isinstance(distributor, Scatter)
         and collector.dim == distributor.dim

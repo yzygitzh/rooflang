@@ -8,7 +8,7 @@ Three-phase structure:
 
 from rooflang.programs.dsv4_pro.config import *  # noqa: F401,F403
 from rooflang.programs.dsv4_pro.model import (
-    LayerMeta, declare_model, make_gated_up, make_gemm, make_norm,
+    LayerMeta, declare_model,
 )
 from rooflang.programs.dsv4_pro.optimization import (
     optimize_model_b300_cluster_a_cp_dp_ep_pp_decode,

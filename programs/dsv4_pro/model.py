@@ -25,7 +25,7 @@ from rooflang.programs.dsv4_pro.config import (
 
 # ── Kernel factories ────────────────────────────────────────────────────
 
-def make_gemm(B, S, N, K, w_dtype, a_dtype="bf16", out_dtype="bf16"):
+def _make_gemm(B, S, N, K, w_dtype, a_dtype="bf16", out_dtype="bf16"):
     M = B * S
     k = Gemm(M, N, K, w_dtype, a_dtype, out_dtype)
     k.inputs = {"x": Tensor(a_dtype, (B, S, K))}
@@ -37,7 +37,7 @@ def make_gemm(B, S, N, K, w_dtype, a_dtype="bf16", out_dtype="bf16"):
     return k
 
 
-def make_norm(B, S, dim):
+def _make_norm(B, S, dim):
     M = B * S
     k = RMSNorm(M, dim, "bf16")
     k.inputs = {"x": Tensor("bf16", (B, S, dim))}
@@ -46,7 +46,7 @@ def make_norm(B, S, dim):
     return k
 
 
-def make_gated_up(B, S, N, K, w_dtype, a_dtype="bf16", out_dtype="bf16"):
+def _make_gated_up(B, S, N, K, w_dtype, a_dtype="bf16", out_dtype="bf16"):
     """SwiGLU fused gate+up: 2·M·(2N)·K flops, writes M·N output."""
     M = B * S
     k = StridedGemm(M, 2 * N, K, w_dtype, a_dtype, out_dtype, out_elems=M * N)
@@ -143,12 +143,12 @@ def _build_token_input(g, B, S):
 
 def _build_output_head(g, B, hidden_src):
     """Build the shared final norm, logits projection, and sampler."""
-    final_norm = make_norm(B, 1, D)
+    final_norm = _make_norm(B, 1, D)
     g.add_kernel(final_norm)
     g.add_data_edge(hidden_src, final_norm, {"y": "x"})
     _tag_weights(final_norm, -1, "final_norm")
 
-    logits = make_gemm(B, 1, V, D, "bf16")
+    logits = _make_gemm(B, 1, V, D, "bf16")
     g.add_kernel(logits)
     g.add_data_edge(final_norm, logits, {"y": "x"})
     _tag_weights(logits, -1, "logits")
@@ -197,7 +197,7 @@ def _build_layers(g, B, S, context_len, prev_out):
         L.bridge = bridge
 
         # ── Attention ─────────────────────────────────────────────
-        attn_norm = make_norm(B, S, D)
+        attn_norm = _make_norm(B, S, D)
         g.add_kernel(attn_norm)
         g.add_data_edge(bridge, attn_norm, {"y": "x"})
         L.attn_norm = attn_norm
@@ -212,28 +212,28 @@ def _build_layers(g, B, S, context_len, prev_out):
         L.attn_fan = attn_fan
 
         # Q path
-        wq_a = make_gemm(B, S, Q_LORA, D, "fp8")
+        wq_a = _make_gemm(B, S, Q_LORA, D, "fp8")
         g.add_kernel(wq_a)
         g.add_data_edge(attn_fan, wq_a, {"y": "x"})
         L.wq_a = wq_a
 
-        q_norm = make_norm(B, S, Q_LORA)
+        q_norm = _make_norm(B, S, Q_LORA)
         g.add_kernel(q_norm)
         g.add_data_edge(wq_a, q_norm, {"y": "x"})
         L.q_norm = q_norm
 
-        wq_b = make_gemm(B, S, H * HD, Q_LORA, "fp8")
+        wq_b = _make_gemm(B, S, H * HD, Q_LORA, "fp8")
         g.add_kernel(wq_b)
         g.add_data_edge(q_norm, wq_b, {"y": "x"})
         L.wq_b = wq_b
 
         # KV path (branch from attn fan-out)
-        wkv = make_gemm(B, S, KV_DIM, D, "fp8")
+        wkv = _make_gemm(B, S, KV_DIM, D, "fp8")
         g.add_kernel(wkv)
         g.add_data_edge(attn_fan, wkv, {"y2": "x"})
         L.wkv = wkv
 
-        kv_norm = make_norm(B, S, KV_DIM)
+        kv_norm = _make_norm(B, S, KV_DIM)
         g.add_kernel(kv_norm)
         g.add_data_edge(wkv, kv_norm, {"y": "x"})
         L.kv_norm = kv_norm
@@ -257,7 +257,7 @@ def _build_layers(g, B, S, context_len, prev_out):
                 g.add_data_edge(bridge, comp, {"y2": "x"})
                 L.comp = comp
 
-                comp_norm = make_norm(B, compressed_len, KV_DIM)
+                comp_norm = _make_norm(B, compressed_len, KV_DIM)
                 g.add_kernel(comp_norm)
                 g.add_data_edge(comp, comp_norm, {"y": "x"})
                 L.comp_norm = comp_norm
@@ -328,7 +328,7 @@ def _build_layers(g, B, S, context_len, prev_out):
         g.add_data_edge(sa, wo_a, {"y": "x"})
         L.wo_a = wo_a
 
-        wo_b = make_gemm(B, S, D, O_GROUPS * O_LORA, "fp8")
+        wo_b = _make_gemm(B, S, D, O_GROUPS * O_LORA, "fp8")
         g.add_kernel(wo_b)
         g.add_data_edge(wo_a, wo_b, {"y": "x"})
         L.wo_b = wo_b
@@ -354,7 +354,7 @@ def _build_layers(g, B, S, context_len, prev_out):
         L.ffn_bridge = ffn_bridge
 
         # ── FFN / MoE ─────────────────────────────────────────────
-        ffn_norm = make_norm(B, S, D)
+        ffn_norm = _make_norm(B, S, D)
         g.add_kernel(ffn_norm)
         g.add_data_edge(ffn_bridge, ffn_norm, {"y": "x"})
         L.ffn_norm = ffn_norm
@@ -369,7 +369,7 @@ def _build_layers(g, B, S, context_len, prev_out):
         g.add_data_edge(ffn_norm, ffn_fan, {"y": "x"})
         L.ffn_fan = ffn_fan
 
-        gate = make_gemm(B, S, N_EXPERTS, D, "bf16", "bf16", "fp32")
+        gate = _make_gemm(B, S, N_EXPERTS, D, "bf16", "bf16", "fp32")
         g.add_kernel(gate)
         g.add_data_edge(ffn_fan, gate, {"y": "x"})
         L.gate = gate
@@ -422,12 +422,12 @@ def _build_layers(g, B, S, context_len, prev_out):
             L.experts.extend([up, down])
 
         # Shared expert (parallel with routed — reads from ffn_fan)
-        sw_up = make_gated_up(B, S, MOE_INTER, D, "fp8", "bf16")
+        sw_up = _make_gated_up(B, S, MOE_INTER, D, "fp8", "bf16")
         g.add_kernel(sw_up)
         g.add_data_edge(ffn_fan, sw_up, {"y3": "x"})
         L.sw_up = sw_up
 
-        sw_down = make_gemm(B, S, D, MOE_INTER, "fp8", "bf16")
+        sw_down = _make_gemm(B, S, D, MOE_INTER, "fp8", "bf16")
         g.add_kernel(sw_down)
         g.add_data_edge(sw_up, sw_down, {"y": "x"})
         L.sw_down = sw_down

@@ -125,18 +125,20 @@ def _cluster_a_resources(hw):
 
 
 def _validate_cp_dp_ep_pp_prefill(
-    layers, emb, cp, dp, ep, pp, n_gpus,
+    layers, emb, cp, dp, ep, pp_partition, n_gpus,
 ):
     """Validate parallel degrees, PP layer counts, and split divisibility."""
     if min(cp, dp, ep, n_gpus) <= 0:
         raise ValueError("cp, dp, ep, and n_gpus must all be positive")
-    if not pp or any(not isinstance(count, int) or count <= 0 for count in pp):
-        raise ValueError("pp layer counts must be positive integers")
-    if sum(pp) != len(layers):
+    if not pp_partition or any(
+            not isinstance(count, int) or count <= 0
+            for count in pp_partition):
+        raise ValueError("pp_partition must contain positive layer counts")
+    if sum(pp_partition) != len(layers):
         raise ValueError(
-            f"pp layer counts must sum to the model layer count; "
-            f"got sum(pp)={sum(pp)} for {len(layers)} layers")
-    pp_degree = len(pp)
+            f"pp_partition must sum to the model layer count; "
+            f"got {sum(pp_partition)} for {len(layers)} layers")
+    pp_degree = len(pp_partition)
     if cp * dp != ep:
         raise ValueError(
             f"CP/DP/EP placement requires cp * dp == ep; "
@@ -243,21 +245,22 @@ def _place_experts_and_routes(
 
 
 def optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill(
-    g, layers, hw, emb=None, read_input=None, *, cp, dp, ep, pp, n_gpus,
+    g, layers, hw, emb=None, read_input=None, *, cp, dp, ep,
+    pp_partition, n_gpus,
 ):
     """Apply dynamic DP→CP→EP→PP placement to a prefill-only graph.
 
     Non-expert kernels use CP×DP within their assigned PP stage. Experts use
-    EP within the stage, with EP=CP×DP. Each pp entry is the number of model
-    layers assigned to that stage. PP models one prefill wave without a
-    microbatch schedule.
+    EP within the stage, with EP=CP×DP. Each pp_partition entry is the number
+    of model layers assigned to that stage. PP models one prefill wave without
+    a microbatch schedule.
     """
     _validate_cp_dp_ep_pp_prefill(
-        layers, emb, cp, dp, ep, pp, n_gpus)
-    pp_degree = len(pp)
+        layers, emb, cp, dp, ep, pp_partition, n_gpus)
+    pp_degree = len(pp_partition)
     layer_stages = [
         stage
-        for stage, layer_count in enumerate(pp)
+        for stage, layer_count in enumerate(pp_partition)
         for _ in range(layer_count)
     ]
     gpus, cpus, drams = _cluster_a_resources(hw)
@@ -268,13 +271,11 @@ def optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill(
         raise ValueError("B300 Cluster A requires per-node CPUs and DRAMs")
 
     kv_barrier = layers[0].kv_persist_barrier
-    if not all(layer.persist_kv_cache for layer in layers) \
-            or kv_barrier is None \
+    if kv_barrier is None \
             or any(layer.kv_persist_barrier is not kv_barrier
                    for layer in layers):
         raise ValueError(
-            "prefill KV persistence is disabled; pass "
-            "persist_kv_cache=True to declare_model")
+            "prefill KV persistence is missing from the declared model")
 
     layer_copies = []
     for layer in layers:
@@ -358,27 +359,31 @@ def optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill(
 
 
 def optimize_model_b300_cluster_a_cp_dp_ep_pp_decode(
-    g, decode_step, hw, kv_cache_reads=None, *, cp, dp, ep, pp, n_gpus,
+    g, layers, hw, emb=None, read_input=None, kv_cache_reads=None,
+    output_head=None, *, cp, dp, ep, pp_partition, n_gpus,
 ):
     """Apply CP, DP, EP, and PP to a one-step decode-only graph.
 
     KV is a persistent read-only model input. The optimizer does not construct
     cache slices, append the current token, or model cache ownership changes.
     """
-    if decode_step is None or not kv_cache_reads:
-        raise ValueError("decode optimizer requires a decode step and KV")
+    if emb is None or read_input is None or not kv_cache_reads \
+            or output_head is None or len(output_head) != 3:
+        raise ValueError("decode optimizer requires input, KV, and output head")
     if min(cp, dp, ep, n_gpus) <= 0:
         raise ValueError("cp, dp, ep, and n_gpus must all be positive")
-    if not pp or any(not isinstance(count, int) or count <= 0 for count in pp):
-        raise ValueError("pp layer counts must be positive integers")
+    if not pp_partition or any(
+            not isinstance(count, int) or count <= 0
+            for count in pp_partition):
+        raise ValueError("pp_partition must contain positive layer counts")
 
-    step = decode_step
-    n_layers = len(step.layers)
-    if sum(pp) != n_layers:
+    final_norm, logits, sampling = output_head
+    n_layers = len(layers)
+    if sum(pp_partition) != n_layers:
         raise ValueError(
-            "pp layer counts must sum to the model layer count; "
-            f"got sum(pp)={sum(pp)} for {n_layers} layers")
-    pp_degree = len(pp)
+            "pp_partition must sum to the model layer count; "
+            f"got {sum(pp_partition)} for {n_layers} layers")
+    pp_degree = len(pp_partition)
     if cp * dp != ep:
         raise ValueError(
             "CP/DP/EP placement requires cp * dp == ep; "
@@ -394,7 +399,7 @@ def optimize_model_b300_cluster_a_cp_dp_ep_pp_decode(
         raise ValueError(
             f"expected {n_layers} KV cache reads, got {len(kv_cache_reads)}")
 
-    batch_size = step.emb.outputs["y"].shape[0]
+    batch_size = emb.outputs["y"].shape[0]
     if batch_size % ep != 0:
         raise ValueError(
             f"decode batch size {batch_size} must be divisible by ep={ep}")
@@ -406,7 +411,7 @@ def optimize_model_b300_cluster_a_cp_dp_ep_pp_decode(
 
     layer_stages = [
         stage
-        for stage, layer_count in enumerate(pp)
+        for stage, layer_count in enumerate(pp_partition)
         for _ in range(layer_count)
     ]
     gpus, cpus, drams = _cluster_a_resources(hw)
@@ -421,7 +426,7 @@ def optimize_model_b300_cluster_a_cp_dp_ep_pp_decode(
     ]
 
     for layer_id, (kv_read, layer) in enumerate(
-            zip(kv_cache_reads, step.layers)):
+            zip(kv_cache_reads, layers)):
         cache_len = kv_read.outputs["y"].shape[1]
         if cache_len % cp != 0:
             raise ValueError(
@@ -440,17 +445,17 @@ def optimize_model_b300_cluster_a_cp_dp_ep_pp_decode(
         _, copies, _ = g.split_kernel(context_split, kv_read, cp)
         kv_read_cp_copies.append(copies)
 
-    barrier = step.kv_persist_barrier
+    barrier = layers[0].kv_persist_barrier
     if barrier is None or any(
             layer.kv_persist_barrier is not barrier
-            for layer in step.layers):
+            for layer in layers):
         raise ValueError("decode KV persistence barrier is missing")
     barrier_prev, barrier_cp_copies, _ = g.split_kernel(
         decode_persistence_split, barrier, cp)
     cp_collectives_to_replicate = [barrier_prev["decode_output"]]
 
     cp_fields_by_layer = []
-    for layer in step.layers:
+    for layer in layers:
         cp_fields = {}
         _, cp_fields["kv_cache_fan"], _ = g.split_kernel(
             context_split, layer.kv_cache_fan, cp)
@@ -509,22 +514,19 @@ def optimize_model_b300_cluster_a_cp_dp_ep_pp_decode(
         kv_cache_reads[layer_id]._cp_dp_copies = cp_dp_copies
 
     barrier_copies = split_cp_copies(barrier_cp_copies)
-    step._kv_persist_barrier_cp_dp_copies = barrier_copies
-    for layer in step.layers:
+    for layer in layers:
         layer._kv_persist_barrier_cp_dp_copies = barrier_copies
 
-    _, step._emb_dp_copies, _ = g.split_kernel(dp_split, step.emb, dp)
-    _, step._final_norm_dp_copies, _ = g.split_kernel(
-        dp_split, step.final_norm, dp)
-    _, step._logits_dp_copies, _ = g.split_kernel(
-        dp_split, step.logits, dp)
-    _, step._sampling_dp_copies, _ = g.split_kernel(
-        dp_split, step.sampling, dp)
+    _, emb_dp_copies, _ = g.split_kernel(dp_split, emb, dp)
+    _, final_norm_dp_copies, _ = g.split_kernel(
+        dp_split, final_norm, dp)
+    _, logits_dp_copies, _ = g.split_kernel(dp_split, logits, dp)
+    _, sampling_dp_copies, _ = g.split_kernel(dp_split, sampling, dp)
 
     prefix_fields = (
         "bridge", "attn_norm", "attn_fan", "wkv", "kv_norm",
     )
-    for layer, cp_fields in zip(step.layers, cp_fields_by_layer):
+    for layer, cp_fields in zip(layers, cp_fields_by_layer):
         dp_fields = {}
         for name in prefix_fields:
             _, copies, _ = g.split_kernel(
@@ -561,25 +563,24 @@ def optimize_model_b300_cluster_a_cp_dp_ep_pp_decode(
                 kernel.inputs["kv"], nearby_dram(device))
 
     first_devices = stage_gpus[0]
-    if step.read_input is not None:
-        placement.set_kernel_device(step.read_input, first_devices[0])
-        placement.set_tensor_memory(
-            step.read_input.inputs["tokens"], nearby_dram(first_devices[0]))
-    for dp_rank, kernel in enumerate(step._emb_dp_copies):
+    placement.set_kernel_device(read_input, first_devices[0])
+    placement.set_tensor_memory(
+        read_input.inputs["tokens"], nearby_dram(first_devices[0]))
+    for dp_rank, kernel in enumerate(emb_dp_copies):
         placement.set_kernel_device(
             kernel, first_devices[dp_rank * cp])
 
     final_devices = stage_gpus[layer_stages[-1]]
     for copies in (
-        step._final_norm_dp_copies,
-        step._logits_dp_copies,
-        step._sampling_dp_copies,
+        final_norm_dp_copies,
+        logits_dp_copies,
+        sampling_dp_copies,
     ):
         for dp_rank, kernel in enumerate(copies):
             placement.set_kernel_device(
                 kernel, final_devices[dp_rank * cp])
 
-    for layer_id, layer in enumerate(step.layers):
+    for layer_id, layer in enumerate(layers):
         devices = stage_gpus[layer_stages[layer_id]]
         fields = layer._decode_dp_fields
         for name in prefix_fields:

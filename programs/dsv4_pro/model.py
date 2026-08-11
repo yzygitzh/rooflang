@@ -94,22 +94,8 @@ class LayerMeta:
     # KV cache and persistence metadata
     kv_win_slice: Kernel = None
     kv_cache_fan: Kernel = None
-    persist_kv_cache: bool = False
     kv_persist_fan: Kernel = None
     kv_persist_barrier: Kernel = None
-
-
-@dataclass
-class DecodeStepMeta:
-    """Single-step decode metadata (token input + embedding + layers)."""
-    read_input: Kernel = None
-    emb: Kernel = None
-    final_norm: Kernel = None
-    logits: Kernel = None
-    sampling: Kernel = None
-    kv_persist_barrier: Kernel = None
-    layers: List[LayerMeta] = field(default_factory=list)
-
 
 def _tag_weights(kernel, layer_id, name):
     """Tag kernel's weight Tensors with a weight_id for simulator dedup."""
@@ -137,6 +123,24 @@ def _tag_layer_weights(layer, layer_id):
                      f"expert{eid}_down")
 
 
+def _build_token_input(g, B, S):
+    """Build the token reader and embedding shared by both stages."""
+    M = B * S
+    read_input = ReadInput(M, "int32")
+    read_input.inputs = {"tokens": Tensor("int32", (B, S, 1))}
+    read_input.outputs = {"tokens": Tensor("int32", (B, S, 1))}
+    g.add_kernel(read_input)
+
+    emb = Embedding(M, V, D)
+    emb.inputs = {"idx": Tensor("int32", (B, S, 1))}
+    emb.weights = {"emb": Tensor("bf16", (V, D))}
+    emb.outputs = {"y": Tensor("bf16", (B, S, D))}
+    g.add_kernel(emb)
+    g.add_data_edge(read_input, emb, {"tokens": "idx"})
+    _tag_weights(emb, -1, "emb")
+    return read_input, emb
+
+
 def _build_output_head(g, B, hidden_src):
     """Build the shared final norm, logits projection, and sampler."""
     final_norm = make_norm(B, 1, D)
@@ -158,9 +162,7 @@ def _build_output_head(g, B, hidden_src):
     return final_norm, logits, sampling
 
 
-def _build_layers(
-    g, B, S, context_len, prev_out, capture_kv_cache=False,
-):
+def _build_layers(g, B, S, context_len, prev_out):
     """Build N_LAYERS transformer layers into graph g.
 
     Args:
@@ -175,29 +177,23 @@ def _build_layers(
     """
     M = B * S
     layers = []
+    is_prefill = context_len is None
 
     for layer_id in range(N_LAYERS):
         ratio = COMPRESS_RATIOS[layer_id]
         L = LayerMeta()
 
         # ── Input fan-out (residual + attention + optional compressor) ──
-        if context_len is None:
-            # Prefill: y→attn_norm, y2→comp, y3→attn_residual
-            bridge = Spawn(world=3)
-            bridge.inputs = {"x": Tensor("bf16", (B, S, D))}
-            bridge.outputs = {"y": Tensor("bf16", (B, S, D)),
-                              "y2": Tensor("bf16", (B, S, D)),
-                              "y3": Tensor("bf16", (B, S, D))}
-            g.add_kernel(bridge)
-            g.add_data_edge(prev_out, bridge, {"y": "x"})
-        else:
-            # Decode does not mutate or compress the persistent KV cache.
-            bridge = Spawn(world=2)
-            bridge.inputs = {"x": Tensor("bf16", (B, S, D))}
-            bridge.outputs = {"y": Tensor("bf16", (B, S, D)),
-                              "y2": Tensor("bf16", (B, S, D))}
-            g.add_kernel(bridge)
-            g.add_data_edge(prev_out, bridge, {"y": "x"})
+        bridge = Spawn(world=3 if is_prefill else 2)
+        bridge.inputs = {"x": Tensor("bf16", (B, S, D))}
+        bridge.outputs = {
+            "y": Tensor("bf16", (B, S, D)),
+            "y2": Tensor("bf16", (B, S, D)),
+        }
+        if is_prefill:
+            bridge.outputs["y3"] = Tensor("bf16", (B, S, D))
+        g.add_kernel(bridge)
+        g.add_data_edge(prev_out, bridge, {"y": "x"})
         L.bridge = bridge
 
         # ── Attention ─────────────────────────────────────────────
@@ -242,43 +238,48 @@ def _build_layers(
         g.add_data_edge(wkv, kv_norm, {"y": "x"})
         L.kv_norm = kv_norm
 
-        if context_len is None:
-            # Prefill: build compressor + kv_concat
+        if is_prefill:
+            compressed_len = S // ratio
+            window_len = WINDOW
+
+            # Prefill builds the compact KV cache consumed by attention.
             if ratio in (128, 4):
                 coff = 2 if ratio == 4 else 1
-                S_comp = S // ratio
-                M_comp = B * S_comp
+                M_comp = B * compressed_len
                 comp_out_elems = M_comp * KV_DIM
                 comp = StridedGemm(M, 2 * coff * KV_DIM, D, "fp32", "bf16",
                                    in_elems=M * D, out_elems=comp_out_elems)
                 comp.inputs = {"x": Tensor("bf16", (B, S, D))}
                 comp.weights = {"w": Tensor("fp32", (D, 2 * coff * KV_DIM))}
-                comp.outputs = {"y": Tensor("bf16", (B, S_comp, KV_DIM))}
+                comp.outputs = {
+                    "y": Tensor("bf16", (B, compressed_len, KV_DIM))}
                 g.add_kernel(comp)
                 g.add_data_edge(bridge, comp, {"y2": "x"})
                 L.comp = comp
 
-                comp_norm = make_norm(B, S_comp, KV_DIM)
+                comp_norm = make_norm(B, compressed_len, KV_DIM)
                 g.add_kernel(comp_norm)
                 g.add_data_edge(comp, comp_norm, {"y": "x"})
                 L.comp_norm = comp_norm
+        else:
+            compressed_len = context_len // ratio
+            window_len = min(WINDOW, context_len)
 
-            # Sparse attention (prefill: S_kv = WINDOW + S//ratio)
-            k_sel = WINDOW
-            if ratio == 128:
-                k_sel = WINDOW + S // 128
-            elif ratio == 4:
-                k_sel = WINDOW + INDEX_TOPK
+        S_kv = window_len + compressed_len
+        k_sel = WINDOW
+        if ratio == 128:
+            k_sel += compressed_len
+        elif ratio == 4:
+            k_sel += INDEX_TOPK
 
-            S_comp = S // ratio
-            S_kv = WINDOW + S_comp
-            sa = SparseAttn(B, H, 1, S, k_sel, S_kv, HD, "bf16", kv_factor=1)
-            sa.inputs = {"q": Tensor("bf16", (B, S, H * HD)),
-                         "kv": Tensor("bf16", (B, S_kv, KV_DIM))}
-            sa.outputs = {"y": Tensor("bf16", (B, S, H * HD))}
-            g.add_kernel(sa)
-            g.add_data_edge(wq_b, sa, {"y": "q"})
+        sa = SparseAttn(B, H, 1, S, k_sel, S_kv, HD, "bf16", kv_factor=1)
+        sa.inputs = {"q": Tensor("bf16", (B, S, H * HD)),
+                     "kv": Tensor("bf16", (B, S_kv, KV_DIM))}
+        sa.outputs = {"y": Tensor("bf16", (B, S, H * HD))}
+        g.add_kernel(sa)
+        g.add_data_edge(wq_b, sa, {"y": "q"})
 
+        if is_prefill:
             # Window slice: extract last WINDOW tokens from full KV
             kv_win_slice = Slice()
             kv_win_slice.inputs = {
@@ -291,47 +292,28 @@ def _build_layers(
             # KV cache = concat(window_kv, compressed_kv)
             kv_concat = Concat()
             kv_concat.inputs = {"a": Tensor("bf16", (B, WINDOW, KV_DIM)),
-                                "b": Tensor("bf16", (B, S_comp, KV_DIM))}
+                                "b": Tensor(
+                                    "bf16", (B, compressed_len, KV_DIM))}
             kv_concat.outputs = {"y": Tensor("bf16", (B, S_kv, KV_DIM))}
             g.add_kernel(kv_concat)
 
             g.add_data_edge(kv_win_slice, kv_concat, {"y": "a"})
             g.add_data_edge(comp_norm, kv_concat, {"y": "b"})
 
-            if capture_kv_cache:
-                kv_persist_fan = Spawn(world=2)
-                kv_persist_fan.inputs = {
-                    "x": Tensor("bf16", (B, S_kv, KV_DIM))}
-                kv_persist_fan.outputs = {
-                    "y": Tensor("bf16", (B, S_kv, KV_DIM)),
-                    "y2": Tensor("bf16", (B, S_kv, KV_DIM)),
-                }
-                g.add_kernel(kv_persist_fan)
-                g.add_data_edge(kv_concat, kv_persist_fan, {"y": "x"})
-                g.add_data_edge(kv_persist_fan, sa, {"y": "kv"})
-                L.kv_persist_fan = kv_persist_fan
-            else:
-                g.add_data_edge(kv_concat, sa, {"y": "kv"})
+            kv_persist_fan = Spawn(world=2)
+            kv_persist_fan.inputs = {
+                "x": Tensor("bf16", (B, S_kv, KV_DIM))}
+            kv_persist_fan.outputs = {
+                "y": Tensor("bf16", (B, S_kv, KV_DIM)),
+                "y2": Tensor("bf16", (B, S_kv, KV_DIM)),
+            }
+            g.add_kernel(kv_persist_fan)
+            g.add_data_edge(kv_concat, kv_persist_fan, {"y": "x"})
+            g.add_data_edge(kv_persist_fan, sa, {"y": "kv"})
+            L.kv_persist_fan = kv_persist_fan
 
             L.kv_win_slice = kv_win_slice
             L.kv_concat = kv_concat
-        else:
-            # Decode: window + compressed KV cache
-            total_compressed = context_len // ratio
-            S_kv = min(WINDOW, context_len) + total_compressed
-
-            k_sel = WINDOW
-            if ratio == 128:
-                k_sel = WINDOW + total_compressed
-            elif ratio == 4:
-                k_sel = WINDOW + INDEX_TOPK
-
-            sa = SparseAttn(B, H, 1, S, k_sel, S_kv, HD, "bf16", kv_factor=1)
-            sa.inputs = {"q": Tensor("bf16", (B, S, H * HD)),
-                         "kv": Tensor("bf16", (B, S_kv, KV_DIM))}
-            sa.outputs = {"y": Tensor("bf16", (B, S, H * HD))}
-            g.add_kernel(sa)
-            g.add_data_edge(wq_b, sa, {"y": "q"})
 
         L.sa = sa
 
@@ -357,10 +339,8 @@ def _build_layers(
                            "b": Tensor("bf16", (B, S, D))}
         attn_add.outputs = {"y": Tensor("bf16", (B, S, D))}
         g.add_kernel(attn_add)
-        if context_len is None:
-            g.add_data_edge(bridge, attn_add, {"y3": "a"})
-        else:
-            g.add_data_edge(bridge, attn_add, {"y2": "a"})
+        residual_port = "y3" if is_prefill else "y2"
+        g.add_data_edge(bridge, attn_add, {residual_port: "a"})
         g.add_data_edge(wo_b, attn_add, {"y": "b"})
         L.attn_add = attn_add
 
@@ -481,36 +461,19 @@ def _build_layers(
     return layers, prev_out
 
 
-def _build_decode_step(g, B, pfx_len, kv_cache_reads):
-    """Build one decode step against a persistent, read-only KV cache."""
-    dec_read = ReadInput(B, "int32")
-    dec_read.inputs = {"tokens": Tensor("int32", (B, 1, 1))}
-    dec_read.outputs = {"tokens": Tensor("int32", (B, 1, 1))}
-    g.add_kernel(dec_read)
-
-    dec_emb = Embedding(B, V, D)
-    dec_emb.inputs = {"idx": Tensor("int32", (B, 1, 1))}
-    dec_emb.weights = {"emb": Tensor("bf16", (V, D))}
-    dec_emb.outputs = {"y": Tensor("bf16", (B, 1, D))}
-    g.add_kernel(dec_emb)
-    g.add_data_edge(dec_read, dec_emb, {"tokens": "idx"})
-    _tag_weights(dec_emb, -1, "emb")
-
-    dec_layers, step_last = _build_layers(g, B, 1, pfx_len, dec_emb)
-    final_norm, logits, sampling = _build_output_head(g, B, step_last)
-
-    decode_step = DecodeStepMeta(
-        read_input=dec_read, emb=dec_emb,
-        final_norm=final_norm, logits=logits, sampling=sampling,
-        layers=dec_layers)
-
-    cache_fans = []
-    for layer_id, layer in enumerate(dec_layers):
+def _attach_decode_kv_cache(g, B, context_len, layers):
+    """Attach persistent external KV-cache inputs to decode attention."""
+    kv_cache_reads = []
+    for layer_id, layer in enumerate(layers):
         ratio = COMPRESS_RATIOS[layer_id]
-        window_len = min(WINDOW, pfx_len)
-        comp_len = pfx_len // ratio
-        cache_len = window_len + comp_len
-        cache_src = kv_cache_reads[layer_id]
+        cache_len = min(WINDOW, context_len) + context_len // ratio
+
+        kv_read = ReadInput(B * cache_len * KV_DIM, "bf16")
+        kv_read.inputs = {
+            "kv": Tensor("bf16", (B, cache_len, KV_DIM))}
+        kv_read.outputs = {
+            "y": Tensor("bf16", (B, cache_len, KV_DIM))}
+        g.add_kernel(kv_read)
 
         cache_fan = Spawn(world=2)
         cache_fan.inputs = {
@@ -520,140 +483,82 @@ def _build_decode_step(g, B, pfx_len, kv_cache_reads):
             "y2": Tensor("bf16", (B, cache_len, KV_DIM)),
         }
         g.add_kernel(cache_fan)
-        g.add_data_edge(cache_src, cache_fan, {"y": "x"})
+        g.add_data_edge(kv_read, cache_fan, {"y": "x"})
         g.add_data_edge(cache_fan, layer.sa, {"y": "kv"})
+
         layer.kv_cache_fan = cache_fan
         layer.kv_persist_fan = cache_fan
-        layer.persist_kv_cache = True
-        cache_fans.append(cache_fan)
+        kv_cache_reads.append(kv_read)
+    return kv_cache_reads
 
+
+def _build_kv_persistence_barrier(
+    g, layers, output_src, output_name,
+):
+    """Keep every compact KV cache alive until the stage output is ready."""
     barrier = Nop()
     barrier.inputs = {
         f"kv{layer_id}": Tensor(
-            fan.outputs["y2"].dtype, fan.outputs["y2"].shape)
-        for layer_id, fan in enumerate(cache_fans)
+            layer.kv_persist_fan.outputs["y2"].dtype,
+            layer.kv_persist_fan.outputs["y2"].shape,
+        )
+        for layer_id, layer in enumerate(layers)
     }
-    barrier.inputs["decode_output"] = Tensor(
-        sampling.outputs["y"].dtype, sampling.outputs["y"].shape)
+    barrier.inputs[output_name] = Tensor(
+        output_src.outputs["y"].dtype, output_src.outputs["y"].shape)
     barrier.outputs = {"done": Tensor("int32", (1,))}
     g.add_kernel(barrier)
-    for layer_id, fan in enumerate(cache_fans):
-        g.add_data_edge(fan, barrier, {"y2": f"kv{layer_id}"})
-    g.add_data_edge(sampling, barrier, {"y": "decode_output"})
 
-    decode_step.kv_persist_barrier = barrier
-    for layer in dec_layers:
+    for layer_id, layer in enumerate(layers):
+        g.add_data_edge(
+            layer.kv_persist_fan, barrier, {"y2": f"kv{layer_id}"})
         layer.kv_persist_barrier = barrier
-    return decode_step
+    g.add_data_edge(output_src, barrier, {"y": output_name})
+    return barrier
 
 
 def declare_model(
     batch_size=BATCH,
     seq_prefill=S_PREFILL,
     decode=False,
-    kv_prefill_len=None,
-    persist_kv_cache=False,
 ):
     """Build either a prefill graph or a single-step decode graph.
 
     Args:
         batch_size: number of independent sequences (>= 64 for MoE routing).
-        seq_prefill: prefill sequence length; must be None for decode.
+        seq_prefill: prefill sequence length, or the persistent prefix length
+            whose KV cache is consumed by decode.
         decode: whether to build the single-step decode stage.
-        kv_prefill_len: original prefill length for decode KV cache sizing.
-        persist_kv_cache: whether the placement optimizer should retain every
-            compact prefill KV cache until prefill completes.
 
     Returns:
-        (g, prefill_layers, decode_step, emb, read_input, kv_cache_reads)
-        - prefill_layers: list[LayerMeta] (empty for decode)
-        - decode_step: DecodeStepMeta (None for prefill)
-        - emb: prefill Embedding kernel (None for decode)
-        - read_input: prefill ReadInput kernel (None for decode)
+        (g, layers, emb, read_input, kv_cache_reads, output_head)
+        - layers: list[LayerMeta] for the selected stage
+        - emb/read_input: token input kernels shared by both stages
         - kv_cache_reads: per-layer KV cache ReadInput kernels (decode only)
+        - output_head: (final_norm, logits, sampling) for decode, empty tuple
+            for prefill
     """
-    is_prefill = seq_prefill is not None
-    if is_prefill == decode:
-        raise ValueError(
-            "declare_model requires exactly one of prefill or decode")
-    if persist_kv_cache and not is_prefill:
-        raise ValueError("persist_kv_cache requires a prefill graph")
+    is_prefill = not decode
 
     g = ComputeGraph()
     B = batch_size
-    prefill_layers = []
-    decode_step = None
-    emb = None
-    read_input = None
+    S = seq_prefill if is_prefill else 1
+    context_len = None if is_prefill else seq_prefill
+
+    read_input, emb = _build_token_input(g, B, S)
+    layers, last_output = _build_layers(g, B, S, context_len, emb)
+
     kv_cache_reads = []
-
+    output_head = ()
     if is_prefill:
-        S_p = seq_prefill
-        M_p = B * S_p
-
-        read_input = ReadInput(M_p, "int32")
-        read_input.inputs = {"tokens": Tensor("int32", (B, S_p, 1))}
-        read_input.outputs = {"tokens": Tensor("int32", (B, S_p, 1))}
-        g.add_kernel(read_input)
-
-        emb = Embedding(M_p, V, D)
-        emb.inputs = {"idx": Tensor("int32", (B, S_p, 1))}
-        emb.weights = {"emb": Tensor("bf16", (V, D))}
-        emb.outputs = {"y": Tensor("bf16", (B, S_p, D))}
-        g.add_kernel(emb)
-        g.add_data_edge(read_input, emb, {"tokens": "idx"})
-        _tag_weights(emb, -1, "emb")
-
-        prefill_layers, prefill_last = _build_layers(
-            g, B, S_p, None, emb,
-            capture_kv_cache=persist_kv_cache)
-        for layer in prefill_layers:
-            layer.persist_kv_cache = persist_kv_cache
-        if persist_kv_cache:
-            barrier = Nop()
-            barrier.inputs = {
-                f"kv{layer_id}": Tensor(
-                    layer.kv_persist_fan.outputs["y2"].dtype,
-                    layer.kv_persist_fan.outputs["y2"].shape,
-                )
-                for layer_id, layer in enumerate(prefill_layers)
-            }
-            barrier.inputs["prefill_output"] = Tensor(
-                prefill_last.outputs["y"].dtype,
-                prefill_last.outputs["y"].shape,
-            )
-            barrier.outputs = {"done": Tensor("int32", (1,))}
-            g.add_kernel(barrier)
-            for layer_id, layer in enumerate(prefill_layers):
-                g.add_data_edge(
-                    layer.kv_persist_fan, barrier,
-                    {"y2": f"kv{layer_id}"},
-                )
-            g.add_data_edge(
-                prefill_last, barrier, {"y": "prefill_output"})
-            for layer in prefill_layers:
-                layer.kv_persist_barrier = barrier
+        _build_kv_persistence_barrier(
+            g, layers, last_output, "prefill_output")
     else:
-        if kv_prefill_len is None:
-            raise ValueError("kv_prefill_len is required for decode")
-
-        for layer_id in range(N_LAYERS):
-            ratio = COMPRESS_RATIOS[layer_id]
-            cache_len = (
-                min(WINDOW, kv_prefill_len)
-                + kv_prefill_len // ratio
-            )
-            kv_read = ReadInput(B * cache_len * KV_DIM, "bf16")
-            kv_read.inputs = {
-                "kv": Tensor("bf16", (B, cache_len, KV_DIM))}
-            kv_read.outputs = {
-                "y": Tensor("bf16", (B, cache_len, KV_DIM))}
-            g.add_kernel(kv_read)
-            kv_cache_reads.append(kv_read)
-
-        decode_step = _build_decode_step(
-            g, B, kv_prefill_len, kv_cache_reads)
+        kv_cache_reads = _attach_decode_kv_cache(
+            g, B, context_len, layers)
+        output_head = _build_output_head(g, B, last_output)
+        _build_kv_persistence_barrier(
+            g, layers, output_head[-1], "decode_output")
 
     g.validate()
-    return (g, prefill_layers, decode_step, emb, read_input,
-            kv_cache_reads)
+    return g, layers, emb, read_input, kv_cache_reads, output_head

@@ -39,25 +39,23 @@ def main():
     parser.add_argument("--ep", type=int, default=8,
                         help="Expert-parallel degree (default: 8)")
     parser.add_argument(
-        "--pp", type=int, nargs="+", default=None, metavar="LAYERS",
+        "--pp-partition", type=int, nargs="+", default=[N_LAYERS],
+        metavar="LAYERS",
         help="Layer counts assigned to successive pipeline stages")
     parser.add_argument("--visualization", action="store_true",
                         help="Export layer graph visualization")
     args = parser.parse_args()
 
     is_prefill = args.stage == "prefill"
-    is_cluster = args.hardware.startswith("B300ClusterA")
     hw = HARDWARE_MAP[args.hardware]()
 
     # A. Declaration
     decl_kwargs = dict(
-        seq_prefill=8192 if is_prefill else None,
-        decode=not is_prefill,
-        kv_prefill_len=None if is_prefill else 8192,
-        persist_kv_cache=is_cluster and is_prefill)
+        seq_prefill=8192,
+        decode=not is_prefill)
     if args.batch_size is not None:
         decl_kwargs["batch_size"] = args.batch_size
-    g, layers, decode_step, emb, read_input, kv_cache_reads = \
+    g, layers, emb, read_input, kv_cache_reads, output_head = \
         declare_model(**decl_kwargs)
 
     # B. Visualization
@@ -66,11 +64,8 @@ def main():
         seeds = {emb, read_input}
         if layers:
             viz_layer = layers[0]
-        elif decode_step is not None and decode_step.layers:
-            viz_layer = decode_step.layers[0]
-            seeds = {decode_step.emb, decode_step.read_input}
-            if kv_cache_reads:
-                seeds.add(kv_cache_reads[0])
+        if kv_cache_reads:
+            seeds.add(kv_cache_reads[0])
         seeds.discard(None)
         if viz_layer:
             visualize_layer(g, viz_layer, extra_seeds=seeds)
@@ -80,27 +75,17 @@ def main():
         g, p = optimize_model_b300_superchip_a(g, hw)
     else:
         n_gpus = 16 if args.hardware == "B300ClusterA2Node" else 8
-        if args.pp is None:
-            if n_gpus % args.ep != 0:
-                parser.error(
-                    f"n_gpus={n_gpus} must be divisible by ep={args.ep}")
-            pp_degree = n_gpus // args.ep
-            layers_per_stage, remainder = divmod(N_LAYERS, pp_degree)
-            pp = [
-                layers_per_stage + (stage < remainder)
-                for stage in range(pp_degree)
-            ]
-        else:
-            pp = args.pp
         optimize_kwargs = dict(
-            cp=args.cp, dp=args.dp, ep=args.ep, pp=pp,
+            cp=args.cp, dp=args.dp, ep=args.ep,
+            pp_partition=args.pp_partition,
             n_gpus=n_gpus)
         if is_prefill:
             g, p = optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill(
                 g, layers, hw, emb, read_input, **optimize_kwargs)
         else:
             g, p = optimize_model_b300_cluster_a_cp_dp_ep_pp_decode(
-                g, decode_step, hw, kv_cache_reads, **optimize_kwargs)
+                g, layers, hw, emb, read_input, kv_cache_reads,
+                output_head, **optimize_kwargs)
 
     # D. Simulation
     trace_name = f"dsv4_pro_{args.stage}_{args.hardware}.json"

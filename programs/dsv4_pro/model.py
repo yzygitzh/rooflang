@@ -461,8 +461,8 @@ def _build_layers(g, B, S, context_len, prev_out):
     return layers, prev_out
 
 
-def _attach_decode_kv_cache(g, B, context_len, layers):
-    """Attach persistent external KV-cache inputs to decode attention."""
+def _build_decode_kv_cache_read(g, B, context_len, layers):
+    """Build persistent external KV-cache reads for decode attention."""
     kv_cache_reads = []
     for layer_id, layer in enumerate(layers):
         ratio = COMPRESS_RATIOS[layer_id]
@@ -535,8 +535,8 @@ def declare_model(
         - layers: list[LayerMeta] for the selected stage
         - emb/read_input: token input kernels shared by both stages
         - kv_cache_reads: per-layer KV cache ReadInput kernels (decode only)
-        - output_head: (final_norm, logits, sampling) for decode, empty tuple
-            for prefill
+        - output_head: (last_token, final_norm, logits, sampling) for prefill;
+            (final_norm, logits, sampling) for decode
     """
     is_prefill = not decode
 
@@ -551,10 +551,20 @@ def declare_model(
     kv_cache_reads = []
     output_head = ()
     if is_prefill:
+        last_token = Slice()
+        last_token.inputs = {
+            "x": Tensor("bf16", (B, S, D))}
+        last_token.outputs = {
+            "y": Tensor("bf16", (B, 1, D))}
+        g.add_kernel(last_token)
+        g.add_data_edge(last_output, last_token, {"y": "x"})
+        output_head = (
+            last_token, *_build_output_head(g, B, last_token))
+
         _build_kv_persistence_barrier(
-            g, layers, last_output, "prefill_output")
+            g, layers, output_head[-1], "prefill_output")
     else:
-        kv_cache_reads = _attach_decode_kv_cache(
+        kv_cache_reads = _build_decode_kv_cache_read(
             g, B, context_len, layers)
         output_head = _build_output_head(g, B, last_output)
         _build_kv_persistence_barrier(

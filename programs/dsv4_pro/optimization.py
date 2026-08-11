@@ -12,7 +12,7 @@ from rooflang.language.optimization.comm import (
 )
 from rooflang.language.optimization.split import (
     batch_split, batch_split_comm, context_split,
-    decode_attention_context_split, decode_persistence_split,
+    decode_attention_context_split, kv_persistence_split,
     replicate_before,
 )
 from rooflang.language.placement import Placement
@@ -245,8 +245,8 @@ def _place_experts_and_routes(
 
 
 def optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill(
-    g, layers, hw, emb=None, read_input=None, *, cp, dp, ep,
-    pp_partition, n_gpus,
+    g, layers, hw, emb=None, read_input=None, output_head=None, *,
+    cp, dp, ep, pp_partition, n_gpus,
 ):
     """Apply dynamic DP→CP→EP→PP placement to a prefill-only graph.
 
@@ -257,6 +257,9 @@ def optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill(
     """
     _validate_cp_dp_ep_pp_prefill(
         layers, emb, cp, dp, ep, pp_partition, n_gpus)
+    if output_head is None or len(output_head) != 4:
+        raise ValueError(
+            "prefill optimizer requires last-token output head kernels")
     pp_degree = len(pp_partition)
     layer_stages = [
         stage
@@ -291,6 +294,10 @@ def optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill(
     _, emb_copies, _ = g.split_kernel(batch_split, emb, dp)
     layer_copies = _split_prefill_state(
         g, layer_copies, batch_split, dp, "dp")
+    output_head_dp_copies = []
+    for kernel in output_head:
+        _, copies, _ = g.split_kernel(batch_split, kernel, dp)
+        output_head_dp_copies.append(copies)
     _, barrier_dp_copies, _ = g.split_kernel(
         batch_split, kv_barrier, dp)
 
@@ -303,7 +310,8 @@ def optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill(
         g, layer_copies, context_split, cp, "cp_dp")
     barrier_copies = []
     for copy in barrier_dp_copies:
-        _, split_copies, _ = g.split_kernel(context_split, copy, cp)
+        _, split_copies, _ = g.split_kernel(
+            kv_persistence_split, copy, cp)
         barrier_copies.extend(split_copies)
     for layer in layers:
         layer._kv_persist_barrier_cp_dp_copies = barrier_copies
@@ -336,6 +344,11 @@ def optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill(
             g, layer, fields, devices, placement, hw, shard_experts=True)
 
     final_devices = stage_gpus[layer_stages[-1]]
+    for copies in output_head_dp_copies:
+        for dp_rank, copy in enumerate(copies):
+            placement.set_kernel_device(
+                copy, final_devices[dp_rank * cp + cp - 1])
+
     for rank, barrier in enumerate(barrier_copies):
         for input_name, tensor in barrier.inputs.items():
             if input_name.startswith("kv"):
@@ -451,7 +464,7 @@ def optimize_model_b300_cluster_a_cp_dp_ep_pp_decode(
             for layer in layers):
         raise ValueError("decode KV persistence barrier is missing")
     barrier_prev, barrier_cp_copies, _ = g.split_kernel(
-        decode_persistence_split, barrier, cp)
+        kv_persistence_split, barrier, cp)
     cp_collectives_to_replicate = [barrier_prev["decode_output"]]
 
     cp_fields_by_layer = []

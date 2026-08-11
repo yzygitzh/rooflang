@@ -6,7 +6,7 @@ import pytest
 
 from rooflang.language.hardware.component import Compute
 from rooflang.language.kernels.comm import Broadcast, ReduceScatter
-from rooflang.language.kernels.forward import Nop, SparseAttn
+from rooflang.language.kernels.forward import Nop, Slice, SparseAttn
 from rooflang.language.kernels.identity import Move
 from rooflang.programs.dsv4_pro import optimization
 from rooflang.programs.dsv4_pro import model
@@ -82,7 +82,14 @@ def test_cp_dp_ep_pp_requires_layer_counts_to_cover_model():
 def test_declare_model_marks_kv_cache_for_persistence(monkeypatch):
     monkeypatch.setattr(model, "N_LAYERS", 2)
     monkeypatch.setattr(model, "N_EXPERTS", 8)
-    graph, layers, *_ = model.declare_model(seq_prefill=512)
+    graph, layers, _, _, _, output_head = model.declare_model(
+        seq_prefill=512)
+    assert len(output_head) == 4
+    assert isinstance(output_head[0], Slice)
+    assert output_head[0].inputs["x"].shape[1] == 512
+    assert output_head[0].outputs["y"].shape[1] == 1
+    assert layers[0].kv_persist_barrier.inputs[
+        "prefill_output"].shape == (512, 1, 1)
     barriers = {layer.kv_persist_barrier for layer in layers}
     assert len(barriers) == 1
     barrier = next(iter(barriers))
@@ -127,7 +134,7 @@ def test_cp4_dp2_ep8_pp2_prefill(monkeypatch):
         )
 
     graph, placement = optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill(
-        graph, layers, hw, emb, read_input,
+        graph, layers, hw, emb, read_input, output_head,
         cp=4, dp=2, ep=8, pp_partition=pp_partition, n_gpus=16)
 
     barriers = [kernel for kernel in graph.kernels

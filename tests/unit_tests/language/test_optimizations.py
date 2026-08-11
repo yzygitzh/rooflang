@@ -21,7 +21,7 @@ from rooflang.language.optimization.comm import (
 )
 from rooflang.language.optimization.split import (
     batch_split, batch_split_comm, column_split, context_split,
-    decode_attention_context_split, decode_persistence_split, head_split,
+    decode_attention_context_split, head_split, kv_persistence_split,
     replicate_before, row_split,
 )
 from rooflang.language.utils import gemm_scale_bytes
@@ -765,21 +765,22 @@ def test_decode_attention_context_split_broadcasts_q_and_shards_kv():
     assert isinstance(nxt["y"], Reduce)
 
 
-def test_decode_persistence_split_shards_kv_and_replicates_output():
+@pytest.mark.parametrize("output_name", ["prefill_output", "decode_output"])
+def test_kv_persistence_split_shards_kv_and_replicates_output(output_name):
     kernel = Nop(
         inputs={
             "kv": Tensor("bf16", (8, 16, 64)),
-            "decode_output": Tensor("int32", (8, 1, 1)),
+            output_name: Tensor("int32", (8, 1, 1)),
         },
         outputs={"done": Tensor("int32", (1,))},
     )
-    prev, copies, nxt = decode_persistence_split(kernel, N)
+    prev, copies, nxt = kv_persistence_split(kernel, N)
 
     assert isinstance(prev["kv"], Scatter)
-    assert isinstance(prev["decode_output"], Broadcast)
+    assert isinstance(prev[output_name], Broadcast)
     assert all(copy.inputs["kv"].shape == (8, 4, 64)
                for copy in copies)
-    assert all(copy.inputs["decode_output"].shape == (8, 1, 1)
+    assert all(copy.inputs[output_name].shape == (8, 1, 1)
                for copy in copies)
     assert all(copy.outputs["done"].shape == (1,) for copy in copies)
     assert isinstance(nxt["done"], Gather)

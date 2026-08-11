@@ -40,7 +40,6 @@ def main():
                         help="Expert-parallel degree (default: 8)")
     parser.add_argument(
         "--pp-partition", type=int, nargs="+", default=[N_LAYERS],
-        metavar="LAYERS",
         help="Layer counts assigned to successive pipeline stages")
     parser.add_argument("--visualization", action="store_true",
                         help="Export layer graph visualization")
@@ -81,7 +80,8 @@ def main():
             n_gpus=n_gpus)
         if is_prefill:
             g, p = optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill(
-                g, layers, hw, emb, read_input, **optimize_kwargs)
+                g, layers, hw, emb, read_input, output_head,
+                **optimize_kwargs)
         else:
             g, p = optimize_model_b300_cluster_a_cp_dp_ep_pp_decode(
                 g, layers, hw, emb, read_input, kv_cache_reads,

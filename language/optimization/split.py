@@ -126,14 +126,19 @@ def decode_attention_context_split(kernel, n):
     return prev_comms, copies, next_comms
 
 
-def decode_persistence_split(kernel, n):
-    """Split a decode KV barrier while replicating its scalar completion."""
-    if not isinstance(kernel, Nop) or "decode_output" not in kernel.inputs:
-        raise TypeError("decode persistence split requires its barrier Nop")
+def kv_persistence_split(kernel, n):
+    """Shard KV barrier inputs while replicating the stage output token."""
+    output_ports = {
+        port for port in kernel.inputs
+        if port in ("prefill_output", "decode_output")
+    } if isinstance(kernel, Nop) else set()
+    if len(output_ports) != 1:
+        raise TypeError("KV persistence split requires its barrier Nop")
+    output_port = next(iter(output_ports))
 
     prev_comms = {}
     for port, tensor in kernel.inputs.items():
-        if port == "decode_output":
+        if port == output_port:
             prev_comms[port] = _make_broadcast(tensor, n)
         else:
             prev_comms[port] = _make_scatter(tensor, n, dim=1)
@@ -144,7 +149,7 @@ def decode_persistence_split(kernel, n):
         copy.inputs = {
             port: Tensor(
                 tensor.dtype,
-                tensor.shape if port == "decode_output"
+                tensor.shape if port == output_port
                 else _shard_shape(tensor.shape, n, dim=1))
             for port, tensor in kernel.inputs.items()
         }

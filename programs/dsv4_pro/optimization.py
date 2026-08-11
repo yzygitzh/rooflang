@@ -244,7 +244,7 @@ def _place_experts_and_routes(
                 hw.find_local_memory(devices[owner]))
 
 
-def optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill(
+def optimize_model_cluster_prefill(
     g, layers, hw, emb=None, read_input=None, output_head=None, *,
     cp, dp, ep, pp_partition, n_gpus,
 ):
@@ -371,7 +371,7 @@ def optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill(
     return g, placement
 
 
-def optimize_model_b300_cluster_a_cp_dp_ep_pp_decode(
+def optimize_model_cluster_decode(
     g, layers, hw, emb=None, read_input=None, kv_cache_reads=None,
     output_head=None, *, cp, dp, ep, pp_partition, n_gpus,
 ):
@@ -682,7 +682,7 @@ def optimize_model_b300_cluster_a_cp_dp_ep_pp_decode(
     return g, placement
 
 
-def optimize_model_b300_superchip_a(g, hw):
+def optimize_model_superchip(g, hw):
     """Place all kernels on the single fused GPU (no splits, no comms)."""
     gpu = [c for c in hw.nodes if isinstance(c, Compute)
            and "nvidia-b300" in c.name][0]

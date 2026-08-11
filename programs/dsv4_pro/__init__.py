@@ -11,9 +11,9 @@ from rooflang.programs.dsv4_pro.model import (
     LayerMeta, declare_model,
 )
 from rooflang.programs.dsv4_pro.optimization import (
-    optimize_model_b300_cluster_a_cp_dp_ep_pp_decode,
-    optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill,
-    optimize_model_b300_superchip_a,
+    optimize_model_cluster_decode,
+    optimize_model_cluster_prefill,
+    optimize_model_superchip,
 )
 from rooflang.programs.dsv4_pro.simulation import simulate
 from rooflang.programs.dsv4_pro.visualization import visualize_layer

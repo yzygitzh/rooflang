@@ -7,9 +7,9 @@ from rooflang.programs.presets.b300 import B300ClusterA, B300SuperChipA
 from rooflang.programs.dsv4_pro.config import N_LAYERS
 from rooflang.programs.dsv4_pro.model import declare_model
 from rooflang.programs.dsv4_pro.optimization import (
-    optimize_model_b300_cluster_a_cp_dp_ep_pp_decode,
-    optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill,
-    optimize_model_b300_superchip_a,
+    optimize_model_cluster_decode,
+    optimize_model_cluster_prefill,
+    optimize_model_superchip,
 )
 from rooflang.programs.dsv4_pro.simulation import simulate
 from rooflang.programs.dsv4_pro.visualization import visualize_layer
@@ -71,7 +71,7 @@ def main():
 
     # C. Optimization
     if args.hardware == "B300SuperChipA":
-        g, p = optimize_model_b300_superchip_a(g, hw)
+        g, p = optimize_model_superchip(g, hw)
     else:
         n_gpus = 16 if args.hardware == "B300ClusterA2Node" else 8
         optimize_kwargs = dict(
@@ -79,11 +79,11 @@ def main():
             pp_partition=args.pp_partition,
             n_gpus=n_gpus)
         if is_prefill:
-            g, p = optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill(
+            g, p = optimize_model_cluster_prefill(
                 g, layers, hw, emb, read_input, output_head,
                 **optimize_kwargs)
         else:
-            g, p = optimize_model_b300_cluster_a_cp_dp_ep_pp_decode(
+            g, p = optimize_model_cluster_decode(
                 g, layers, hw, emb, read_input, kv_cache_reads,
                 output_head, **optimize_kwargs)
 

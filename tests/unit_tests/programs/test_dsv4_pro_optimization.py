@@ -11,8 +11,8 @@ from rooflang.language.kernels.identity import Move
 from rooflang.programs.dsv4_pro import optimization
 from rooflang.programs.dsv4_pro import model
 from rooflang.programs.dsv4_pro.optimization import (
-    optimize_model_b300_cluster_a_cp_dp_ep_pp_decode,
-    optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill,
+    optimize_model_cluster_decode,
+    optimize_model_cluster_prefill,
 )
 from rooflang.programs.presets.b300 import B300ClusterA
 from rooflang.runtime.simulator import Simulator
@@ -24,9 +24,9 @@ def test_public_optimizers_are_the_supported_strategies():
         if name.startswith("optimize_model_") and callable(value)
     }
     assert public_optimizers == {
-        "optimize_model_b300_superchip_a",
-        "optimize_model_b300_cluster_a_cp_dp_ep_pp_decode",
-        "optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill",
+        "optimize_model_superchip",
+        "optimize_model_cluster_decode",
+        "optimize_model_cluster_prefill",
     }
 
 
@@ -45,16 +45,15 @@ def test_declare_model_exposes_only_single_step_decode():
 def test_dynamic_optimizers_do_not_edit_declared_data_dependencies():
     forbidden = (".add_data_edge(", ".add_kernel(", ".remove_kernel(")
     for function in (
-        optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill,
-        optimize_model_b300_cluster_a_cp_dp_ep_pp_decode,
+        optimize_model_cluster_prefill,
+        optimize_model_cluster_decode,
     ):
         source = inspect.getsource(function)
         assert all(call not in source for call in forbidden)
 
 
 def test_decode_finishes_cp_and_dp_transforms_before_placement():
-    source = inspect.getsource(
-        optimize_model_b300_cluster_a_cp_dp_ep_pp_decode)
+    source = inspect.getsource(optimize_model_cluster_decode)
     cp_start = source.index("# CP comes first")
     dp_start = source.index("# DP is the second graph transform")
     placement_start = source.index("placement = Placement")
@@ -67,14 +66,14 @@ def test_decode_finishes_cp_and_dp_transforms_before_placement():
 
 def test_cp_dp_ep_pp_requires_ep_equal_cp_times_dp():
     with pytest.raises(ValueError, match=r"cp \* dp == ep"):
-        optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill(
+        optimize_model_cluster_prefill(
             g=None, layers=[object()], hw=None, emb=None,
             cp=2, dp=2, ep=8, pp_partition=[1], n_gpus=8)
 
 
 def test_cp_dp_ep_pp_requires_layer_counts_to_cover_model():
     with pytest.raises(ValueError, match="sum to the model layer count"):
-        optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill(
+        optimize_model_cluster_prefill(
             g=None, layers=[object(), object()], hw=None, emb=None,
             cp=2, dp=2, ep=4, pp_partition=[1, 2], n_gpus=8)
 
@@ -133,7 +132,7 @@ def test_cp4_dp2_ep8_pp2_prefill(monkeypatch):
             seq_prefill=512,
         )
 
-    graph, placement = optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill(
+    graph, placement = optimize_model_cluster_prefill(
         graph, layers, hw, emb, read_input, output_head,
         cp=4, dp=2, ep=8, pp_partition=pp_partition, n_gpus=16)
 
@@ -192,7 +191,7 @@ def test_cp4_dp2_ep8_pp2_decode(monkeypatch):
             decode=True,
         )
 
-    graph, placement = optimize_model_b300_cluster_a_cp_dp_ep_pp_decode(
+    graph, placement = optimize_model_cluster_decode(
         graph, layers, hw, emb, read_input, kv_reads, output_head,
         cp=4, dp=2, ep=8, pp_partition=[1, 1], n_gpus=16)
 
@@ -266,7 +265,7 @@ def test_cp_decode_broadcasts_q_between_same_stage_layers(monkeypatch):
             seq_prefill=512,
             decode=True,
         )
-    graph = optimize_model_b300_cluster_a_cp_dp_ep_pp_decode(
+    graph = optimize_model_cluster_decode(
         graph, layers, hw, emb, read_input, kv_reads, output_head,
         cp=4, dp=2, ep=8, pp_partition=[2], n_gpus=8,
     )[0]

@@ -32,8 +32,9 @@ def main():
                         help="Run decode phase")
     parser.add_argument("--batch-size", type=int, default=None,
                         help="Batch size (default: config BATCH)")
-    parser.add_argument("--n-decode-steps", type=int, default=1,
-                        help="Number of decode steps to unroll (default 1)")
+    parser.add_argument(
+        "--n-decode-steps", type=int, choices=[1], default=1,
+        help="Decode steps to simulate (only one-step decode is supported)")
     parser.add_argument("--visualization", action="store_true",
                         help="Export layer graph visualization")
     args = parser.parse_args()

@@ -1,4 +1,4 @@
-"""Split callables for ComputeGraph.split_kernel().
+"""Split and duplication callables for semantics-preserving graph rewrites.
 
 Each callable takes (kernel, n) and returns (prev_comms, copies, next_comms):
   - prev_comms: Dict[str, Kernel] — one comm kernel per input port
@@ -15,9 +15,11 @@ Each next_comm has n inputs ("i0".."i{n-1}") and 1 output ("y").
 | Contracting dim            | Scatter        | Reduce         |
 """
 
+from copy import deepcopy
+
 from rooflang.language.kernels.comm import Broadcast, Gather, Reduce, Scatter
 from rooflang.language.kernels.forward import (
-    Attn, ElementwiseOp, Embedding, Gemm, ReadInput, RMSNorm, Sampling,
+    Attn, ElementwiseOp, Embedding, Gemm, Nop, ReadInput, RMSNorm, Sampling,
     SparseAttn, Slice, StridedGemm, TokenCombine, TokenDispatch,
 )
 from rooflang.language.kernels.identity import Concat, Move, Spawn
@@ -75,6 +77,141 @@ def _make_reduce(tensor, n, dtype="bf16"):
                    for i in range(n)}
     comm.outputs = {"y": Tensor(tensor.dtype, tensor.shape)}
     return comm
+
+
+def _make_dependency_gather(tensor, n):
+    """Join replicated dummy outputs from split dependency-only kernels."""
+    comm = Gather(total_bytes=tensor.size_bytes, world=n, dim=0)
+    comm.inputs = {
+        f"i{i}": Tensor(tensor.dtype, tensor.shape) for i in range(n)}
+    comm.outputs = {"y": Tensor(tensor.dtype, tensor.shape)}
+    return comm
+
+
+def decode_attention_context_split(kernel, n):
+    """Split one decode attention over equal-size persistent KV shards."""
+    if not isinstance(kernel, SparseAttn):
+        raise TypeError("decode attention split requires SparseAttn")
+    if kernel.S_kv % n != 0:
+        raise ValueError(
+            f"attention S_kv={kernel.S_kv} must be divisible by {n}")
+    if kernel.k_sel % n != 0:
+        raise ValueError(
+            f"attention k_sel={kernel.k_sel} must be divisible by {n}")
+
+    q_tensor = kernel.inputs["q"]
+    kv_tensor = kernel.inputs["kv"]
+    out_tensor = kernel.outputs["y"]
+    local_kv = kernel.S_kv // n
+    prev_comms = {
+        "q": _make_broadcast(q_tensor, n),
+        "kv": _make_scatter(kv_tensor, n, dim=1),
+    }
+    copies = []
+    for _ in range(n):
+        copy = SparseAttn(
+            kernel.B, kernel.H, kernel.H_kv, kernel.S_q,
+            kernel.k_sel // n, local_kv, kernel.Hd, kernel.dtype_,
+            kernel.kv_factor)
+        copy.inputs = {
+            "q": Tensor(q_tensor.dtype, q_tensor.shape),
+            "kv": Tensor(
+                kv_tensor.dtype, _shard_shape(kv_tensor.shape, n, dim=1)),
+        }
+        copy.outputs = {
+            "y": Tensor(out_tensor.dtype, out_tensor.shape)}
+        copies.append(copy)
+    next_comms = {
+        "y": _make_reduce(out_tensor, n, dtype=out_tensor.dtype)}
+    return prev_comms, copies, next_comms
+
+
+def decode_persistence_split(kernel, n):
+    """Split a decode KV barrier while replicating its scalar completion."""
+    if not isinstance(kernel, Nop) or "decode_output" not in kernel.inputs:
+        raise TypeError("decode persistence split requires its barrier Nop")
+
+    prev_comms = {}
+    for port, tensor in kernel.inputs.items():
+        if port == "decode_output":
+            prev_comms[port] = _make_broadcast(tensor, n)
+        else:
+            prev_comms[port] = _make_scatter(tensor, n, dim=1)
+
+    copies = []
+    for _ in range(n):
+        copy = Nop()
+        copy.inputs = {
+            port: Tensor(
+                tensor.dtype,
+                tensor.shape if port == "decode_output"
+                else _shard_shape(tensor.shape, n, dim=1))
+            for port, tensor in kernel.inputs.items()
+        }
+        copy.outputs = {
+            port: Tensor(tensor.dtype, tensor.shape)
+            for port, tensor in kernel.outputs.items()
+        }
+        copies.append(copy)
+    next_comms = {
+        port: _make_dependency_gather(tensor, n)
+        for port, tensor in kernel.outputs.items()
+    }
+    return prev_comms, copies, next_comms
+
+
+def replicate_before(kernel, n):
+    """Dup callable that moves a one-input Broadcast before the kernel."""
+    if len(kernel.inputs) != 1 or len(kernel.outputs) != 1:
+        raise ValueError("replicate_before requires one input and one output")
+    input_name, input_tensor = next(iter(kernel.inputs.items()))
+    broadcast = _make_broadcast(input_tensor, n)
+    broadcast.inputs = {
+        input_name: Tensor(input_tensor.dtype, input_tensor.shape)}
+    copies = [deepcopy(kernel) for _ in range(n)]
+    return broadcast, copies
+
+
+def batch_split_comm(kernel, n):
+    """Replicate one collective across independent batch/DP groups.
+
+    The original collective operates on the full batch. Each copy operates on
+    one batch shard; per-port Scatter/Gather wrappers preserve the original
+    graph interface until adjacent compute kernels receive the same DP split.
+    """
+    if not isinstance(kernel, (Broadcast, Gather, Reduce, Scatter)):
+        raise TypeError(
+            "batch collective split requires a primitive communication "
+            "kernel")
+    tensors = (*kernel.inputs.values(), *kernel.outputs.values())
+    if any(not tensor.shape or tensor.shape[0] % n != 0
+           for tensor in tensors):
+        raise ValueError(
+            "every collective tensor batch dimension must be divisible by "
+            f"{n}")
+
+    prev_comms = {
+        port: _make_scatter(tensor, n)
+        for port, tensor in kernel.inputs.items()
+    }
+    copies = []
+    for _ in range(n):
+        copy = deepcopy(kernel)
+        copy.total_bytes /= n
+        copy.inputs = {
+            port: Tensor(tensor.dtype, _shard_shape(tensor.shape, n))
+            for port, tensor in kernel.inputs.items()
+        }
+        copy.outputs = {
+            port: Tensor(tensor.dtype, _shard_shape(tensor.shape, n))
+            for port, tensor in kernel.outputs.items()
+        }
+        copies.append(copy)
+    next_comms = {
+        port: _make_gather(tensor, n)
+        for port, tensor in kernel.outputs.items()
+    }
+    return prev_comms, copies, next_comms
 
 
 # ── column_split / row_split / head_split ──────────────────────────────
@@ -234,11 +371,18 @@ def context_split(kernel, n):
         for port, tensor in kernel.inputs.items()
     }
     copies = [_make_context_copy(kernel, n) for _ in range(n)]
-    next_comms = {
-        port: _make_gather(
-            tensor, n, dim=_context_port_dim(kernel, port, is_input=False))
-        for port, tensor in kernel.outputs.items()
-    }
+    if isinstance(kernel, Nop):
+        next_comms = {
+            port: _make_dependency_gather(tensor, n)
+            for port, tensor in kernel.outputs.items()
+        }
+    else:
+        next_comms = {
+            port: _make_gather(
+                tensor, n,
+                dim=_context_port_dim(kernel, port, is_input=False))
+            for port, tensor in kernel.outputs.items()
+        }
     return prev_comms, copies, next_comms
 
 
@@ -322,6 +466,8 @@ def _make_context_copy(kernel, n):
         c = Sampling(kernel.M // n, kernel.V, kernel.dtype_, kernel.out_dtype)
     elif isinstance(kernel, ElementwiseOp):
         c = ElementwiseOp(kernel.M // n, kernel.D, kernel.dtype_, kernel.op)
+    elif isinstance(kernel, Nop):
+        c = Nop()
     else:
         raise TypeError(
             f"context_split: unsupported kernel type "
@@ -335,14 +481,20 @@ def _make_context_copy(kernel, n):
                 _context_port_dim(kernel, port, is_input=True)))
         for port, tensor in kernel.inputs.items()
     }
-    c.outputs = {
-        port: Tensor(
-            tensor.dtype,
-            _shard_shape(
-                tensor.shape, n,
-                _context_port_dim(kernel, port, is_input=False)))
-        for port, tensor in kernel.outputs.items()
-    }
+    if isinstance(kernel, Nop):
+        c.outputs = {
+            port: Tensor(tensor.dtype, tensor.shape)
+            for port, tensor in kernel.outputs.items()
+        }
+    else:
+        c.outputs = {
+            port: Tensor(
+                tensor.dtype,
+                _shard_shape(
+                    tensor.shape, n,
+                    _context_port_dim(kernel, port, is_input=False)))
+            for port, tensor in kernel.outputs.items()
+        }
     if kernel.weights:
         if isinstance(kernel, Embedding):
             c.weights = {
@@ -370,8 +522,14 @@ def batch_split(kernel, n):
     prev_comms = {port: _make_scatter(tensor, n)
                   for port, tensor in kernel.inputs.items()}
     copies = [_make_batch_copy(kernel, n) for _ in range(n)]
-    next_comms = {port: _make_gather(tensor, n)
-                  for port, tensor in kernel.outputs.items()}
+    if isinstance(kernel, Nop):
+        next_comms = {
+            port: _make_dependency_gather(tensor, n)
+            for port, tensor in kernel.outputs.items()
+        }
+    else:
+        next_comms = {port: _make_gather(tensor, n)
+                      for port, tensor in kernel.outputs.items()}
     return prev_comms, copies, next_comms
 
 
@@ -414,14 +572,20 @@ def _make_batch_copy(kernel, n):
         c = Sampling(kernel.M // n, kernel.V, kernel.dtype_, kernel.out_dtype)
     elif isinstance(kernel, ElementwiseOp):
         c = ElementwiseOp(kernel.M // n, kernel.D, kernel.dtype_, kernel.op)
+    elif isinstance(kernel, Nop):
+        c = Nop()
     else:
         raise TypeError(
             f"batch_split: unsupported kernel type {type(kernel).__name__}")
 
     c.inputs = {k: Tensor(t.dtype, _shard_shape(t.shape, n))
                 for k, t in kernel.inputs.items()}
-    c.outputs = {k: Tensor(t.dtype, _shard_shape(t.shape, n))
-                 for k, t in kernel.outputs.items()}
+    if isinstance(kernel, Nop):
+        c.outputs = {k: Tensor(t.dtype, t.shape)
+                     for k, t in kernel.outputs.items()}
+    else:
+        c.outputs = {k: Tensor(t.dtype, _shard_shape(t.shape, n))
+                     for k, t in kernel.outputs.items()}
     if kernel.weights:
         if isinstance(kernel, Embedding):
             c.weights = {"emb": Tensor(kernel.w_dtype, (kernel.V, kernel.D),

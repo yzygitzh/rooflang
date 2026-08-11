@@ -54,6 +54,47 @@ def optimize_comms(graph: ComputeGraph, placement: Placement) -> None:
         changed |= _eliminate_dead(graph)
 
 
+def canonicalize_split_comms(graph: ComputeGraph, axis: str) -> None:
+    """Eliminate rank-aligned Gather/Scatter artifacts for one split axis.
+
+    Sequentially splitting adjacent kernels wraps both sides of an otherwise
+    local edge. Unlike optimize_comms(), this rewrite is placement-free and is
+    restricted to communication kernels explicitly tagged with the same
+    logical parallel axis by the caller.
+    """
+    while True:
+        pairs = []
+        for collector in list(graph._dag.nodes):
+            if not isinstance(collector, Gather) \
+                    or getattr(collector, "_split_axis", None) != axis:
+                continue
+            out_edges = graph._out_edges(collector)
+            if len(out_edges) != 1:
+                continue
+            distributor = out_edges[0].dst
+            if not isinstance(distributor, Scatter) \
+                    or getattr(distributor, "_split_axis", None) != axis:
+                continue
+            if len(graph._in_edges(distributor)) != 1 \
+                    or collector.world != distributor.world \
+                    or collector.dim != distributor.dim:
+                continue
+            collector_shard = next(iter(collector.inputs.values())).shape
+            distributor_shard = next(
+                iter(distributor.outputs.values())).shape
+            if collector_shard != distributor_shard:
+                continue
+            pairs.append((collector, distributor))
+
+        if not pairs:
+            break
+        for collector, distributor in pairs:
+            if not graph._dag.has_node(collector) \
+                    or not graph._dag.has_node(distributor):
+                continue
+            _bypass_pair(graph, collector, distributor)
+
+
 def _same_device_set(
     collector: Kernel, distributor: Kernel, placement: Placement,
 ) -> bool:

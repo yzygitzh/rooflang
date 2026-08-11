@@ -9,16 +9,20 @@ from rooflang.language.kernels.comm import (
     ReduceScatter, Scatter, Send, Recv,
 )
 from rooflang.language.kernels.forward import (
-    Attn, Embedding, Gemm, ReadInput, RMSNorm, Slice, SparseAttn,
+    Attn, Embedding, Gemm, Nop, ReadInput, RMSNorm, Slice, SparseAttn,
     StridedGemm, TokenCombine, TokenDispatch,
 )
 from rooflang.language.kernels.identity import Concat, Move, Spawn
 from rooflang.language.tensor import Tensor
 from rooflang.language.placement import Placement
 from rooflang.language.hardware.component import Compute, Memory
-from rooflang.language.optimization.comm import optimize_comms
+from rooflang.language.optimization.comm import (
+    canonicalize_split_comms, optimize_comms,
+)
 from rooflang.language.optimization.split import (
-    batch_split, column_split, context_split, head_split, row_split,
+    batch_split, batch_split_comm, column_split, context_split,
+    decode_attention_context_split, decode_persistence_split, head_split,
+    replicate_before, row_split,
 )
 from rooflang.language.utils import gemm_scale_bytes
 
@@ -727,6 +731,107 @@ def test_context_split_dispatch_and_combine_port_axes():
     assert combine_prev["i0"].dim == 0
     assert combine_copies[0].inputs["i0"].shape == (2, 64)
     assert combine_copies[0].outputs["y"].shape == (2, 4, 64)
+
+
+def test_context_split_nop_keeps_dummy_output_shape():
+    nop = Nop(
+        inputs={"kv": Tensor("bf16", (8, 16, 64))},
+        outputs={"done": Tensor("int32", (1,))},
+    )
+    prev, copies, nxt = context_split(nop, N)
+
+    assert isinstance(prev["kv"], Scatter)
+    assert all(copy.inputs["kv"].shape == (8, 4, 64)
+               for copy in copies)
+    assert all(copy.outputs["done"].shape == (1,) for copy in copies)
+    assert isinstance(nxt["done"], Gather)
+    assert all(tensor.shape == (1,)
+               for tensor in nxt["done"].inputs.values())
+
+
+def test_decode_attention_context_split_broadcasts_q_and_shards_kv():
+    kernel = SparseAttn(8, 8, 1, 1, 8, 12, 64, "bf16", kv_factor=1)
+    kernel.inputs = {
+        "q": Tensor("bf16", (8, 1, 8 * 64)),
+        "kv": Tensor("bf16", (8, 12, 64)),
+    }
+    kernel.outputs = {"y": Tensor("bf16", (8, 1, 8 * 64))}
+    prev, copies, nxt = decode_attention_context_split(kernel, N)
+
+    assert isinstance(prev["q"], Broadcast)
+    assert isinstance(prev["kv"], Scatter)
+    assert all(copy.S_kv == 3 for copy in copies)
+    assert all(copy.k_sel == 2 for copy in copies)
+    assert isinstance(nxt["y"], Reduce)
+
+
+def test_decode_persistence_split_shards_kv_and_replicates_output():
+    kernel = Nop(
+        inputs={
+            "kv": Tensor("bf16", (8, 16, 64)),
+            "decode_output": Tensor("int32", (8, 1, 1)),
+        },
+        outputs={"done": Tensor("int32", (1,))},
+    )
+    prev, copies, nxt = decode_persistence_split(kernel, N)
+
+    assert isinstance(prev["kv"], Scatter)
+    assert isinstance(prev["decode_output"], Broadcast)
+    assert all(copy.inputs["kv"].shape == (8, 4, 64)
+               for copy in copies)
+    assert all(copy.inputs["decode_output"].shape == (8, 1, 1)
+               for copy in copies)
+    assert all(copy.outputs["done"].shape == (1,) for copy in copies)
+    assert isinstance(nxt["done"], Gather)
+
+
+def test_batch_split_comm_replicates_collective_per_batch_group():
+    kernel = Broadcast(total_bytes=8 * 16 * 2, world=N)
+    kernel.inputs = {"x": Tensor("bf16", (8, 16))}
+    kernel.outputs = {
+        f"o{i}": Tensor("bf16", (8, 16)) for i in range(N)}
+
+    prev, copies, nxt = batch_split_comm(kernel, 2)
+
+    assert isinstance(prev["x"], Scatter)
+    assert prev["x"].world == 2
+    assert len(copies) == 2
+    assert all(isinstance(copy, Broadcast) and copy.world == N
+               for copy in copies)
+    assert all(copy.total_bytes == kernel.total_bytes / 2
+               for copy in copies)
+    assert all(copy.inputs["x"].shape == (4, 16) for copy in copies)
+    assert all(isinstance(comm, Gather) and comm.world == 2
+               for comm in nxt.values())
+
+
+def test_canonicalize_split_comms_bypasses_only_matching_axis():
+    gather = Gather(total_bytes=SHARD.size_bytes, world=N, dim=0)
+    scatter = Scatter(total_bytes=SHARD.size_bytes, world=N, dim=0)
+    graph, _, preds, succs = _build_chain(gather, scatter, N)
+    gather._split_axis = "dp"
+    scatter._split_axis = "dp"
+
+    canonicalize_split_comms(graph, "dp")
+
+    assert gather not in graph.kernels
+    assert scatter not in graph.kernels
+    for pred, succ in zip(preds, succs):
+        assert any(edge.src is pred and edge.dst is succ
+                   for edge in graph._out_edges(pred))
+
+
+def test_replicate_before_builds_broadcast_and_identical_copies():
+    kernel = Gemm(8, 16, 32, "bf16", "bf16")
+    kernel.inputs = {"x": Tensor("bf16", (8, 32))}
+    kernel.weights = {"w": Tensor("bf16", (32, 16))}
+    kernel.outputs = {"y": Tensor("bf16", (8, 16))}
+
+    broadcast, copies = replicate_before(kernel, N)
+
+    assert isinstance(broadcast, Broadcast)
+    assert len(copies) == N
+    assert all(copy.to_dict() == kernel.to_dict() for copy in copies)
 
 
 # ── batch_split ────────────────────────────────────────────────────────

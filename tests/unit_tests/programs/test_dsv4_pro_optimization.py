@@ -13,32 +13,21 @@ from rooflang.programs.dsv4_pro import model
 from rooflang.programs.dsv4_pro.optimization import (
     optimize_model_b300_cluster_a_cp_dp_ep_pp_decode,
     optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill,
-    optimize_model_b300_cluster_a_cp8_ep8_1node,
 )
 from rooflang.programs.presets.b300 import B300ClusterA
 from rooflang.runtime.simulator import Simulator
 
 
-def test_cp8_ep8_1node_rejects_decode():
-    with pytest.raises(ValueError, match="supports prefill only"):
-        optimize_model_b300_cluster_a_cp8_ep8_1node(
-            g=None, layers=[], hw=None, decode_steps=[object()])
-
-
-def test_dp8_ep8_requires_equal_parallel_sizes(monkeypatch):
-    monkeypatch.setattr(optimization, "DP", 4)
-    monkeypatch.setattr(optimization, "EP", 8)
-    with pytest.raises(ValueError, match="requires DP == EP"):
-        optimization.optimize_model_b300_cluster_a_dp8_ep8_1node(
-            g=None, layers=[], hw=None)
-
-
-def test_cp8_ep8_requires_equal_parallel_sizes(monkeypatch):
-    monkeypatch.setattr(optimization, "CP", 4)
-    monkeypatch.setattr(optimization, "EP", 8)
-    with pytest.raises(ValueError, match="requires CP == EP"):
-        optimization.optimize_model_b300_cluster_a_cp8_ep8_1node(
-            g=None, layers=[], hw=None)
+def test_public_optimizers_are_the_supported_strategies():
+    public_optimizers = {
+        name for name, value in vars(optimization).items()
+        if name.startswith("optimize_model_") and callable(value)
+    }
+    assert public_optimizers == {
+        "optimize_model_b300_superchip_a",
+        "optimize_model_b300_cluster_a_cp_dp_ep_pp_decode",
+        "optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill",
+    }
 
 
 def test_cp_dp_ep_pp_prefill_rejects_decode():

@@ -61,6 +61,7 @@ def _place_comm_tensor_memories(g, placement):
     ]
 
     def place_from_edges(comm):
+        changed = False
         for edge in g._in_edges(comm):
             for output_name, input_name in edge.mapping.items():
                 memory = placement.get_tensor_memory(
@@ -69,6 +70,7 @@ def _place_comm_tensor_memories(g, placement):
                 if memory is not None \
                         and placement.get_tensor_memory(tensor) is None:
                     placement.set_tensor_memory(tensor, memory)
+                    changed = True
         for edge in g._out_edges(comm):
             for output_name, input_name in edge.mapping.items():
                 memory = placement.get_tensor_memory(
@@ -77,6 +79,8 @@ def _place_comm_tensor_memories(g, placement):
                 if memory is not None \
                         and placement.get_tensor_memory(tensor) is None:
                     placement.set_tensor_memory(tensor, memory)
+                    changed = True
+        return changed
 
     def place_root(comm):
         if isinstance(comm, (Gather, Reduce)):
@@ -86,20 +90,24 @@ def _place_comm_tensor_memories(g, placement):
             anchor = next(iter(comm.outputs.values()), None)
             targets = comm.inputs.values()
         else:
-            return
+            return False
         memory = placement.get_tensor_memory(anchor)
         if memory is None:
-            return
+            return False
+        changed = False
         for tensor in targets:
             if placement.get_tensor_memory(tensor) is None:
                 placement.set_tensor_memory(tensor, memory)
+                changed = True
+        return changed
 
-    for comm in comms:
-        place_from_edges(comm)
-        place_root(comm)
-    for comm in reversed(comms):
-        place_from_edges(comm)
-        place_root(comm)
+    changed = True
+    while changed:
+        changed = False
+        for sweep in (comms, reversed(comms)):
+            for comm in sweep:
+                changed |= place_from_edges(comm)
+                changed |= place_root(comm)
 
 
 def _cluster_a_resources(hw):
@@ -257,9 +265,6 @@ def optimize_model_cluster_prefill(
     _validate_args(
         layers, batch_size, seq_prefill, True,
         cp, dp, ep, pp_partition, n_gpus)
-    if output_head is None or len(output_head) != 4:
-        raise ValueError(
-            "prefill optimizer requires last-token output head kernels")
     pp_degree = len(pp_partition)
     layer_stages = [
         stage
@@ -267,18 +272,8 @@ def optimize_model_cluster_prefill(
         for _ in range(layer_count)
     ]
     gpus, cpus, drams = _cluster_a_resources(hw)
-    if len(gpus) != n_gpus:
-        raise ValueError(
-            f"hardware contains {len(gpus)} B300 GPUs, expected {n_gpus}")
-    if not cpus or not drams:
-        raise ValueError("B300 Cluster A requires per-node CPUs and DRAMs")
 
     kv_barrier = layers[0].kv_persist_barrier
-    if kv_barrier is None \
-            or any(layer.kv_persist_barrier is not kv_barrier
-                   for layer in layers):
-        raise ValueError(
-            "prefill KV persistence is missing from the declared model")
 
     layer_copies = []
     for layer in layers:

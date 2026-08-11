@@ -50,6 +50,7 @@ def test_dynamic_optimizers_do_not_edit_declared_data_dependencies():
     ):
         source = inspect.getsource(function)
         assert all(call not in source for call in forbidden)
+        assert "_validate_args(" in source
 
 
 def test_decode_finishes_cp_and_dp_transforms_before_placement():
@@ -64,17 +65,19 @@ def test_decode_finishes_cp_and_dp_transforms_before_placement():
     assert source.index("optimize_comms(") > placement_start
 
 
-def test_cp_dp_ep_pp_requires_ep_equal_cp_times_dp():
+def test_cluster_optimizers_require_ep_equal_cp_times_dp():
     with pytest.raises(ValueError, match=r"cp \* dp == ep"):
-        optimize_model_cluster_prefill(
-            g=None, layers=[object()], hw=None, emb=None,
+        optimization._validate_args(
+            layers=[object()], batch_size=64, seq_prefill=512,
+            is_prefill=False,
             cp=2, dp=2, ep=8, pp_partition=[1], n_gpus=8)
 
 
-def test_cp_dp_ep_pp_requires_layer_counts_to_cover_model():
+def test_cluster_optimizers_require_partition_to_cover_model():
     with pytest.raises(ValueError, match="sum to the model layer count"):
-        optimize_model_cluster_prefill(
-            g=None, layers=[object(), object()], hw=None, emb=None,
+        optimization._validate_args(
+            layers=[object(), object()], batch_size=64, seq_prefill=512,
+            is_prefill=False,
             cp=2, dp=2, ep=4, pp_partition=[1, 2], n_gpus=8)
 
 
@@ -193,7 +196,8 @@ def test_cp4_dp2_ep8_pp2_decode(monkeypatch):
 
     graph, placement = optimize_model_cluster_decode(
         graph, layers, hw, emb, read_input, kv_reads, output_head,
-        cp=4, dp=2, ep=8, pp_partition=[1, 1], n_gpus=16)
+        seq_prefill=512, cp=4, dp=2, ep=8,
+        pp_partition=[1, 1], n_gpus=16)
 
     for layer_id, layer in enumerate(layers):
         q_broadcasts = {
@@ -267,7 +271,8 @@ def test_cp_decode_broadcasts_q_between_same_stage_layers(monkeypatch):
         )
     graph = optimize_model_cluster_decode(
         graph, layers, hw, emb, read_input, kv_reads, output_head,
-        cp=4, dp=2, ep=8, pp_partition=[2], n_gpus=8,
+        seq_prefill=512, cp=4, dp=2, ep=8,
+        pp_partition=[2], n_gpus=8,
     )[0]
 
     q_broadcasts = {

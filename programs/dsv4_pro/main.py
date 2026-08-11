@@ -85,7 +85,8 @@ def main():
         else:
             g, p = optimize_model_cluster_decode(
                 g, layers, hw, emb, read_input, kv_cache_reads,
-                output_head, **optimize_kwargs)
+                output_head, seq_prefill=decl_kwargs["seq_prefill"],
+                **optimize_kwargs)
 
     # D. Simulation
     trace_name = f"dsv4_pro_{args.stage}_{args.hardware}.json"

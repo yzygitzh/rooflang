@@ -124,16 +124,11 @@ def _cluster_a_resources(hw):
     return gpus, dict(cpus), dict(drams)
 
 
-def _validate_cp_dp_ep_pp_prefill(
-    layers, emb, cp, dp, ep, pp_partition, n_gpus,
+def _validate_args(
+    layers, batch_size, seq_prefill, is_prefill,
+    cp, dp, ep, pp_partition, n_gpus,
 ):
-    """Validate parallel degrees, PP layer counts, and split divisibility."""
-    if min(cp, dp, ep, n_gpus) <= 0:
-        raise ValueError("cp, dp, ep, and n_gpus must all be positive")
-    if not pp_partition or any(
-            not isinstance(count, int) or count <= 0
-            for count in pp_partition):
-        raise ValueError("pp_partition must contain positive layer counts")
+    """Validate parallel degrees and stage-dependent split divisibility."""
     if sum(pp_partition) != len(layers):
         raise ValueError(
             f"pp_partition must sum to the model layer count; "
@@ -150,16 +145,18 @@ def _validate_cp_dp_ep_pp_prefill(
     if N_EXPERTS % ep != 0:
         raise ValueError(
             f"N_EXPERTS={N_EXPERTS} must be divisible by ep={ep}")
-    if emb is None:
-        raise ValueError("prefill optimizer requires an embedding kernel")
 
-    batch_size, seq_prefill = emb.outputs["y"].shape[:2]
-    if batch_size % dp != 0:
+    context_length = seq_prefill if is_prefill else 1
+    batch_degree = dp if is_prefill else cp * dp
+    if batch_size % batch_degree != 0:
         raise ValueError(
-            f"batch size {batch_size} must be divisible by dp={dp}")
+            f"batch size {batch_size} must be divisible by "
+            f"{'dp' if is_prefill else 'cp * dp'}={batch_degree}")
+
     if seq_prefill % cp != 0:
         raise ValueError(
-            f"prefill sequence {seq_prefill} must be divisible by cp={cp}")
+            f"prefill sequence {seq_prefill} must be divisible by "
+            f"cp={cp}")
     if WINDOW % cp != 0:
         raise ValueError(f"WINDOW={WINDOW} must be divisible by cp={cp}")
     for ratio in set(COMPRESS_RATIOS):
@@ -169,12 +166,13 @@ def _validate_cp_dp_ep_pp_prefill(
                 f"compression ratio {ratio}")
         if (seq_prefill // ratio) % cp != 0:
             raise ValueError(
-                f"compressed sequence {seq_prefill // ratio} must be "
-                f"divisible by cp={cp}")
-    routed_tokens = batch_size * seq_prefill * TOPK
+                f"compressed sequence {seq_prefill // ratio} must "
+                f"be divisible by cp={cp}")
+
+    routed_tokens = batch_size * context_length * TOPK
     if routed_tokens % (N_EXPERTS * ep) != 0:
         raise ValueError(
-            "expert-token count must be divisible by cp * dp; got "
+            "expert-token count must be divisible by EP copies; got "
             f"B*S*TOPK={routed_tokens}, N_EXPERTS*ep={N_EXPERTS * ep}")
 
 
@@ -255,8 +253,10 @@ def optimize_model_cluster_prefill(
     of model layers assigned to that stage. PP models one prefill wave without
     a microbatch schedule.
     """
-    _validate_cp_dp_ep_pp_prefill(
-        layers, emb, cp, dp, ep, pp_partition, n_gpus)
+    batch_size, seq_prefill = emb.outputs["y"].shape[:2]
+    _validate_args(
+        layers, batch_size, seq_prefill, True,
+        cp, dp, ep, pp_partition, n_gpus)
     if output_head is None or len(output_head) != 4:
         raise ValueError(
             "prefill optimizer requires last-token output head kernels")
@@ -373,7 +373,7 @@ def optimize_model_cluster_prefill(
 
 def optimize_model_cluster_decode(
     g, layers, hw, emb=None, read_input=None, kv_cache_reads=None,
-    output_head=None, *, cp, dp, ep, pp_partition, n_gpus,
+    output_head=None, *, seq_prefill, cp, dp, ep, pp_partition, n_gpus,
 ):
     """Apply CP, DP, EP, and PP to a one-step decode-only graph.
 
@@ -383,44 +383,17 @@ def optimize_model_cluster_decode(
     if emb is None or read_input is None or not kv_cache_reads \
             or output_head is None or len(output_head) != 3:
         raise ValueError("decode optimizer requires input, KV, and output head")
-    if min(cp, dp, ep, n_gpus) <= 0:
-        raise ValueError("cp, dp, ep, and n_gpus must all be positive")
-    if not pp_partition or any(
-            not isinstance(count, int) or count <= 0
-            for count in pp_partition):
-        raise ValueError("pp_partition must contain positive layer counts")
 
     final_norm, logits, sampling = output_head
     n_layers = len(layers)
-    if sum(pp_partition) != n_layers:
-        raise ValueError(
-            "pp_partition must sum to the model layer count; "
-            f"got {sum(pp_partition)} for {n_layers} layers")
+    batch_size = emb.outputs["y"].shape[0]
+    _validate_args(
+        layers, batch_size, seq_prefill, False,
+        cp, dp, ep, pp_partition, n_gpus)
     pp_degree = len(pp_partition)
-    if cp * dp != ep:
-        raise ValueError(
-            "CP/DP/EP placement requires cp * dp == ep; "
-            f"got {cp} * {dp} != {ep}")
-    if ep * pp_degree != n_gpus:
-        raise ValueError(
-            "EP/PP placement requires ep * PP == n_gpus; "
-            f"got {ep} * {pp_degree} != {n_gpus}")
-    if N_EXPERTS % ep != 0:
-        raise ValueError(
-            f"N_EXPERTS={N_EXPERTS} must be divisible by ep={ep}")
     if len(kv_cache_reads) != n_layers:
         raise ValueError(
             f"expected {n_layers} KV cache reads, got {len(kv_cache_reads)}")
-
-    batch_size = emb.outputs["y"].shape[0]
-    if batch_size % ep != 0:
-        raise ValueError(
-            f"decode batch size {batch_size} must be divisible by ep={ep}")
-    routed_tokens = batch_size * TOPK
-    if routed_tokens % (N_EXPERTS * ep) != 0:
-        raise ValueError(
-            "expert-token count must be divisible by EP copies; got "
-            f"B*TOPK={routed_tokens}, N_EXPERTS*ep={N_EXPERTS * ep}")
 
     layer_stages = [
         stage

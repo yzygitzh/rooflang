@@ -30,18 +30,16 @@ def test_public_optimizers_are_the_supported_strategies():
     }
 
 
-def test_cp_dp_ep_pp_prefill_rejects_decode():
-    with pytest.raises(ValueError, match="supports prefill only"):
-        optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill(
-            g=None, layers=[], hw=None, decode_steps=[object()],
-            cp=4, dp=2, ep=8, pp=[], n_gpus=16)
+def test_declare_model_requires_exactly_one_stage():
+    with pytest.raises(ValueError, match="exactly one"):
+        model.declare_model(seq_prefill=512, decode=True)
+    with pytest.raises(ValueError, match="exactly one"):
+        model.declare_model(seq_prefill=None, decode=False)
 
 
-def test_cp_dp_ep_pp_decode_rejects_prefill():
-    with pytest.raises(ValueError, match="supports decode only"):
-        optimize_model_b300_cluster_a_cp_dp_ep_pp_decode(
-            g=None, layers=[object()], hw=None,
-            cp=4, dp=2, ep=8, pp=[1], n_gpus=8)
+def test_declare_model_exposes_only_single_step_decode():
+    assert "n_decode_steps" not in inspect.signature(
+        model.declare_model).parameters
 
 
 def test_dynamic_optimizers_do_not_edit_declared_data_dependencies():
@@ -98,39 +96,24 @@ def test_declare_model_marks_kv_cache_for_persistence(monkeypatch):
 def test_declare_decode_uses_read_only_persistent_kv(monkeypatch):
     monkeypatch.setattr(model, "N_LAYERS", 2)
     monkeypatch.setattr(model, "N_EXPERTS", 8)
-    graph, _, decode_steps, _, _, kv_reads, _ = model.declare_model(
+    graph, _, decode_step, _, _, kv_reads = model.declare_model(
         batch_size=64,
         seq_prefill=None,
         decode=True,
         kv_prefill_len=512,
     )
 
-    step = decode_steps[0]
-    barrier = step.kv_persist_barrier
+    barrier = decode_step.kv_persist_barrier
     assert isinstance(barrier, Nop)
     assert set(barrier.inputs) == {"kv0", "kv1", "decode_output"}
     assert barrier.outputs["done"].shape == (1,)
-    for layer_id, layer in enumerate(step.layers):
+    for layer_id, layer in enumerate(decode_step.layers):
         assert layer.persist_kv_cache
         assert layer.kv_persist_barrier is barrier
-        assert layer.kv_acc is None
-        assert layer.kv_acc_fan is None
         assert layer.kv_win_slice is None
-        assert layer.kv_comp_slice is None
         assert layer.sa.S_kv == kv_reads[layer_id].outputs["y"].shape[1]
         assert any(edge.src is layer.kv_cache_fan and edge.dst is barrier
                    for edge in graph._in_edges(barrier))
-
-
-def test_declare_decode_rejects_multiple_steps():
-    with pytest.raises(ValueError, match="exactly one step"):
-        model.declare_model(
-            batch_size=64,
-            seq_prefill=None,
-            decode=True,
-            kv_prefill_len=512,
-            n_decode_steps=2,
-        )
 
 
 def test_cp4_dp2_ep8_pp2_prefill(monkeypatch):
@@ -141,7 +124,7 @@ def test_cp4_dp2_ep8_pp2_prefill(monkeypatch):
 
     hw = B300ClusterA(n_nodes=2)
     pp = [1, 1]
-    graph, layers, decode_steps, emb, read_input, kv_reads, head = \
+    graph, layers, decode_step, emb, read_input, kv_reads = \
         model.declare_model(
             batch_size=64,
             seq_prefill=512,
@@ -149,7 +132,7 @@ def test_cp4_dp2_ep8_pp2_prefill(monkeypatch):
         )
 
     graph, placement = optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill(
-        graph, layers, hw, emb, read_input, decode_steps, kv_reads, head,
+        graph, layers, hw, emb, read_input,
         cp=4, dp=2, ep=8, pp=pp, n_gpus=16)
 
     barriers = [kernel for kernel in graph.kernels
@@ -200,21 +183,19 @@ def test_cp4_dp2_ep8_pp2_decode(monkeypatch):
     monkeypatch.setattr(optimization, "N_EXPERTS", 8)
 
     hw = B300ClusterA(n_nodes=2)
-    graph, layers, decode_steps, emb, read_input, kv_reads, head = \
+    graph, layers, decode_step, emb, read_input, kv_reads = \
         model.declare_model(
             batch_size=64,
             seq_prefill=None,
             decode=True,
             kv_prefill_len=512,
-            n_decode_steps=1,
         )
 
     graph, placement = optimize_model_b300_cluster_a_cp_dp_ep_pp_decode(
-        graph, layers, hw, emb, read_input, decode_steps, kv_reads, head,
+        graph, decode_step, hw, kv_reads,
         cp=4, dp=2, ep=8, pp=[1, 1], n_gpus=16)
 
-    step = decode_steps[0]
-    for layer_id, layer in enumerate(step.layers):
+    for layer_id, layer in enumerate(decode_step.layers):
         q_broadcasts = {
             graph._in_edges(copy)[0].src
             for copy in layer._wq_a_cp_dp_copies
@@ -241,7 +222,7 @@ def test_cp4_dp2_ep8_pp2_decode(monkeypatch):
             for kernel in layer._wkv_dp_copies
         ) == [0, 4]
 
-    barriers = step._kv_persist_barrier_cp_dp_copies
+    barriers = decode_step._kv_persist_barrier_cp_dp_copies
     assert len(barriers) == 8
     assert all(isinstance(barrier, Nop) for barrier in barriers)
     assert all(barrier not in placement.placed_kernels
@@ -278,23 +259,21 @@ def test_cp_decode_broadcasts_q_between_same_stage_layers(monkeypatch):
     monkeypatch.setattr(optimization, "N_EXPERTS", 8)
 
     hw = B300ClusterA(n_nodes=1)
-    graph, layers, decode_steps, emb, read_input, kv_reads, head = \
+    graph, layers, decode_step, emb, read_input, kv_reads = \
         model.declare_model(
             batch_size=64,
             seq_prefill=None,
             decode=True,
             kv_prefill_len=512,
-            n_decode_steps=1,
         )
     graph = optimize_model_b300_cluster_a_cp_dp_ep_pp_decode(
-        graph, layers, hw, emb, read_input, decode_steps, kv_reads, head,
+        graph, decode_step, hw, kv_reads,
         cp=4, dp=2, ep=8, pp=[2], n_gpus=8,
     )[0]
 
     q_broadcasts = {
         graph._in_edges(copy)[0].src
-        for step in decode_steps
-        for layer in step.layers
+        for layer in decode_step.layers
         for copy in layer._wq_a_cp_dp_copies
     }
     assert len(q_broadcasts) == 2 * 2

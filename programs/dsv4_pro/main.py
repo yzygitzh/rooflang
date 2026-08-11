@@ -27,15 +27,11 @@ def main():
     parser.add_argument("--hardware", required=True,
                         choices=list(HARDWARE_MAP.keys()),
                         help="Hardware configuration")
-    parser.add_argument("--prefill", action="store_true",
-                        help="Run prefill phase")
-    parser.add_argument("--decode", action="store_true",
-                        help="Run decode phase")
+    parser.add_argument("--stage", required=True,
+                        choices=("prefill", "decode"),
+                        help="Inference stage to simulate")
     parser.add_argument("--batch-size", type=int, default=None,
                         help="Batch size (default: config BATCH)")
-    parser.add_argument(
-        "--n-decode-steps", type=int, choices=[1], default=1,
-        help="Decode steps to simulate (only one-step decode is supported)")
     parser.add_argument("--cp", type=int, default=1,
                         help="Context-parallel degree (default: 1)")
     parser.add_argument("--dp", type=int, default=8,
@@ -49,27 +45,20 @@ def main():
                         help="Export layer graph visualization")
     args = parser.parse_args()
 
+    is_prefill = args.stage == "prefill"
     is_cluster = args.hardware.startswith("B300ClusterA")
-    if is_cluster and args.prefill and args.decode:
-        parser.error(
-            "B300 Cluster A requires prefill-only or decode-only simulation")
-
     hw = HARDWARE_MAP[args.hardware]()
-
-    has_sim = args.prefill or args.decode
-    seq_prefill = 8192 if args.prefill else None
-    kv_prefill_len = 8192 if (args.decode and not args.prefill) else None
 
     # A. Declaration
     decl_kwargs = dict(
-        seq_prefill=seq_prefill, decode=args.decode,
-        kv_prefill_len=kv_prefill_len,
-        n_decode_steps=args.n_decode_steps,
-        persist_kv_cache=is_cluster and args.prefill)
+        seq_prefill=8192 if is_prefill else None,
+        decode=not is_prefill,
+        kv_prefill_len=None if is_prefill else 8192,
+        persist_kv_cache=is_cluster and is_prefill)
     if args.batch_size is not None:
         decl_kwargs["batch_size"] = args.batch_size
-    g, layers, decode_steps, emb, read_input, kv_cache_reads, \
-        pfx_out_head = declare_model(**decl_kwargs)
+    g, layers, decode_step, emb, read_input, kv_cache_reads = \
+        declare_model(**decl_kwargs)
 
     # B. Visualization
     if args.visualization:
@@ -77,56 +66,48 @@ def main():
         seeds = {emb, read_input}
         if layers:
             viz_layer = layers[0]
-        elif decode_steps and decode_steps[0].layers:
-            viz_layer = decode_steps[0].layers[0]
-            seeds = {decode_steps[0].emb, decode_steps[0].read_input}
+        elif decode_step is not None and decode_step.layers:
+            viz_layer = decode_step.layers[0]
+            seeds = {decode_step.emb, decode_step.read_input}
             if kv_cache_reads:
                 seeds.add(kv_cache_reads[0])
         seeds.discard(None)
         if viz_layer:
             visualize_layer(g, viz_layer, extra_seeds=seeds)
 
-    if has_sim:
-        # C. Optimization
-        if args.hardware == "B300SuperChipA":
-            g, p = optimize_model_b300_superchip_a(g, hw)
+    # C. Optimization
+    if args.hardware == "B300SuperChipA":
+        g, p = optimize_model_b300_superchip_a(g, hw)
+    else:
+        n_gpus = 16 if args.hardware == "B300ClusterA2Node" else 8
+        if args.pp is None:
+            if n_gpus % args.ep != 0:
+                parser.error(
+                    f"n_gpus={n_gpus} must be divisible by ep={args.ep}")
+            pp_degree = n_gpus // args.ep
+            layers_per_stage, remainder = divmod(N_LAYERS, pp_degree)
+            pp = [
+                layers_per_stage + (stage < remainder)
+                for stage in range(pp_degree)
+            ]
         else:
-            n_gpus = 16 if args.hardware == "B300ClusterA2Node" else 8
-            if args.pp is None:
-                if n_gpus % args.ep != 0:
-                    parser.error(
-                        f"n_gpus={n_gpus} must be divisible by ep={args.ep}")
-                pp_degree = n_gpus // args.ep
-                layers_per_stage, remainder = divmod(N_LAYERS, pp_degree)
-                pp = [
-                    layers_per_stage + (stage < remainder)
-                    for stage in range(pp_degree)
-                ]
-            else:
-                pp = args.pp
-            optimizer = (
-                optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill
-                if args.prefill else
-                optimize_model_b300_cluster_a_cp_dp_ep_pp_decode
-            )
-            g, p = optimizer(
-                g, layers, hw, emb, read_input, decode_steps,
-                kv_cache_reads, pfx_out_head,
-                cp=args.cp, dp=args.dp, ep=args.ep, pp=pp,
-                n_gpus=n_gpus)
+            pp = args.pp
+        optimize_kwargs = dict(
+            cp=args.cp, dp=args.dp, ep=args.ep, pp=pp,
+            n_gpus=n_gpus)
+        if is_prefill:
+            g, p = optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill(
+                g, layers, hw, emb, read_input, **optimize_kwargs)
+        else:
+            g, p = optimize_model_b300_cluster_a_cp_dp_ep_pp_decode(
+                g, decode_step, hw, kv_cache_reads, **optimize_kwargs)
 
-        # D. Simulation
-        mode = []
-        if args.prefill:
-            mode.append("prefill")
-        if args.decode:
-            mode.append("decode")
-        trace_name = f"dsv4_pro_{'_'.join(mode)}_{args.hardware}.json"
-
-        result = simulate(g, p, hw, trace_name)
-        print(f"{'+'.join(mode)} ({args.hardware}): "
-              f"{result.total_time_us:.1f} us "
-              f"({result.total_time_us / 1000:.1f} ms)")
+    # D. Simulation
+    trace_name = f"dsv4_pro_{args.stage}_{args.hardware}.json"
+    result = simulate(g, p, hw, trace_name)
+    print(f"{args.stage} ({args.hardware}): "
+          f"{result.total_time_us:.1f} us "
+          f"({result.total_time_us / 1000:.1f} ms)")
 
 
 if __name__ == "__main__":

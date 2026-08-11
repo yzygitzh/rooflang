@@ -243,9 +243,7 @@ def _place_experts_and_routes(
 
 
 def optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill(
-    g, layers, hw, emb=None, read_input=None, decode_steps=None,
-    kv_cache_reads=None, prefill_output_head=None, *,
-    cp, dp, ep, pp, n_gpus,
+    g, layers, hw, emb=None, read_input=None, *, cp, dp, ep, pp, n_gpus,
 ):
     """Apply dynamic DP→CP→EP→PP placement to a prefill-only graph.
 
@@ -254,10 +252,6 @@ def optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill(
     layers assigned to that stage. PP models one prefill wave without a
     microbatch schedule.
     """
-    if decode_steps or kv_cache_reads or prefill_output_head:
-        raise ValueError(
-            "optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill supports "
-            "prefill only")
     _validate_cp_dp_ep_pp_prefill(
         layers, emb, cp, dp, ep, pp, n_gpus)
     pp_degree = len(pp)
@@ -364,30 +358,21 @@ def optimize_model_b300_cluster_a_cp_dp_ep_pp_prefill(
 
 
 def optimize_model_b300_cluster_a_cp_dp_ep_pp_decode(
-    g, layers, hw, emb=None, read_input=None, decode_steps=None,
-    kv_cache_reads=None, prefill_output_head=None, *,
-    cp, dp, ep, pp, n_gpus,
+    g, decode_step, hw, kv_cache_reads=None, *, cp, dp, ep, pp, n_gpus,
 ):
     """Apply CP, DP, EP, and PP to a one-step decode-only graph.
 
     KV is a persistent read-only model input. The optimizer does not construct
     cache slices, append the current token, or model cache ownership changes.
     """
-    if layers or emb is not None or read_input is not None \
-            or prefill_output_head:
-        raise ValueError(
-            "optimize_model_b300_cluster_a_cp_dp_ep_pp_decode supports "
-            "decode only")
-    if not decode_steps or not kv_cache_reads:
-        raise ValueError("decode-only optimizer requires decode steps and KV")
-    if len(decode_steps) != 1:
-        raise ValueError("decode optimizer supports exactly one step")
+    if decode_step is None or not kv_cache_reads:
+        raise ValueError("decode optimizer requires a decode step and KV")
     if min(cp, dp, ep, n_gpus) <= 0:
         raise ValueError("cp, dp, ep, and n_gpus must all be positive")
     if not pp or any(not isinstance(count, int) or count <= 0 for count in pp):
         raise ValueError("pp layer counts must be positive integers")
 
-    step = decode_steps[0]
+    step = decode_step
     n_layers = len(step.layers)
     if sum(pp) != n_layers:
         raise ValueError(

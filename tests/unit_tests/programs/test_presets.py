@@ -3,6 +3,10 @@
 import pytest
 
 from rooflang.language.hardware.component import Compute, Memory
+from rooflang.programs.presets.ascend950dt import (
+    Ascend950DTCluster,
+    Ascend950DTSuperChip,
+)
 from rooflang.programs.presets.b300 import B300Cluster, B300SuperChip
 from rooflang.programs.presets.gb300 import GB300Cluster, GB300SuperChip
 from rooflang.programs.presets.gh200 import GH200Cluster, GH200SuperChip
@@ -524,3 +528,130 @@ class TestGH200SuperChip:
         assert dram.src_to_dst_bandwidth_gbs == 2048.0
         assert ssd.src_to_dst_bandwidth_gbs == 56.0
         assert ssd.dst_to_src_bandwidth_gbs == 28.0
+
+
+@pytest.mark.parametrize(
+    "preset", [Ascend950DTCluster, Ascend950DTSuperChip])
+@pytest.mark.parametrize("ub_scope", [0, 7, 9, 65])
+def test_ascend950dt_rejects_invalid_ub_scope(preset, ub_scope):
+    with pytest.raises(ValueError, match="ub_scope"):
+        preset(ub_scope=ub_scope)
+
+
+@pytest.mark.parametrize(
+    "preset", [Ascend950DTCluster, Ascend950DTSuperChip])
+@pytest.mark.parametrize("ub_scope", [8, 64])
+def test_ascend950dt_accepts_ub_scope_boundaries(preset, ub_scope):
+    assert preset(ub_scope=ub_scope).ub_scope == ub_scope
+
+
+class TestAscend950DTCluster:
+    def test_ub_scope_controls_component_counts(self):
+        hw = Ascend950DTCluster(ub_scope=8)
+
+        assert hw.ub_scope == 8
+        assert sum(component.kind == "gpu" for component in hw.nodes) == 8
+        assert sum(component.kind == "cpu" for component in hw.nodes) == 2
+        assert sum(component.kind == "hbm" for component in hw.nodes) == 8
+        assert sum(component.kind == "dram" for component in hw.nodes) == 2
+        assert sum(component.kind == "ssd" for component in hw.nodes) == 8
+
+    def test_npu_specs_and_links(self):
+        hw = Ascend950DTCluster(ub_scope=8)
+        components = {component.name: component for component in hw.nodes}
+        npu = components["n0-huawei-ascend-950dt-0"]
+        cpu = components["n0-intel-xeon-6767p-0"]
+
+        assert npu.tflops == {
+            "fp4": 1946.0, "fp8": 973.0,
+            "bf16": 486.0, "fp16": 486.0, "fp32": 243.0,
+        }
+        assert components["n0-hbm-0"].capacity_gb == 144.0
+
+        hbm = hw.find_fabric(npu, components["n0-hbm-0"])
+        ub = hw.find_fabric(npu, components["n0-ub-switch"])
+        pcie = hw.find_fabric(cpu, npu)
+        uboe = hw.find_fabric(npu, components["eth-switch"])
+
+        assert hbm.src_to_dst_bandwidth_gbs == 4000.0
+        assert ub.src_to_dst_bandwidth_gbs == 896.0
+        assert ub.dst_to_src_bandwidth_gbs == 896.0
+        assert pcie.src_to_dst_bandwidth_gbs == 64.0
+        assert pcie.dst_to_src_bandwidth_gbs == 64.0
+        assert uboe.src_to_dst_bandwidth_gbs == 100.0
+        assert uboe.dst_to_src_bandwidth_gbs == 100.0
+
+    def test_reuses_b300_cpu_dram_and_ssd_specs(self):
+        hw = Ascend950DTCluster(ub_scope=8)
+        components = {component.name: component for component in hw.nodes}
+
+        for cpu_index in range(2):
+            cpu = components[f"n0-intel-xeon-6767p-{cpu_index}"]
+            dram = components[f"n0-ddr5-{cpu_index}"]
+            fabric = hw.find_fabric(cpu, dram)
+            assert cpu.tflops == {
+                "bf16": 255.29, "fp16": 255.29, "int8": 511.18,
+            }
+            assert dram.capacity_gb == 1536.0
+            assert fabric.src_to_dst_bandwidth_gbs == 332.8
+
+        qpi = hw.find_fabric(
+            components["n0-intel-xeon-6767p-0"],
+            components["n0-intel-xeon-6767p-1"])
+        assert qpi.src_to_dst_bandwidth_gbs == 192.0
+
+        for index in range(8):
+            ssd = components[f"n0-ssd-{index}"]
+            cpu = components[f"n0-intel-xeon-6767p-{index // 4}"]
+            fabric = hw.find_fabric(ssd, cpu)
+            assert ssd.capacity_gb == 3840.0
+            assert fabric.src_to_dst_bandwidth_gbs == 14.0
+            assert fabric.dst_to_src_bandwidth_gbs == 7.0
+
+    def test_aggregate_bandwidth(self):
+        hw = Ascend950DTCluster(ub_scope=8, n_nodes=2)
+        npus = [component for component in hw.nodes
+                if component.kind == "gpu"]
+        node0_npus = [npu for npu in npus if npu.name.startswith("n0-")]
+
+        assert hw.find_aggregate_bandwidth(node0_npus) == 896.0
+        assert hw.find_aggregate_bandwidth(npus) == 800.0
+
+
+class TestAscend950DTSuperChip:
+    def test_aggregates_requested_ub_scope(self):
+        hw = Ascend950DTSuperChip(ub_scope=8)
+        components = {component.name: component for component in hw.nodes}
+
+        assert hw.ub_scope == 8
+        assert components["n0-huawei-ascend-950dt-0"].tflops == {
+            "fp4": 15568.0, "fp8": 7784.0,
+            "bf16": 3888.0, "fp16": 3888.0, "fp32": 1944.0,
+        }
+        assert components["n0-intel-xeon-6767p-0"].tflops == {
+            "bf16": 510.58, "fp16": 510.58, "int8": 1022.36,
+        }
+        assert components["n0-hbm-0"].capacity_gb == 1152.0
+        assert components["n0-ddr5-0"].capacity_gb == 3072.0
+        assert components["n0-ssd"].capacity_gb == 30720.0
+        assert not any("ub-switch" in component.name
+                       for component in hw.nodes)
+
+    def test_aggregates_bandwidths(self):
+        hw = Ascend950DTSuperChip(ub_scope=8)
+        components = {component.name: component for component in hw.nodes}
+        npu = components["n0-huawei-ascend-950dt-0"]
+        cpu = components["n0-intel-xeon-6767p-0"]
+
+        hbm = hw.find_fabric(npu, components["n0-hbm-0"])
+        pcie = hw.find_fabric(cpu, npu)
+        dram = hw.find_fabric(cpu, components["n0-ddr5-0"])
+        uboe = hw.find_fabric(npu, components["eth-switch"])
+        ssd = hw.find_fabric(components["n0-ssd"], cpu)
+
+        assert hbm.src_to_dst_bandwidth_gbs == 32000.0
+        assert pcie.src_to_dst_bandwidth_gbs == 512.0
+        assert dram.src_to_dst_bandwidth_gbs == 665.6
+        assert uboe.src_to_dst_bandwidth_gbs == 800.0
+        assert ssd.src_to_dst_bandwidth_gbs == 112.0
+        assert ssd.dst_to_src_bandwidth_gbs == 56.0

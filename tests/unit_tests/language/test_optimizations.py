@@ -21,8 +21,8 @@ from rooflang.language.optimization.comm import (
 )
 from rooflang.language.optimization.split import (
     batch_split, batch_split_comm, column_split, context_split_decode,
-    context_split_prefill, head_split, kv_persistence_split,
-    replicate_before, row_split,
+    context_split_prefill, general_dup, head_split, kv_persistence_split,
+    row_split,
 )
 from rooflang.language.utils import gemm_scale_bytes
 
@@ -823,13 +823,13 @@ def test_canonicalize_split_comms_bypasses_only_matching_axis():
                    for edge in graph._out_edges(pred))
 
 
-def test_replicate_before_builds_broadcast_and_identical_copies():
+def test_general_dup_builds_broadcast_and_identical_copies():
     kernel = Gemm(8, 16, 32, "bf16", "bf16")
     kernel.inputs = {"x": Tensor("bf16", (8, 32))}
     kernel.weights = {"w": Tensor("bf16", (32, 16))}
     kernel.outputs = {"y": Tensor("bf16", (8, 16))}
 
-    broadcast, copies = replicate_before(kernel, N)
+    broadcast, copies = general_dup(kernel, N)
 
     assert isinstance(broadcast, Broadcast)
     assert len(copies) == N

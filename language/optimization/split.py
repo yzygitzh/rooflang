@@ -165,10 +165,10 @@ def kv_persistence_split(kernel, n):
     return prev_comms, copies, next_comms
 
 
-def replicate_before(kernel, n):
+def general_dup(kernel, n):
     """Dup callable that moves a one-input Broadcast before the kernel."""
     if len(kernel.inputs) != 1 or len(kernel.outputs) != 1:
-        raise ValueError("replicate_before requires one input and one output")
+        raise ValueError("general_dup requires one input and one output")
     input_name, input_tensor = next(iter(kernel.inputs.items()))
     broadcast = _make_broadcast(input_tensor, n)
     broadcast.inputs = {

@@ -12,7 +12,7 @@ from rooflang.language.optimization.comm import (
 )
 from rooflang.language.optimization.split import (
     batch_split, batch_split_comm, context_split_decode,
-    context_split_prefill, kv_persistence_split, replicate_before,
+    context_split_prefill, general_dup, kv_persistence_split,
 )
 from rooflang.language.placement import Placement
 from rooflang.language.tensor import Tensor
@@ -438,7 +438,7 @@ def optimize_model_cluster_decode(
         q_broadcast = sa_prev["q"]
         for name in reversed(_DECODE_REPLICATED_FIELDS):
             q_broadcast, copies = g.dup(
-                replicate_before, getattr(layer, name))
+                general_dup, getattr(layer, name))
             cp_fields[name] = copies
 
         for name in _DECODE_SHARDED_FIELDS:

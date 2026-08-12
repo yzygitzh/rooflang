@@ -387,6 +387,8 @@ def write_outputs(output_dir: Path, records: Sequence[dict]) -> None:
                     label=hardware,
                 )
             axis.set_title(f"{n_gpus} GPUs")
+            axis.set_xlim(left=0)
+            axis.set_ylim(bottom=0)
             axis.set_xlabel("tokens/s/user")
             axis.set_ylabel("tokens/s/GPU")
             axis.grid(True, which="both", alpha=0.25)

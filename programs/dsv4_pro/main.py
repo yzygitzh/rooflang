@@ -2,7 +2,9 @@
 
 import argparse
 
+from rooflang.language.hardware.component import Compute
 from rooflang.programs.presets.b300 import B300Cluster, B300SuperChip
+from rooflang.programs.presets.h200 import H200Cluster, H200SuperChip
 
 from rooflang.programs.dsv4_pro.config import N_LAYERS
 from rooflang.programs.dsv4_pro.model import declare_model
@@ -16,8 +18,9 @@ from rooflang.programs.dsv4_pro.simulation import simulate
 
 HARDWARE_MAP = {
     "B300Cluster1Node": lambda: B300Cluster(n_nodes=1),
-    "B300Cluster2Node": lambda: B300Cluster(n_nodes=2),
     "B300SuperChip": lambda: B300SuperChip(),
+    "H200Cluster1Node": lambda: H200Cluster(n_nodes=1),
+    "H200SuperChip": lambda: H200SuperChip(),
 }
 
 
@@ -76,10 +79,12 @@ def main():
             visualize_layer(g, viz_layer, extra_seeds=seeds)
 
     # C. Optimization
-    if args.hardware == "B300SuperChip":
+    if isinstance(hw, (B300SuperChip, H200SuperChip)):
         g, p = optimize_model_superchip(g, hw)
     else:
-        n_gpus = 16 if args.hardware == "B300Cluster2Node" else 8
+        n_gpus = sum(
+            isinstance(component, Compute) and component.kind == "gpu"
+            for component in hw.nodes)
         optimize_kwargs = dict(
             cp=args.cp, dp=args.dp, ep=args.ep,
             pp_partition=args.pp_partition,

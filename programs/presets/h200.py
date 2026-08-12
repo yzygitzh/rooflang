@@ -24,7 +24,7 @@ class H200Cluster(HardwareGraph):
     def __init__(self, n_nodes: int = 1):
         super().__init__()
 
-        ib_switch = Compute(name="ib-switch")
+        ib_switch = Compute(name="ib-switch", kind="switch")
         self.add_node(ib_switch)
 
         for node in range(n_nodes):
@@ -33,24 +33,29 @@ class H200Cluster(HardwareGraph):
             gpus = [Compute(name=f"{p}nvidia-h200-sxm-{i}", tflops={
                 "fp4": 1979.0, "fp8": 1979.0,
                 "bf16": 989.5, "fp16": 989.5, "fp32": 494.5,
-            }) for i in range(8)]
+            }, kind="gpu") for i in range(8)]
 
-            nvswitch = Compute(name=f"{p}nvswitch")
-            hgx_pcie_switch = Compute(name=f"{p}hgx-pcie-switch")
-            cpu_pcie_switch = Compute(name=f"{p}cpu-pcie-switch")
+            nvswitch = Compute(name=f"{p}nvswitch", kind="switch")
+            hgx_pcie_switch = Compute(
+                name=f"{p}hgx-pcie-switch", kind="switch")
+            cpu_pcie_switch = Compute(
+                name=f"{p}cpu-pcie-switch", kind="switch")
 
             cpus = [Compute(name=f"{p}intel-xeon-6767p-{i}", tflops={
                 "bf16": 255.29, "fp16": 255.29, "int8": 511.18,
-            }) for i in range(2)]
+            }, kind="cpu") for i in range(2)]
 
-            nics = [Compute(name=f"{p}mellanox-cx7-{i}")
+            nics = [Compute(name=f"{p}mellanox-cx7-{i}", kind="nic")
                     for i in range(8)]
 
-            hbms = [Memory(name=f"{p}hbm3e-{i}", capacity_gb=141.0)
+            hbms = [Memory(name=f"{p}hbm3e-{i}", capacity_gb=141.0,
+                           kind="hbm")
                     for i in range(8)]
-            drams = [Memory(name=f"{p}ddr5-{i}", capacity_gb=1536.0)
+            drams = [Memory(name=f"{p}ddr5-{i}", capacity_gb=1536.0,
+                            kind="dram")
                      for i in range(2)]
-            ssds = [Memory(name=f"{p}ssd-{i}", capacity_gb=3840.0)
+            ssds = [Memory(name=f"{p}ssd-{i}", capacity_gb=3840.0,
+                           kind="ssd")
                     for i in range(8)]
 
             for comp in (gpus + [nvswitch, hgx_pcie_switch,
@@ -154,18 +159,22 @@ class H200SuperChip(HardwareGraph):
         gpu = Compute(name="n0-nvidia-h200-sxm-0", tflops={
             "fp4": 15832.0, "fp8": 15832.0,
             "bf16": 7916.0, "fp16": 7916.0, "fp32": 3956.0,
-        })
-        hgx_pcie_switch = Compute(name="n0-hgx-pcie-switch")
-        cpu_pcie_switch = Compute(name="n0-cpu-pcie-switch")
+        }, kind="gpu")
+        hgx_pcie_switch = Compute(
+            name="n0-hgx-pcie-switch", kind="switch")
+        cpu_pcie_switch = Compute(
+            name="n0-cpu-pcie-switch", kind="switch")
         cpu = Compute(name="n0-intel-xeon-6767p-0", tflops={
             "bf16": 510.58, "fp16": 510.58, "int8": 1022.36,
-        })
-        nic = Compute(name="n0-mellanox-cx7-0")
-        ib_switch = Compute(name="ib-switch")
+        }, kind="cpu")
+        nic = Compute(name="n0-mellanox-cx7-0", kind="nic")
+        ib_switch = Compute(name="ib-switch", kind="switch")
 
-        hbm = Memory(name="n0-hbm3e-0", capacity_gb=1128.0)
-        dram = Memory(name="n0-ddr5-0", capacity_gb=3072.0)
-        ssd = Memory(name="n0-ssd", capacity_gb=30720.0)
+        hbm = Memory(
+            name="n0-hbm3e-0", capacity_gb=1128.0, kind="hbm")
+        dram = Memory(
+            name="n0-ddr5-0", capacity_gb=3072.0, kind="dram")
+        ssd = Memory(name="n0-ssd", capacity_gb=30720.0, kind="ssd")
 
         for comp in [gpu, hgx_pcie_switch, cpu_pcie_switch,
                      cpu, nic, ib_switch]:

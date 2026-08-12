@@ -6,6 +6,18 @@ from rooflang.programs.presets.h200 import H200Cluster, H200SuperChip
 
 
 class TestB300AggregateOverride:
+    def test_component_kinds(self):
+        hw = B300Cluster(n_nodes=1)
+        components = {component.name: component for component in hw.nodes}
+
+        assert components["n0-nvidia-b300-sxm-0"].kind == "gpu"
+        assert components["n0-intel-xeon-6767p-0"].kind == "cpu"
+        assert components["n0-mellanox-cx8-0"].kind == "nic"
+        assert components["n0-hbm3e-0"].kind == "hbm"
+        assert components["n0-ddr5-0"].kind == "dram"
+        assert components["n0-ssd-0"].kind == "ssd"
+        assert components["n0-nvswitch"].kind == "switch"
+
     def test_intra_node(self):
         hw = B300Cluster(n_nodes=1)
         gpus = [n for n in hw.nodes
@@ -112,6 +124,18 @@ class TestB300SuperChip:
 
 
 class TestH200Cluster:
+    def test_component_kinds(self):
+        hw = H200Cluster(n_nodes=1)
+        components = {component.name: component for component in hw.nodes}
+
+        assert components["n0-nvidia-h200-sxm-0"].kind == "gpu"
+        assert components["n0-intel-xeon-6767p-0"].kind == "cpu"
+        assert components["n0-mellanox-cx7-0"].kind == "nic"
+        assert components["n0-hbm3e-0"].kind == "hbm"
+        assert components["n0-ddr5-0"].kind == "dram"
+        assert components["n0-ssd-0"].kind == "ssd"
+        assert components["n0-nvswitch"].kind == "switch"
+
     def test_gpu_and_hbm_specs(self):
         hw = H200Cluster(n_nodes=1)
         components = {component.name: component for component in hw.nodes}

@@ -103,11 +103,11 @@ def _place_comm_tensor_memories(g, placement):
                 queue.append(target)
 
 
-def _cluster_a_resources(hw):
+def _cluster_resources(hw):
     """Return ordered GPUs and per-node CPU/DRAM resources."""
     gpus = sorted(
         [c for c in hw.nodes if isinstance(c, Compute)
-         and "nvidia-b300" in c.name],
+         and c.kind == "gpu"],
         key=lambda c: (
             int(c.name.split("-")[0][1:]), int(c.name.rsplit("-", 1)[1])))
     cpus = defaultdict(list)
@@ -115,9 +115,9 @@ def _cluster_a_resources(hw):
     for component in hw.nodes:
         prefix = component.name.split("-", 1)[0]
         if isinstance(component, Compute) \
-                and "intel-xeon" in component.name:
+                and component.kind == "cpu":
             cpus[prefix].append(component)
-        elif isinstance(component, Memory) and "-ddr5-" in component.name:
+        elif isinstance(component, Memory) and component.kind == "dram":
             drams[prefix].append(component)
     for resources in (*cpus.values(), *drams.values()):
         resources.sort(key=lambda component: int(
@@ -280,7 +280,7 @@ def optimize_model_cluster_prefill(
         for stage, layer_count in enumerate(pp_partition)
         for _ in range(layer_count)
     ]
-    gpus, cpus, drams = _cluster_a_resources(hw)
+    gpus, cpus, drams = _cluster_resources(hw)
 
     kv_barrier = layers[0].kv_persist_barrier
 
@@ -397,7 +397,7 @@ def optimize_model_cluster_decode(
         for stage, layer_count in enumerate(pp_partition)
         for _ in range(layer_count)
     ]
-    gpus, cpus, drams = _cluster_a_resources(hw)
+    gpus, cpus, drams = _cluster_resources(hw)
     stage_gpus = [
         gpus[stage * ep:(stage + 1) * ep]
         for stage in range(pp_degree)
@@ -578,7 +578,7 @@ def optimize_model_cluster_decode(
 def optimize_model_superchip(g, hw):
     """Place all kernels on the single fused GPU (no splits, no comms)."""
     gpu = [c for c in hw.nodes if isinstance(c, Compute)
-           and "nvidia-b300" in c.name][0]
+           and c.kind == "gpu"][0]
     p = Placement(hardware=hw, graph=g)
     for k in g.topological_sort():
         p.set_kernel_device(k, gpu)

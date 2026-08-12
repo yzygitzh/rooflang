@@ -14,6 +14,7 @@ from rooflang.programs.dsv4_pro.optimization import (
     optimize_model_cluster_prefill,
 )
 from rooflang.programs.presets.b300 import B300Cluster
+from rooflang.programs.presets.h200 import H200Cluster
 from rooflang.runtime.simulator import Simulator
 
 
@@ -171,6 +172,56 @@ def test_cp4_dp2_ep8_pp2_prefill(monkeypatch):
         assert len(expert_devices) == 8
         assert all(isinstance(device, Compute)
                    for device in expert_devices)
+
+
+def test_h200_cluster_resources_use_component_kinds(monkeypatch):
+    """H200 placement must not depend on a B300 model-name substring."""
+    monkeypatch.setattr(model, "N_LAYERS", 1)
+    monkeypatch.setattr(model, "N_EXPERTS", 8)
+    monkeypatch.setattr(optimization, "N_EXPERTS", 8)
+
+    hw = H200Cluster(n_nodes=1)
+    graph, layers, emb, read_input, _, output_head = model.declare_model(
+        batch_size=16, seq_prefill=512)
+
+    graph, placement = optimize_model_cluster_prefill(
+        graph, layers, hw, emb, read_input, output_head,
+        cp=2, dp=4, ep=8, pp_partition=[1], n_gpus=8)
+
+    devices = {
+        placement.get_kernel_device(kernel).device
+        for kernel in placement.placed_kernels
+    }
+    assert devices
+    assert all(device.kind == "gpu" for device in devices)
+    assert all("nvidia-h200" in device.name for device in devices)
+    assert Simulator(graph, placement, hw).run().total_time_us > 0
+
+
+def test_h200_cluster_decode_uses_component_kinds(monkeypatch):
+    monkeypatch.setattr(model, "N_LAYERS", 1)
+    monkeypatch.setattr(model, "N_EXPERTS", 8)
+    monkeypatch.setattr(optimization, "N_EXPERTS", 8)
+
+    hw = H200Cluster(n_nodes=1)
+    graph, layers, emb, read_input, kv_reads, output_head = \
+        model.declare_model(batch_size=32, seq_prefill=512, decode=True)
+
+    graph, placement = optimize_model_cluster_decode(
+        graph, layers, hw, emb, read_input, kv_reads, output_head,
+        seq_prefill=512, cp=2, dp=4, ep=8,
+        pp_partition=[1], n_gpus=8)
+
+    devices = {
+        placement.get_kernel_device(kernel).device
+        for kernel in placement.placed_kernels
+    }
+    assert devices
+    assert all(device.kind == "gpu" for device in devices)
+    assert all("nvidia-h200" in device.name for device in devices)
+    assert Simulator(
+        graph, placement, hw, measurement_start=read_input,
+    ).run().measured_time_us > 0
 
 
 def test_cp4_dp2_ep8_pp2_decode(monkeypatch):

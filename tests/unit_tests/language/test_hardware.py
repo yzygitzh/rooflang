@@ -19,6 +19,14 @@ class TestComputeInit:
         c = Compute(name="cpu")
         assert c.tflops == {}
 
+    def test_kind(self):
+        c = Compute(name="accelerator", kind="gpu")
+        assert c.kind == "gpu"
+
+    def test_default_kind_none(self):
+        c = Compute(name="custom")
+        assert c.kind is None
+
 
 class TestMemoryInit:
     def test_basic(self):
@@ -28,6 +36,10 @@ class TestMemoryInit:
     def test_default_capacity_zero(self):
         m = Memory(name="dram")
         assert m.capacity_gb == 0.0
+
+    def test_kind(self):
+        m = Memory(name="memory", kind="dram")
+        assert m.kind == "dram"
 
 
 class TestFabricEdgeTransferTimeUs:

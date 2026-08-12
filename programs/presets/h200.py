@@ -73,26 +73,20 @@ class H200Cluster(HardwareGraph):
                 ))
                 self.add_edge(FabricEdge(
                     name="nvlink", src=gpus[i], dst=nvswitch,
-                    src_to_dst_bandwidth_gbs=900.0,
-                    dst_to_src_bandwidth_gbs=900.0,
-                    is_full_duplex=True, alpha_us=0.5,
-                ))
-                self.add_edge(FabricEdge(
-                    name="pcie", src=gpus[i], dst=nics[i],
-                    src_to_dst_bandwidth_gbs=128.0,
-                    dst_to_src_bandwidth_gbs=128.0,
+                    src_to_dst_bandwidth_gbs=450.0,
+                    dst_to_src_bandwidth_gbs=450.0,
                     is_full_duplex=True, alpha_us=0.5,
                 ))
                 self.add_edge(FabricEdge(
                     name="pcie", src=gpus[i], dst=hgx_pcie_switch,
-                    src_to_dst_bandwidth_gbs=128.0,
-                    dst_to_src_bandwidth_gbs=128.0,
+                    src_to_dst_bandwidth_gbs=64.0,
+                    dst_to_src_bandwidth_gbs=64.0,
                     is_full_duplex=True, alpha_us=0.5,
                 ))
                 self.add_edge(FabricEdge(
                     name="pcie", src=nics[i], dst=hgx_pcie_switch,
-                    src_to_dst_bandwidth_gbs=128.0,
-                    dst_to_src_bandwidth_gbs=128.0,
+                    src_to_dst_bandwidth_gbs=64.0,
+                    dst_to_src_bandwidth_gbs=64.0,
                     is_full_duplex=True, alpha_us=0.5,
                 ))
                 self.add_edge(FabricEdge(
@@ -141,7 +135,7 @@ class H200Cluster(HardwareGraph):
             return float("inf")
         nodes = Counter(d.name.split("-")[0] for d in devices)
         if len(nodes) == 1:
-            return 900.0
+            return 450.0
         return min(nodes.values()) * 50.0
 
 
@@ -190,20 +184,14 @@ class H200SuperChip(HardwareGraph):
         ))
         self.add_edge(FabricEdge(
             name="pcie", src=gpu, dst=hgx_pcie_switch,
-            src_to_dst_bandwidth_gbs=1024.0,
-            dst_to_src_bandwidth_gbs=1024.0,
-            is_full_duplex=True, alpha_us=0.5,
-        ))
-        self.add_edge(FabricEdge(
-            name="pcie", src=gpu, dst=nic,
-            src_to_dst_bandwidth_gbs=1024.0,
-            dst_to_src_bandwidth_gbs=1024.0,
+            src_to_dst_bandwidth_gbs=512.0,
+            dst_to_src_bandwidth_gbs=512.0,
             is_full_duplex=True, alpha_us=0.5,
         ))
         self.add_edge(FabricEdge(
             name="pcie", src=nic, dst=hgx_pcie_switch,
-            src_to_dst_bandwidth_gbs=1024.0,
-            dst_to_src_bandwidth_gbs=1024.0,
+            src_to_dst_bandwidth_gbs=512.0,
+            dst_to_src_bandwidth_gbs=512.0,
             is_full_duplex=True, alpha_us=0.5,
         ))
         self.add_edge(FabricEdge(

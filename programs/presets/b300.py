@@ -76,12 +76,6 @@ class B300Cluster(HardwareGraph):
                     is_full_duplex=True, alpha_us=0.5,
                 ))
                 self.add_edge(FabricEdge(
-                    name="pcie", src=gpus[i], dst=nics[i],
-                    src_to_dst_bandwidth_gbs=128.0,
-                    dst_to_src_bandwidth_gbs=128.0,
-                    is_full_duplex=True, alpha_us=0.5,
-                ))
-                self.add_edge(FabricEdge(
                     name="pcie", src=gpus[i], dst=hgx_pcie_switch,
                     src_to_dst_bandwidth_gbs=128.0,
                     dst_to_src_bandwidth_gbs=128.0,
@@ -191,12 +185,6 @@ class B300SuperChip(HardwareGraph):
         ))
         self.add_edge(FabricEdge(
             name="pcie", src=gpu, dst=hgx_pcie_switch,
-            src_to_dst_bandwidth_gbs=1024.0,
-            dst_to_src_bandwidth_gbs=1024.0,
-            is_full_duplex=True, alpha_us=0.5,
-        ))
-        self.add_edge(FabricEdge(
-            name="pcie", src=gpu, dst=nic,
             src_to_dst_bandwidth_gbs=1024.0,
             dst_to_src_bandwidth_gbs=1024.0,
             is_full_duplex=True, alpha_us=0.5,

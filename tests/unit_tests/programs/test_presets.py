@@ -50,6 +50,18 @@ class TestB300AggregateOverride:
             assert path[0].src_to_dst_bandwidth_gbs == 14.0
             assert path[0].dst_to_src_bandwidth_gbs == 7.0
 
+    def test_gpu_reaches_nic_through_hgx(self):
+        hw = B300Cluster(n_nodes=1)
+        components = {component.name: component for component in hw.nodes}
+        gpu = components["n0-nvidia-b300-sxm-0"]
+        nic = components["n0-mellanox-cx8-0"]
+        hgx = components["n0-hgx-pcie-switch"]
+
+        path = hw.find_fabric_path(gpu, nic)
+        assert len(path) == 2
+        assert all(fabric.name == "pcie" for fabric in path)
+        assert any(hgx in (fabric.src, fabric.dst) for fabric in path)
+
 
 class TestB300SuperChip:
     def test_single_gpu(self):
@@ -114,6 +126,9 @@ class TestB300SuperChip:
             components["ib-switch"])
         ssd_pcie = hw.find_fabric(
             components["n0-ssd"], components["n0-hgx-pcie-switch"])
+        gpu_nic_path = hw.find_fabric_path(
+            components["n0-nvidia-b300-sxm-0"],
+            components["n0-mellanox-cx8-0"])
 
         assert hbm.src_to_dst_bandwidth_gbs == 62000.0
         assert gpu_pcie.src_to_dst_bandwidth_gbs == 1024.0
@@ -121,6 +136,7 @@ class TestB300SuperChip:
         assert infiniband.src_to_dst_bandwidth_gbs == 800.0
         assert ssd_pcie.src_to_dst_bandwidth_gbs == 112.0
         assert ssd_pcie.dst_to_src_bandwidth_gbs == 56.0
+        assert len(gpu_nic_path) == 2
 
 
 class TestH200Cluster:
@@ -158,8 +174,30 @@ class TestH200Cluster:
                 and "nvidia-h200" in component.name]
         node0_gpus = [gpu for gpu in gpus if gpu.name.startswith("n0-")]
 
-        assert hw.find_aggregate_bandwidth(node0_gpus) == 900.0
+        assert hw.find_aggregate_bandwidth(node0_gpus) == 450.0
         assert hw.find_aggregate_bandwidth(gpus) == 400.0
+
+    def test_nvlink_and_pcie_bandwidths(self):
+        hw = H200Cluster(n_nodes=1)
+        components = {component.name: component for component in hw.nodes}
+        gpu = components["n0-nvidia-h200-sxm-0"]
+        nic = components["n0-mellanox-cx7-0"]
+        nvswitch = components["n0-nvswitch"]
+        hgx = components["n0-hgx-pcie-switch"]
+
+        nvlink = hw.find_fabric(gpu, nvswitch)
+        gpu_pcie = hw.find_fabric(gpu, hgx)
+        nic_pcie = hw.find_fabric(nic, hgx)
+        gpu_nic_path = hw.find_fabric_path(gpu, nic)
+
+        assert nvlink.src_to_dst_bandwidth_gbs == 450.0
+        assert nvlink.dst_to_src_bandwidth_gbs == 450.0
+        assert gpu_pcie.src_to_dst_bandwidth_gbs == 64.0
+        assert gpu_pcie.dst_to_src_bandwidth_gbs == 64.0
+        assert nic_pcie.src_to_dst_bandwidth_gbs == 64.0
+        assert nic_pcie.dst_to_src_bandwidth_gbs == 64.0
+        assert len(gpu_nic_path) == 2
+        assert all(fabric.name == "pcie" for fabric in gpu_nic_path)
 
     def test_reuses_b300_cpu_and_ssd_specs(self):
         hw = H200Cluster(n_nodes=1)
@@ -202,6 +240,12 @@ class TestH200SuperChip:
         hbm = hw.find_fabric(
             components["n0-nvidia-h200-sxm-0"],
             components["n0-hbm3e-0"])
+        gpu_pcie = hw.find_fabric(
+            components["n0-nvidia-h200-sxm-0"],
+            components["n0-hgx-pcie-switch"])
+        nic_pcie = hw.find_fabric(
+            components["n0-mellanox-cx7-0"],
+            components["n0-hgx-pcie-switch"])
         infiniband = hw.find_fabric(
             components["n0-mellanox-cx7-0"],
             components["ib-switch"])
@@ -209,6 +253,8 @@ class TestH200SuperChip:
             components["n0-ssd"], components["n0-hgx-pcie-switch"])
 
         assert hbm.src_to_dst_bandwidth_gbs == 38400.0
+        assert gpu_pcie.src_to_dst_bandwidth_gbs == 512.0
+        assert nic_pcie.src_to_dst_bandwidth_gbs == 512.0
         assert infiniband.src_to_dst_bandwidth_gbs == 400.0
         assert ssd_pcie.src_to_dst_bandwidth_gbs == 112.0
         assert ssd_pcie.dst_to_src_bandwidth_gbs == 56.0

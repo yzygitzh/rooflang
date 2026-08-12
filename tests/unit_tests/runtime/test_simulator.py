@@ -634,7 +634,7 @@ class TestExplicitIdentityPlacement:
         p.set_tensor_memory(scatter.inputs["x"], hbms[0])
         for rank in range(2):
             p.set_tensor_memory(scatter.outputs[f"o{rank}"], hbms[rank])
-        optimize_comms(g, p)
+        optimize_comms(g)
         p.validate(g)
 
         result = _sim(g, p, hw)

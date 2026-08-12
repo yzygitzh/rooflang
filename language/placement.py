@@ -179,6 +179,8 @@ class Placement:
     # ── Internal ─────────────────────────────────────────────────────
 
     def _assign_tensor_memory(self, kernel: Kernel, device: Compute) -> None:
+        from rooflang.language.kernels.identity import Spawn
+
         mem = self._hardware.find_local_memory(device)
         predecessor_memories = {}
         if self._graph is not None:
@@ -188,6 +190,18 @@ class Placement:
                     if in_name not in predecessor_memories:
                         predecessor_memories[in_name] = self._memory.get(
                             src.outputs[out_name])
+
+        # Spawn is a zero-cost aliasing fan-out. Its outputs remain in the
+        # input allocation even when downstream compute is placed remotely.
+        if isinstance(kernel, Spawn):
+            source_memory = next(
+                (memory for memory in predecessor_memories.values()
+                 if memory is not None),
+                mem,
+            )
+            for tensor in (*kernel.inputs.values(), *kernel.outputs.values()):
+                self._memory[tensor] = source_memory
+            return
 
         for t in kernel.weights.values():
             if t in self._memory:

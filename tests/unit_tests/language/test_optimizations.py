@@ -16,13 +16,10 @@ from rooflang.language.kernels.identity import Concat, Move, Spawn
 from rooflang.language.tensor import Tensor
 from rooflang.language.placement import Placement
 from rooflang.language.hardware.component import Compute, Memory
-from rooflang.language.optimization.comm import (
-    canonicalize_split_comms, optimize_comms,
-)
+from rooflang.language.optimization.comm import optimize_comms
 from rooflang.language.optimization.split import (
-    batch_split, batch_split_comm, column_split, context_split_decode,
-    context_split_prefill, general_dup, head_split, kv_persistence_split,
-    row_split,
+    batch_split, column_split, context_split_decode, context_split_prefill,
+    general_dup, head_split, kv_persistence_split, row_split,
 )
 from rooflang.language.utils import gemm_scale_bytes
 
@@ -102,7 +99,7 @@ class TestFuseWorld4:
         r = Reduce(total_bytes=32, world=4, dtype="bf16")
         b = Broadcast(total_bytes=32, world=4)
         g, p, preds, succs = _build_chain(r, b, n=4)
-        optimize_comms(g, p)
+        optimize_comms(g)
         comms = g.kernels - set(preds) - set(succs)
         assert len(comms) == 1
         assert isinstance(next(iter(comms)), AllReduce)
@@ -111,7 +108,7 @@ class TestFuseWorld4:
         r = Reduce(total_bytes=32, world=4, dtype="bf16")
         s = Scatter(total_bytes=32, world=4, dim=1)
         g, p, preds, succs = _build_chain(r, s, n=4)
-        optimize_comms(g, p)
+        optimize_comms(g)
         comms = g.kernels - set(preds) - set(succs)
         assert len(comms) == 1
         assert isinstance(next(iter(comms)), ReduceScatter)
@@ -120,7 +117,7 @@ class TestFuseWorld4:
         ga = Gather(total_bytes=128, world=4, dim=0)
         b = Broadcast(total_bytes=128, world=4)
         g, p, preds, succs = _build_chain(ga, b, n=4)
-        optimize_comms(g, p)
+        optimize_comms(g)
         comms = g.kernels - set(preds) - set(succs)
         assert len(comms) == 1
         assert isinstance(next(iter(comms)), AllGather)
@@ -129,34 +126,41 @@ class TestFuseWorld4:
         ga = Gather(total_bytes=128, world=4, dim=0)
         s = Scatter(total_bytes=128, world=4, dim=1)
         g, p, preds, succs = _build_chain(ga, s, n=4)
-        optimize_comms(g, p)
+        optimize_comms(g)
         comms = g.kernels - set(preds) - set(succs)
         assert len(comms) == 1
         assert isinstance(next(iter(comms)), AllToAll)
 
-    def test_fused_collective_inherits_outer_tensor_memories(self):
+    def test_fused_collective_does_not_require_placement(self):
         gather = Gather(total_bytes=128, world=2, dim=0)
         broadcast = Broadcast(total_bytes=128, world=2)
         graph, placement, preds, succs = _build_chain(
             gather, broadcast, n=2)
-        memories = [
-            placement.get_tensor_memory(tensor)
-            for tensor in gather.inputs.values()
-        ]
 
-        optimize_comms(graph, placement)
+        graph_only = ComputeGraph()
+        for kernel in (*preds, gather, broadcast, *succs):
+            graph_only.add_kernel(kernel)
+        for index, pred in enumerate(preds):
+            graph_only.add_data_edge(
+                pred, gather, {"y": f"x{index}"})
+        graph_only.add_data_edge(gather, broadcast, {"z": "z"})
+        for index, succ in enumerate(succs):
+            graph_only.add_data_edge(
+                broadcast, succ, {f"y{index}": "a"})
+
+        optimize_comms(graph_only)
 
         collective = next(
-            kernel for kernel in graph.kernels if isinstance(kernel, AllGather)
+            kernel for kernel in graph_only.kernels
+            if isinstance(kernel, AllGather)
         )
-        assert [
-            placement.get_tensor_memory(tensor)
-            for tensor in collective.inputs.values()
-        ] == memories
-        assert [
-            placement.get_tensor_memory(tensor)
-            for tensor in collective.outputs.values()
-        ] == memories
+        assert len(collective.inputs) == 2
+        assert len(collective.outputs) == 2
+        assert all(
+            placement.get_tensor_memory(tensor) is None
+            for tensor in (*collective.inputs.values(),
+                           *collective.outputs.values())
+        )
 
 
 class TestFuseWorld1Eliminated:
@@ -164,7 +168,7 @@ class TestFuseWorld1Eliminated:
         r = Reduce(total_bytes=32, world=1, dtype="bf16")
         b = Broadcast(total_bytes=32, world=1)
         g, p, preds, succs = _build_chain(r, b, n=1)
-        optimize_comms(g, p)
+        optimize_comms(g)
         assert g.kernels == frozenset(preds + succs)
         assert g._out_edges(preds[0])[0].dst is succs[0]
 
@@ -172,14 +176,14 @@ class TestFuseWorld1Eliminated:
         ga = Gather(total_bytes=32, world=1, dim=0)
         s = Scatter(total_bytes=32, world=1, dim=0)
         g, p, preds, succs = _build_chain(ga, s, n=1)
-        optimize_comms(g, p)
+        optimize_comms(g)
         assert g.kernels == frozenset(preds + succs)
 
     def test_gather_broadcast_world1_eliminated(self):
         ga = Gather(total_bytes=32, world=1, dim=0)
         b = Broadcast(total_bytes=32, world=1)
         g, p, preds, succs = _build_chain(ga, b, n=1)
-        optimize_comms(g, p)
+        optimize_comms(g)
         assert g.kernels == frozenset(preds + succs)
 
 
@@ -188,13 +192,13 @@ class TestBypass:
         ga = Gather(total_bytes=128, world=4, dim=0)
         s = Scatter(total_bytes=128, world=4, dim=0)
         g, p, preds, succs = _build_chain(ga, s, n=1)
-        optimize_comms(g, p)
+        optimize_comms(g)
         assert ga not in g.kernels
         assert s not in g.kernels
         assert g._out_edges(preds[0])[0].dst is succs[0]
 
 
-class TestCrossDeviceSetWhitelist:
+class TestPlacementIndependentRewrite:
     @pytest.mark.parametrize("comm_cls", [Gather, Scatter])
     def test_same_direction_hierarchy_is_preserved(self, comm_cls):
         first = comm_cls(total_bytes=128, world=4, dim=0)
@@ -202,7 +206,7 @@ class TestCrossDeviceSetWhitelist:
         graph, placement, preds, succs = _build_chain(
             first, second, n=4, same_devices=False)
 
-        optimize_comms(graph, placement)
+        optimize_comms(graph)
 
         assert first in graph.kernels
         assert second in graph.kernels
@@ -214,40 +218,23 @@ class TestCrossDeviceSetWhitelist:
         g, p, preds, succs = _build_chain(
             gather, scatter, n=4, same_devices=False)
 
-        optimize_comms(g, p)
+        optimize_comms(g)
 
-        moves = [kernel for kernel in g.kernels if isinstance(kernel, Move)]
-        assert len(moves) == 4
         assert gather not in g.kernels
         assert scatter not in g.kernels
         for pred, succ in zip(preds, succs):
-            move = g._out_edges(pred)[0].dst
-            assert isinstance(move, Move)
-            assert g._out_edges(move)[0].dst is succ
+            assert g._out_edges(pred)[0].dst is succ
 
-    def test_different_memories_insert_move(self):
+    def test_different_memories_do_not_affect_graph_rewrite(self):
         gather = Gather(total_bytes=SHARD.size_bytes, world=1, dim=0)
         scatter = Scatter(total_bytes=SHARD.size_bytes, world=1, dim=0)
         graph, placement, preds, succs = _build_chain(
             gather, scatter, n=1, same_devices=False)
         pred, succ = preds[0], succs[0]
-        src_mem = placement.get_tensor_memory(pred.outputs["y"])
-        dst_mem = placement.get_tensor_memory(succ.inputs["a"])
+        optimize_comms(graph)
 
-        optimize_comms(graph, placement)
-
-        moves = [k for k in graph.kernels if isinstance(k, Move)]
-        assert len(moves) == 1
-        move = moves[0]
-        assert graph.kernels == frozenset({pred, move, succ})
-        assert graph._out_edges(pred)[0].dst is move
-        assert graph._out_edges(move)[0].dst is succ
-        assert placement.get_tensor_memory(pred.outputs["y"]) is src_mem
-        assert placement.get_tensor_memory(move.outputs["dst0"]) is dst_mem
-        assert placement.get_tensor_memory(succ.inputs["a"]) is dst_mem
-        assert placement.get_kernel_device(move).device \
-            is placement.get_kernel_device(pred).device
-        placement.validate(graph)
+        assert graph.kernels == frozenset({pred, succ})
+        assert graph._out_edges(pred)[0].dst is succ
 
     def test_same_memory_uses_direct_edge(self):
         gather = Gather(total_bytes=128, world=1, dim=0)
@@ -258,37 +245,38 @@ class TestCrossDeviceSetWhitelist:
         placement.set_tensor_memory(preds[0].outputs["y"], shared)
         placement.set_tensor_memory(succs[0].inputs["a"], shared)
 
-        optimize_comms(graph, placement)
+        optimize_comms(graph)
 
         assert graph.kernels == frozenset(preds + succs)
         assert graph._out_edges(preds[0])[0].dst is succs[0]
 
-    def test_unsupported_pair_raises(self):
+    def test_unrecognized_pair_is_preserved(self):
         first = AllGather(total_bytes=32, world=4)
         second = AllReduce(total_bytes=32, world=4, dtype="bf16")
         g, p, _, _ = _build_chain(
             first, second, n=4, same_devices=False)
-        with pytest.raises(
-                ValueError, match="Unsupported cross-device-set"):
-            optimize_comms(g, p)
+        optimize_comms(g)
+        assert first in g.kernels
+        assert second in g.kernels
 
-    def test_gather_scatter_different_dims_raises(self):
+    def test_gather_scatter_different_dims_becomes_alltoall(self):
         gather = Gather(total_bytes=128, world=4, dim=0)
         scatter = Scatter(total_bytes=128, world=4, dim=1)
         g, p, _, _ = _build_chain(
             gather, scatter, n=4, same_devices=False)
-        with pytest.raises(ValueError, match="Unsupported cross-device-set"):
-            optimize_comms(g, p)
+        optimize_comms(g)
+        assert any(isinstance(kernel, AllToAll) for kernel in g.kernels)
+        assert gather not in g.kernels
+        assert scatter not in g.kernels
 
-    def test_gather_scatter_different_worlds_not_defensively_rejected(self):
+    def test_gather_scatter_different_worlds_is_preserved(self):
         gather = Gather(total_bytes=128, world=4, dim=0)
         scatter = Scatter(total_bytes=128, world=2, dim=0)
         g, p, preds, succs = _build_chain(
             gather, scatter, n=4, same_devices=False)
-        optimize_comms(g, p)
-        assert len([k for k in g.kernels if isinstance(k, Move)]) == 4
-        assert gather not in g.kernels
-        assert scatter not in g.kernels
+        optimize_comms(g)
+        assert gather in g.kernels
+        assert scatter in g.kernels
 
 
 class TestEliminateDead:
@@ -320,7 +308,7 @@ class TestEliminateDead:
         p = Placement()
         p.set_kernel_device(pred, gpu)
         p.set_kernel_device(succ, gpu)
-        optimize_comms(g, p)
+        optimize_comms(g)
         assert comm not in g.kernels
         assert g._out_edges(pred)[0].dst is succ
 
@@ -344,7 +332,7 @@ class TestEliminateDead:
         p.set_kernel_device(pred, gpu)
         p.set_kernel_device(succ0, gpu)
         p.set_kernel_device(succ1, gpu)
-        optimize_comms(g, p)
+        optimize_comms(g)
         assert comm in g.kernels
 
 
@@ -352,7 +340,7 @@ class TestEliminateDead:
 
 
 class TestFusePairsGuards:
-    def test_cross_device_multi_successor_bypasses_before_fuse_guards(self):
+    def test_collector_multi_successor_is_preserved(self):
         gather = Gather(total_bytes=128.0, world=2, dim=0)
         scatter = Scatter(total_bytes=128.0, world=2, dim=0)
         graph, placement, preds, succs = _build_chain(
@@ -367,12 +355,10 @@ class TestFusePairsGuards:
             gather.outputs["extra"],
             placement.get_tensor_memory(extra.inputs["x"]))
 
-        optimize_comms(graph, placement)
-        assert gather not in graph.kernels
-        assert scatter not in graph.kernels
-        moves = [kernel for kernel in graph.kernels if isinstance(kernel, Move)]
-        assert len(moves) == 2
-        assert set(preds + succs + [extra] + moves) == graph.kernels
+        optimize_comms(graph)
+        assert gather in graph.kernels
+        assert scatter in graph.kernels
+        assert set(preds + succs + [extra, gather, scatter]) == graph.kernels
 
     def test_collector_multi_out_edges_no_fuse(self):
         r = Reduce(total_bytes=128.0, world=2, dtype="bf16")
@@ -386,7 +372,7 @@ class TestFusePairsGuards:
         p.set_kernel_device(extra, device)
         p.set_tensor_memory(
             r.outputs["z2"], p.get_tensor_memory(extra.inputs["q"]))
-        optimize_comms(g, p)
+        optimize_comms(g)
         assert r in g.kernels
         assert b in g.kernels
 
@@ -402,7 +388,7 @@ class TestFusePairsGuards:
         p.set_kernel_device(extra, device)
         p.set_tensor_memory(
             b.inputs["q"], p.get_tensor_memory(extra.outputs["q"]))
-        optimize_comms(g, p)
+        optimize_comms(g)
         assert r in g.kernels
         assert b in g.kernels
 
@@ -410,19 +396,19 @@ class TestFusePairsGuards:
         r = Reduce(total_bytes=128.0, world=2, dtype="bf16")
         b = Broadcast(total_bytes=128.0, world=4)
         g, p, _, _ = _build_chain(r, b, n=2)
-        optimize_comms(g, p)
+        optimize_comms(g)
         assert r in g.kernels
         assert b in g.kernels
 
-    def test_pred_succ_length_mismatch_raises(self):
+    def test_incomplete_rank_ports_are_not_fused(self):
         r = Reduce(total_bytes=128.0, world=3, dtype="bf16")
         b = Broadcast(total_bytes=128.0, world=3)
         g, p, _, succs = _build_chain(r, b, n=3)
         g.remove_kernel(succs[2])
         del b.outputs["y2"]
-        with pytest.raises(
-                ValueError, match="Unsupported cross-device-set"):
-            optimize_comms(g, p)
+        optimize_comms(g)
+        assert r in g.kernels
+        assert b in g.kernels
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -787,34 +773,11 @@ def test_kv_persistence_split_shards_kv_and_replicates_output(output_name):
     assert isinstance(nxt["done"], Gather)
 
 
-def test_batch_split_comm_replicates_collective_per_batch_group():
-    kernel = Broadcast(total_bytes=8 * 16 * 2, world=N)
-    kernel.inputs = {"x": Tensor("bf16", (8, 16))}
-    kernel.outputs = {
-        f"o{i}": Tensor("bf16", (8, 16)) for i in range(N)}
-
-    prev, copies, nxt = batch_split_comm(kernel, 2)
-
-    assert isinstance(prev["x"], Scatter)
-    assert prev["x"].world == 2
-    assert len(copies) == 2
-    assert all(isinstance(copy, Broadcast) and copy.world == N
-               for copy in copies)
-    assert all(copy.total_bytes == kernel.total_bytes / 2
-               for copy in copies)
-    assert all(copy.inputs["x"].shape == (4, 16) for copy in copies)
-    assert all(isinstance(comm, Gather) and comm.world == 2
-               for comm in nxt.values())
-
-
-def test_canonicalize_split_comms_bypasses_only_matching_axis():
+def test_optimize_comms_bypasses_rank_aligned_gather_scatter():
     gather = Gather(total_bytes=SHARD.size_bytes, world=N, dim=0)
     scatter = Scatter(total_bytes=SHARD.size_bytes, world=N, dim=0)
     graph, _, preds, succs = _build_chain(gather, scatter, N)
-    gather._split_axis = "dp"
-    scatter._split_axis = "dp"
-
-    canonicalize_split_comms(graph, "dp")
+    optimize_comms(graph)
 
     assert gather not in graph.kernels
     assert scatter not in graph.kernels

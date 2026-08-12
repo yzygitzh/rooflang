@@ -53,16 +53,17 @@ def test_dynamic_optimizers_do_not_edit_declared_data_dependencies():
         assert "_validate_args(" in source
 
 
-def test_decode_finishes_cp_and_dp_transforms_before_placement():
+def test_decode_finishes_dp_and_cp_transforms_before_placement():
     source = inspect.getsource(optimize_model_cluster_decode)
-    cp_start = source.index("# CP comes first")
-    dp_start = source.index("# DP is the second graph transform")
+    dp_start = source.index("# DP comes first")
+    cp_start = source.index("# Apply CP separately")
     placement_start = source.index("placement = Placement")
 
-    assert cp_start < dp_start < placement_start
+    assert dp_start < cp_start < placement_start
     assert source.rfind(".split_kernel(") < placement_start
+    assert "batch_split_comm" not in source
     assert "local_placement" not in source
-    assert source.index("optimize_comms(") > placement_start
+    assert source.rfind("optimize_comms(") < placement_start
 
 
 def test_cluster_optimizers_require_ep_equal_cp_times_dp():

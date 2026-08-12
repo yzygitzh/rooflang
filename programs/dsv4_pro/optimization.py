@@ -7,12 +7,10 @@ from rooflang.language.kernels.comm import (
     Broadcast, CommKernel, Gather, Reduce, Scatter,
 )
 from rooflang.language.kernels.identity import Move
-from rooflang.language.optimization.comm import (
-    canonicalize_split_comms, optimize_comms,
-)
+from rooflang.language.optimization.comm import optimize_comms
 from rooflang.language.optimization.split import (
-    batch_split, batch_split_comm, context_split_decode,
-    context_split_prefill, general_dup, kv_persistence_split,
+    batch_split, context_split_decode, context_split_prefill, general_dup,
+    kv_persistence_split,
 )
 from rooflang.language.placement import Placement
 from rooflang.language.tensor import Tensor
@@ -39,17 +37,6 @@ _DECODE_SHARDED_FIELDS = (
     "gate", "dispatch", "combine", "sw_up", "sw_down", "moe_add",
     "ffn_add",
 )
-
-
-def _tag_split_comms(split, axis):
-    """Tag only the wrapper comms introduced by one logical split axis."""
-    def tagged_split(kernel, n):
-        prev_comms, copies, next_comms = split(kernel, n)
-        for comm in (*prev_comms.values(), *next_comms.values()):
-            comm._split_axis = axis
-        return prev_comms, copies, next_comms
-
-    return tagged_split
 
 
 def _place_comm_tensor_memories(g, placement):
@@ -332,6 +319,8 @@ def optimize_model_cluster_prefill(
     for layer in layers:
         layer._kv_persist_barrier_cp_dp_copies = barrier_copies
 
+    optimize_comms(g)
+
     # PP changes placement only; it does not split kernels or modify the graph.
     stage_gpus = [
         gpus[stage * ep:(stage + 1) * ep]
@@ -380,8 +369,6 @@ def optimize_model_cluster_prefill(
 
     _place_comm_tensor_memories(g, placement)
 
-    # Communication rewriting runs only after split and placement are final.
-    optimize_comms(g, placement)
     g.validate()
     placement.validate(g)
     return g, placement
@@ -414,82 +401,10 @@ def optimize_model_cluster_decode(
         for stage in range(pp_degree)
     ]
 
-    # CP comes first. Attention broadcasts Q, shards the persistent KV input,
-    # and reduces the partial outputs. Move the Q broadcast before the Q
-    # projection chain while it is still adjacent to those kernels.
-    kv_read_cp_copies = []
-    for kv_read in kv_cache_reads:
-        _, copies, _ = g.split_kernel(context_split_decode, kv_read, cp)
-        kv_read_cp_copies.append(copies)
-
-    barrier = layers[0].kv_persist_barrier
-    barrier_prev, barrier_cp_copies, _ = g.split_kernel(
-        kv_persistence_split, barrier, cp)
-    cp_collectives_to_replicate = [barrier_prev["decode_output"]]
-
-    cp_fields_by_layer = []
-    for layer in layers:
-        cp_fields = {}
-        _, cp_fields["kv_cache_fan"], _ = g.split_kernel(
-            context_split_decode, layer.kv_cache_fan, cp)
-        sa_prev, cp_fields["sa"], sa_next = g.split_kernel(
-            context_split_decode, layer.sa, cp)
-
-        q_broadcast = sa_prev["q"]
-        for name in reversed(_DECODE_REPLICATED_FIELDS):
-            q_broadcast, copies = g.dup(
-                general_dup, getattr(layer, name))
-            cp_fields[name] = copies
-
-        for name in _DECODE_SHARDED_FIELDS:
-            prev_comms, copies, next_comms = g.split_kernel(
-                batch_split, getattr(layer, name), cp)
-            cp_fields[name] = copies
-            if name == "wo_a":
-                attention_scatter = prev_comms["x"]
-            elif name == "attn_add":
-                residual_scatter = prev_comms["a"]
-            elif name == "ffn_add":
-                layer_output_gather = next_comms["y"]
-        cp_collectives_to_replicate.extend(
-            (q_broadcast, sa_next["y"], attention_scatter,
-             residual_scatter, layer_output_gather))
-        cp_fields_by_layer.append(cp_fields)
-
-    # DP is the second graph transform. Split each CP rank by batch, then
-    # flatten copies in DP-major order to match the stage GPU rank layout.
-    # First replicate every batch-shaped CP collective per DP group. The
-    # Scatter/Gather wrappers introduced here cancel against those produced
-    # when the adjacent compute copies are batch-split below.
-    dp_split = _tag_split_comms(batch_split, "dp")
-    dp_comm_split = _tag_split_comms(batch_split_comm, "dp")
-    for kernel in g.kernels:
-        if isinstance(kernel, CommKernel):
-            kernel._split_axis = "cp"
-    for comm in cp_collectives_to_replicate:
-        g.split_kernel(dp_comm_split, comm, dp)
-
-    def split_cp_copies(copies):
-        copies_by_cp = []
-        for copy in copies:
-            _, dp_copies, _ = g.split_kernel(dp_split, copy, dp)
-            copies_by_cp.append(dp_copies)
-        return [
-            copies_by_cp[cp_rank][dp_rank]
-            for dp_rank in range(dp)
-            for cp_rank in range(cp)
-        ]
-
-    kv_read_cp_dp_copies = []
-    for layer_id, copies in enumerate(kv_read_cp_copies):
-        cp_dp_copies = split_cp_copies(copies)
-        kv_read_cp_dp_copies.append(cp_dp_copies)
-        kv_cache_reads[layer_id]._cp_dp_copies = cp_dp_copies
-
-    barrier_copies = split_cp_copies(barrier_cp_copies)
-    for layer in layers:
-        layer._kv_persist_barrier_cp_dp_copies = barrier_copies
-
+    # DP comes first so every later CP split operates within one independent
+    # batch shard. Communication kernels are created only as boundaries of
+    # compute splits; existing communication kernels are never split directly.
+    dp_split = batch_split
     _, emb_dp_copies, _ = g.split_kernel(dp_split, emb, dp)
     _, final_norm_dp_copies, _ = g.split_kernel(
         dp_split, final_norm, dp)
@@ -499,24 +414,93 @@ def optimize_model_cluster_decode(
     prefix_fields = (
         "bridge", "attn_norm", "attn_fan", "wkv", "kv_norm",
     )
-    for layer, cp_fields in zip(layers, cp_fields_by_layer):
-        dp_fields = {}
-        for name in prefix_fields:
+    dp_fields_by_layer = []
+    for layer in layers:
+        fields = {}
+        for name in (
+            *prefix_fields,
+            *_DECODE_REPLICATED_FIELDS,
+            *_DECODE_SHARDED_FIELDS,
+            "sa", "kv_cache_fan",
+        ):
             _, copies, _ = g.split_kernel(
                 dp_split, getattr(layer, name), dp)
-            dp_fields[name] = copies
-            setattr(layer, f"_{name}_dp_copies", copies)
-        layer._decode_dp_fields = dp_fields
+            fields[name] = copies
+            if name in prefix_fields:
+                setattr(layer, f"_{name}_dp_copies", copies)
+        layer._decode_dp_fields = {
+            name: fields[name] for name in prefix_fields
+        }
+        dp_fields_by_layer.append(fields)
+
+    kv_read_dp_copies = []
+    for kv_read in kv_cache_reads:
+        _, copies, _ = g.split_kernel(dp_split, kv_read, dp)
+        kv_read_dp_copies.append(copies)
+
+    barrier = layers[0].kv_persist_barrier
+    _, barrier_dp_copies, _ = g.split_kernel(dp_split, barrier, dp)
+
+    # Restore each independent DP subgraph before CP is introduced.
+    optimize_comms(g)
+
+    # Apply CP separately inside every DP subgraph. Each attention split now
+    # creates its own Q Broadcast and output Reduce for that DP group.
+    cp_context_split = context_split_decode
+    cp_batch_split = batch_split
+    cp_barrier_split = kv_persistence_split
+
+    kv_read_cp_dp_copies = []
+    for layer_id, dp_copies in enumerate(kv_read_dp_copies):
+        cp_dp_copies = []
+        for copy in dp_copies:
+            _, copies, _ = g.split_kernel(cp_context_split, copy, cp)
+            cp_dp_copies.extend(copies)
+        kv_read_cp_dp_copies.append(cp_dp_copies)
+        kv_cache_reads[layer_id]._cp_dp_copies = cp_dp_copies
+
+    barrier_copies = []
+    for copy in barrier_dp_copies:
+        _, copies, _ = g.split_kernel(cp_barrier_split, copy, cp)
+        barrier_copies.extend(copies)
+    for layer in layers:
+        layer._kv_persist_barrier_cp_dp_copies = barrier_copies
+
+    for layer, dp_fields in zip(layers, dp_fields_by_layer):
+        cp_fields = {
+            name: []
+            for name in (
+                *_DECODE_REPLICATED_FIELDS,
+                *_DECODE_SHARDED_FIELDS,
+                "sa", "kv_cache_fan",
+            )
+        }
+        for dp_rank in range(dp):
+            _, copies, _ = g.split_kernel(
+                cp_context_split, dp_fields["kv_cache_fan"][dp_rank], cp)
+            cp_fields["kv_cache_fan"].extend(copies)
+
+            sa_prev, copies, _ = g.split_kernel(
+                cp_context_split, dp_fields["sa"][dp_rank], cp)
+            cp_fields["sa"].extend(copies)
+
+            q_broadcast = sa_prev["q"]
+            for name in reversed(_DECODE_REPLICATED_FIELDS):
+                q_broadcast, copies = g.dup(
+                    general_dup, dp_fields[name][dp_rank])
+                cp_fields[name].extend(copies)
+
+            for name in _DECODE_SHARDED_FIELDS:
+                _, copies, _ = g.split_kernel(
+                    cp_batch_split, dp_fields[name][dp_rank], cp)
+                cp_fields[name].extend(copies)
 
         for name, copies in cp_fields.items():
-            cp_dp_copies = split_cp_copies(copies)
-            setattr(layer, f"_{name}_cp_dp_copies", cp_dp_copies)
+            setattr(layer, f"_{name}_cp_dp_copies", copies)
         layer._kv_persist_fan_cp_dp_copies = (
             layer._kv_cache_fan_cp_dp_copies)
 
-    canonicalize_split_comms(g, "dp")
-    canonicalize_split_comms(g, "cp")
-    canonicalize_split_comms(g, "dp")
+    optimize_comms(g)
 
     placement = Placement(hardware=hw, graph=g)
 
@@ -634,8 +618,6 @@ def optimize_model_cluster_decode(
                 placement.set_tensor_memory(
                     move.outputs[f"dst{index}"], target_memory)
 
-    _place_comm_tensor_memories(g, placement)
-    optimize_comms(g, placement)
     _place_comm_tensor_memories(g, placement)
     g.validate()
     placement.validate(g)

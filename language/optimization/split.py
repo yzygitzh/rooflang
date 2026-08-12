@@ -177,48 +177,6 @@ def general_dup(kernel, n):
     return broadcast, copies
 
 
-def batch_split_comm(kernel, n):
-    """Replicate one collective across independent batch/DP groups.
-
-    The original collective operates on the full batch. Each copy operates on
-    one batch shard; per-port Scatter/Gather wrappers preserve the original
-    graph interface until adjacent compute kernels receive the same DP split.
-    """
-    if not isinstance(kernel, (Broadcast, Gather, Reduce, Scatter)):
-        raise TypeError(
-            "batch collective split requires a primitive communication "
-            "kernel")
-    tensors = (*kernel.inputs.values(), *kernel.outputs.values())
-    if any(not tensor.shape or tensor.shape[0] % n != 0
-           for tensor in tensors):
-        raise ValueError(
-            "every collective tensor batch dimension must be divisible by "
-            f"{n}")
-
-    prev_comms = {
-        port: _make_scatter(tensor, n)
-        for port, tensor in kernel.inputs.items()
-    }
-    copies = []
-    for _ in range(n):
-        copy = deepcopy(kernel)
-        copy.total_bytes /= n
-        copy.inputs = {
-            port: Tensor(tensor.dtype, _shard_shape(tensor.shape, n))
-            for port, tensor in kernel.inputs.items()
-        }
-        copy.outputs = {
-            port: Tensor(tensor.dtype, _shard_shape(tensor.shape, n))
-            for port, tensor in kernel.outputs.items()
-        }
-        copies.append(copy)
-    next_comms = {
-        port: _make_gather(tensor, n)
-        for port, tensor in kernel.outputs.items()
-    }
-    return prev_comms, copies, next_comms
-
-
 # ── column_split / row_split / head_split ──────────────────────────────
 
 

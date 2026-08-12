@@ -84,6 +84,41 @@ class TestPlacementSetKernelDevice:
         p.set_kernel_device(k, Compute(name="g"), resource_cap=1.0)
         assert p.get_kernel_device(k).resource_cap == 1.0
 
+    def test_spawn_outputs_alias_remote_predecessor_memory(self):
+        hw, gpu0, hbm0 = _simple_hw()
+        gpu1 = Compute(name="gpu1", tflops={"bf16": 2250.0})
+        hbm1 = Memory(name="hbm1", capacity_gb=288.0)
+        hw.add_node(gpu1)
+        hw.add_node(hbm1)
+        hw.add_edge(FabricEdge(
+            name="hbm1", src=gpu1, dst=hbm1,
+            src_to_dst_bandwidth_gbs=7750.0,
+            dst_to_src_bandwidth_gbs=7750.0,
+            is_full_duplex=False,
+        ))
+
+        pred = Kernel(outputs={"y": Tensor("bf16", (4,))})
+        spawn = Spawn(world=2)
+        spawn.inputs = {"x": Tensor("bf16", (4,))}
+        spawn.outputs = {
+            "o0": Tensor("bf16", (4,)),
+            "o1": Tensor("bf16", (4,)),
+        }
+        graph = ComputeGraph()
+        graph.add_kernel(pred)
+        graph.add_kernel(spawn)
+        graph.add_data_edge(pred, spawn, {"y": "x"})
+
+        placement = Placement(hardware=hw, graph=graph)
+        placement.set_kernel_device(pred, gpu0)
+        placement.set_kernel_device(spawn, gpu1)
+
+        assert all(
+            placement.get_tensor_memory(tensor) is hbm0
+            for tensor in (*spawn.inputs.values(), *spawn.outputs.values())
+        )
+        placement.validate(graph)
+
 
 # ── Placement.get_kernel_device tests ────────────────────────────────
 

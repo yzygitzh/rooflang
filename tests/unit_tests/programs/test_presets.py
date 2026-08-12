@@ -5,6 +5,7 @@ import pytest
 from rooflang.language.hardware.component import Compute, Memory
 from rooflang.programs.presets.b300 import B300Cluster, B300SuperChip
 from rooflang.programs.presets.gb300 import GB300Cluster, GB300SuperChip
+from rooflang.programs.presets.gh200 import GH200Cluster, GH200SuperChip
 from rooflang.programs.presets.h200 import H200Cluster, H200SuperChip
 
 
@@ -405,3 +406,121 @@ class TestGB300SuperChip:
         assert dram.src_to_dst_bandwidth_gbs == 1536.0
         assert ssd.src_to_dst_bandwidth_gbs == 112.0
         assert ssd.dst_to_src_bandwidth_gbs == 56.0
+
+
+@pytest.mark.parametrize("preset", [GH200Cluster, GH200SuperChip])
+@pytest.mark.parametrize("nvl_scope", [0, 257, 258])
+def test_gh200_rejects_invalid_nvl_scope(preset, nvl_scope):
+    with pytest.raises(ValueError, match="nvl_scope"):
+        preset(nvl_scope=nvl_scope)
+
+
+@pytest.mark.parametrize("preset", [GH200Cluster, GH200SuperChip])
+@pytest.mark.parametrize("nvl_scope", [1, 2, 3, 255, 256])
+def test_gh200_accepts_nvl_scope_boundaries(preset, nvl_scope):
+    assert preset(nvl_scope=nvl_scope).nvl_scope == nvl_scope
+
+
+class TestGH200Cluster:
+    def test_nvl_scope_controls_component_counts(self):
+        hw = GH200Cluster(nvl_scope=4)
+
+        assert hw.nvl_scope == 4
+        assert sum(component.kind == "gpu" for component in hw.nodes) == 4
+        assert sum(component.kind == "cpu" for component in hw.nodes) == 4
+        assert sum(component.kind == "nic" for component in hw.nodes) == 4
+        assert sum(component.kind == "hbm" for component in hw.nodes) == 4
+        assert sum(component.kind == "dram" for component in hw.nodes) == 4
+        assert sum(component.kind == "ssd" for component in hw.nodes) == 4
+
+    def test_superchip_specs_and_links(self):
+        hw = GH200Cluster(nvl_scope=2)
+        components = {component.name: component for component in hw.nodes}
+        gpu = components["n0-nvidia-gh200-0"]
+        cpu = components["n0-nvidia-grace-0"]
+        nic = components["n0-mellanox-cx7-0"]
+
+        assert gpu.tflops == {
+            "fp4": 1979.0, "fp8": 1979.0,
+            "bf16": 989.5, "fp16": 989.5, "fp32": 494.5,
+        }
+        assert cpu.tflops == {"fp64": 3.55}
+        assert components["n0-hbm3e-0"].capacity_gb == 144.0
+        assert components["n0-dram-0"].capacity_gb == 480.0
+
+        hbm = hw.find_fabric(gpu, components["n0-hbm3e-0"])
+        nvlink = hw.find_fabric(gpu, components["n0-nvswitch"])
+        c2c = hw.find_fabric(cpu, gpu)
+        gpu_nic_path = hw.find_fabric_path(gpu, nic)
+
+        assert hbm.src_to_dst_bandwidth_gbs == 4900.0
+        assert nvlink.src_to_dst_bandwidth_gbs == 450.0
+        assert nvlink.dst_to_src_bandwidth_gbs == 450.0
+        assert c2c.name == "nvlink-c2c"
+        assert c2c.src_to_dst_bandwidth_gbs == 450.0
+        assert c2c.dst_to_src_bandwidth_gbs == 450.0
+        dram = hw.find_fabric(cpu, components["n0-dram-0"])
+        assert dram.src_to_dst_bandwidth_gbs == 512.0
+        assert [fabric.name for fabric in gpu_nic_path] == [
+            "nvlink-c2c", "pcie"]
+
+    def test_aggregate_bandwidth(self):
+        hw = GH200Cluster(nvl_scope=4, n_nodes=2)
+        gpus = [component for component in hw.nodes
+                if component.kind == "gpu"]
+        node0_gpus = [gpu for gpu in gpus if gpu.name.startswith("n0-")]
+
+        assert hw.find_aggregate_bandwidth(node0_gpus) == 450.0
+        assert hw.find_aggregate_bandwidth(gpus) == 200.0
+
+    def test_ssd_specs_match_existing_presets(self):
+        hw = GH200Cluster(nvl_scope=2)
+        components = {component.name: component for component in hw.nodes}
+
+        for index in range(2):
+            ssd = components[f"n0-ssd-{index}"]
+            cpu = components[f"n0-nvidia-grace-{index}"]
+            fabric = hw.find_fabric(ssd, cpu)
+            assert ssd.capacity_gb == 3840.0
+            assert fabric.src_to_dst_bandwidth_gbs == 14.0
+            assert fabric.dst_to_src_bandwidth_gbs == 7.0
+
+
+class TestGH200SuperChip:
+    def test_aggregates_requested_nvl_scope(self):
+        hw = GH200SuperChip(nvl_scope=4)
+        components = {component.name: component for component in hw.nodes}
+
+        assert hw.nvl_scope == 4
+        assert components["n0-nvidia-gh200-0"].tflops == {
+            "fp4": 7916.0, "fp8": 7916.0,
+            "bf16": 3958.0, "fp16": 3958.0, "fp32": 1978.0,
+        }
+        assert components["n0-nvidia-grace-0"].tflops == {"fp64": 14.2}
+        assert components["n0-hbm3e-0"].capacity_gb == 576.0
+        assert components["n0-dram-0"].capacity_gb == 1920.0
+        assert components["n0-ssd"].capacity_gb == 15360.0
+        assert not any("nvswitch" in component.name
+                       for component in hw.nodes)
+
+    def test_aggregates_bandwidths(self):
+        hw = GH200SuperChip(nvl_scope=4)
+        components = {component.name: component for component in hw.nodes}
+        gpu = components["n0-nvidia-gh200-0"]
+        cpu = components["n0-nvidia-grace-0"]
+        nic = components["n0-mellanox-cx7-0"]
+
+        hbm = hw.find_fabric(gpu, components["n0-hbm3e-0"])
+        c2c = hw.find_fabric(cpu, gpu)
+        nic_pcie = hw.find_fabric(cpu, nic)
+        infiniband = hw.find_fabric(nic, components["ib-switch"])
+        dram = hw.find_fabric(cpu, components["n0-dram-0"])
+        ssd = hw.find_fabric(components["n0-ssd"], cpu)
+
+        assert hbm.src_to_dst_bandwidth_gbs == 19600.0
+        assert c2c.src_to_dst_bandwidth_gbs == 1800.0
+        assert nic_pcie.src_to_dst_bandwidth_gbs == 256.0
+        assert infiniband.src_to_dst_bandwidth_gbs == 200.0
+        assert dram.src_to_dst_bandwidth_gbs == 2048.0
+        assert ssd.src_to_dst_bandwidth_gbs == 56.0
+        assert ssd.dst_to_src_bandwidth_gbs == 28.0

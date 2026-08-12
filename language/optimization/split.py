@@ -22,7 +22,7 @@ from rooflang.language.kernels.forward import (
     Attn, ElementwiseOp, Embedding, Gemm, Nop, ReadInput, RMSNorm, Sampling,
     SparseAttn, Slice, StridedGemm, TokenCombine, TokenDispatch,
 )
-from rooflang.language.kernels.identity import Concat, Move, Spawn
+from rooflang.language.kernels.identity import Concat, Spawn
 from rooflang.language.tensor import Tensor
 from rooflang.language.utils import dtype_bytes, gemm_scale_bytes
 
@@ -435,8 +435,6 @@ def _make_context_copy(kernel, n):
         c = Concat()
     elif isinstance(kernel, Slice):
         c = Slice()
-    elif isinstance(kernel, Move):
-        c = Move()
     elif isinstance(kernel, Sampling):
         c = Sampling(kernel.M // n, kernel.V, kernel.dtype_, kernel.out_dtype)
     elif isinstance(kernel, ElementwiseOp):
@@ -541,8 +539,6 @@ def _make_batch_copy(kernel, n):
         c = Concat()
     elif isinstance(kernel, Slice):
         c = Slice()
-    elif isinstance(kernel, Move):
-        c = Move()
     elif isinstance(kernel, Sampling):
         c = Sampling(kernel.M // n, kernel.V, kernel.dtype_, kernel.out_dtype)
     elif isinstance(kernel, ElementwiseOp):

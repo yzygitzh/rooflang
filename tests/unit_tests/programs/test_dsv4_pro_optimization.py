@@ -7,7 +7,6 @@ import pytest
 from rooflang.language.hardware.component import Compute
 from rooflang.language.kernels.comm import Broadcast, ReduceScatter
 from rooflang.language.kernels.forward import Nop, Slice, SparseAttn
-from rooflang.language.kernels.identity import Move
 from rooflang.programs.dsv4_pro import optimization
 from rooflang.programs.dsv4_pro import model
 from rooflang.programs.dsv4_pro.optimization import (
@@ -158,13 +157,6 @@ def test_cp4_dp2_ep8_pp2_prefill(monkeypatch):
                     edge.src.outputs[output_name]) is \
                     placement.get_tensor_memory(barrier.inputs[input_name])
 
-    moves = [kernel for kernel in graph.kernels
-             if isinstance(kernel, Move)]
-    assert all(
-        "nvidia-b300" in placement.get_kernel_device(move).device.name
-        for move in moves
-    )
-
     for layer_id, layer in enumerate(layers):
         copies = layer._ffn_add_cp_dp_copies
         assert len(copies) == 8
@@ -255,8 +247,6 @@ def test_cp4_dp2_ep8_pp2_decode(monkeypatch):
     ]
     assert len(reduce_scatters) == 2 * 2
     assert all(kernel.world == 4 for kernel in reduce_scatters)
-    assert not any(isinstance(kernel, Move) for kernel in graph.kernels)
-
     result = Simulator(graph, placement, hw).run()
     assert result.total_time_us > 0
 

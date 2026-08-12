@@ -1,4 +1,4 @@
-"""Identity kernels — zero-cost structural nodes and data movement."""
+"""Identity kernels — zero-cost structural nodes."""
 
 from __future__ import annotations
 
@@ -71,14 +71,3 @@ class Concat(Kernel):
     @property
     def output_bytes(self) -> float:
         return 0.0
-
-
-class Move(Kernel):
-    """Materialize copies of tensors at locations chosen by placement.
-
-    Covers all data movement: HBM→NVMe (offload), NVMe→HBM (prefetch),
-    HBM→DRAM, DRAM→HBM, etc.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()

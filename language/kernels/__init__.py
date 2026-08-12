@@ -8,7 +8,7 @@ split by phase:
                    RMSNorm, LayerNorm, RoPE, Attn, SparseAttn
   optimizer.py  — AdamWStep
   comm.py       — AllReduce, ReduceScatter, AllGather, AllToAll, Broadcast, SendRecv
-  identity.py   — Spawn, Concat, Move
+  identity.py   — Spawn, Concat
 
 Forward and backward share class names; disambiguate via module:
     from rooflang.language.kernels import forward, backward
@@ -18,5 +18,4 @@ Forward and backward share class names; disambiguate via module:
 """
 
 from rooflang.language.kernels.kernel import Kernel  # noqa: F401
-from rooflang.language.kernels.identity import Move  # noqa: F401
 from rooflang.language.tensor import Tensor  # noqa: F401

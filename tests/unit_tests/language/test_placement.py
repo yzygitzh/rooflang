@@ -7,7 +7,7 @@ from rooflang.language.hardware.component import Compute, Memory
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.kernels.comm import AllReduce, Scatter
 from rooflang.language.kernels.forward import Slice
-from rooflang.language.kernels.identity import Concat, Move, Spawn
+from rooflang.language.kernels.identity import Concat, Spawn
 from rooflang.language.graph import ComputeGraph, FabricEdge, HardwareGraph
 from rooflang.language.tensor import Tensor
 
@@ -289,37 +289,24 @@ class TestPlacementTensorMemory:
         assert p.get_tensor_memory(t_w) is hbm
         assert p.get_tensor_memory(t_out) is hbm
 
-    def test_move_output_defaults_to_kernel_local_memory(self):
-        hw, gpu, hbm = _simple_hw()
-        t_src = Tensor("bf16", (1024,))
-        m = Move()
-        m.inputs = {"src0": t_src}
-        m.outputs = {"dst0": Tensor(t_src.dtype, t_src.shape)}
-        p = Placement(hardware=hw)
-        p.set_kernel_device(m, gpu)
-        assert p.get_tensor_memory(m.outputs["dst0"]) is hbm
-        assert p.get_tensor_memory(t_src) is hbm
-
-    def test_move_output_preserves_explicit_placement(self):
+    def test_output_preserves_explicit_placement(self):
         hw, gpu, hbm = _simple_hw()
         nvme = Memory(name="nvme", capacity_gb=3840.0)
         inputs = [Tensor("bf16", (1024,)), Tensor("bf16", (2048,))]
-        move = Move()
-        move.inputs = {
-            f"src{i}": tensor for i, tensor in enumerate(inputs)
-        }
-        move.outputs = {
-            f"dst{i}": Tensor(tensor.dtype, tensor.shape)
-            for i, tensor in enumerate(inputs)
-        }
+        kernel = Kernel(
+            inputs={f"src{i}": tensor
+                    for i, tensor in enumerate(inputs)},
+            outputs={f"dst{i}": Tensor(tensor.dtype, tensor.shape)
+                     for i, tensor in enumerate(inputs)},
+        )
         placement = Placement(hardware=hw)
 
-        placement.set_tensor_memory(move.outputs["dst0"], hbm)
-        placement.set_tensor_memory(move.outputs["dst1"], nvme)
-        placement.set_kernel_device(move, gpu)
+        placement.set_tensor_memory(kernel.outputs["dst0"], hbm)
+        placement.set_tensor_memory(kernel.outputs["dst1"], nvme)
+        placement.set_kernel_device(kernel, gpu)
 
-        assert placement.get_tensor_memory(move.outputs["dst0"]) is hbm
-        assert placement.get_tensor_memory(move.outputs["dst1"]) is nvme
+        assert placement.get_tensor_memory(kernel.outputs["dst0"]) is hbm
+        assert placement.get_tensor_memory(kernel.outputs["dst1"]) is nvme
 
     def test_input_follows_predecessor_output(self):
         hw, gpu, hbm = _simple_hw()

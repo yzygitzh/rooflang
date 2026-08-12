@@ -12,7 +12,7 @@ from rooflang.language.kernels.forward import (
     Attn, Embedding, Gemm, Nop, ReadInput, RMSNorm, Slice, SparseAttn,
     StridedGemm, TokenCombine, TokenDispatch,
 )
-from rooflang.language.kernels.identity import Concat, Move, Spawn
+from rooflang.language.kernels.identity import Concat, Spawn
 from rooflang.language.tensor import Tensor
 from rooflang.language.placement import Placement
 from rooflang.language.hardware.component import Compute, Memory
@@ -1013,36 +1013,6 @@ class TestBatchSplitSlice:
             assert copy.inputs["x"].shape == (8, 64)
             assert copy.outputs["y"].shape == (8, 8)
             assert copy._requires_placement is True
-
-
-class TestBatchAndContextSplitMove:
-    def setup_method(self):
-        tensors = [Tensor("bf16", (8, 16, 64)),
-                   Tensor("bf16", (8, 32, 64))]
-        self.move = Move()
-        self.move.inputs = {
-            f"src{i}": tensor for i, tensor in enumerate(tensors)
-        }
-        self.move.outputs = {
-            f"dst{i}": Tensor(tensor.dtype, tensor.shape)
-            for i, tensor in enumerate(tensors)
-        }
-
-    def test_batch_split(self):
-        _, copies, _ = batch_split(self.move, N)
-        assert len(copies) == N
-        for copy in copies:
-            assert copy.inputs["src0"].shape == (2, 16, 64)
-            assert copy.inputs["src1"].shape == (2, 32, 64)
-            assert copy.input_bytes == copy.output_bytes
-
-    def test_context_split(self):
-        _, copies, _ = context_split_prefill(self.move, N)
-        assert len(copies) == N
-        for copy in copies:
-            assert copy.inputs["src0"].shape == (8, 4, 64)
-            assert copy.inputs["src1"].shape == (8, 8, 64)
-            assert copy.input_bytes == copy.output_bytes
 
 
 class TestBatchSplitTokenDispatch:

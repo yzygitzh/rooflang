@@ -151,11 +151,11 @@ class RunningKernel:
         worst = max(worst, net_remaining)
         return self.seg_start + worst
 
-    def _network_time(self) -> float:
+    def network_time(self) -> float:
         return self.network_alpha + self.network_transfer_time
 
     def bound(self) -> Bound:
-        nt = self._network_time()
+        nt = self.network_time()
         if nt >= self.compute_time and nt >= self.memory_time and nt > 0:
             return Bound.NETWORK
         if self.compute_time >= self.memory_time and self.compute_time > 0:
@@ -266,7 +266,7 @@ class Simulator:
                 component_times = (
                     rk.compute_time,
                     rk.memory_time,
-                    rk._network_time(),
+                    rk.network_time(),
                 )
                 if isinstance(kernel, CommKernel) and len(rk.participants) > 1:
                     for part_dev in rk.participants:

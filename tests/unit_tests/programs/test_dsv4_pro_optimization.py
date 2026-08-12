@@ -13,7 +13,7 @@ from rooflang.programs.dsv4_pro.optimization import (
     optimize_model_cluster_decode,
     optimize_model_cluster_prefill,
 )
-from rooflang.programs.presets.b300 import B300ClusterA
+from rooflang.programs.presets.b300 import B300Cluster
 from rooflang.runtime.simulator import Simulator
 
 
@@ -127,7 +127,7 @@ def test_cp4_dp2_ep8_pp2_prefill(monkeypatch):
     monkeypatch.setattr(model, "N_EXPERTS", 8)
     monkeypatch.setattr(optimization, "N_EXPERTS", 8)
 
-    hw = B300ClusterA(n_nodes=2)
+    hw = B300Cluster(n_nodes=2)
     pp_partition = [1, 1]
     graph, layers, emb, read_input, kv_reads, output_head = \
         model.declare_model(
@@ -179,7 +179,7 @@ def test_cp4_dp2_ep8_pp2_decode(monkeypatch):
     monkeypatch.setattr(model, "N_EXPERTS", 8)
     monkeypatch.setattr(optimization, "N_EXPERTS", 8)
 
-    hw = B300ClusterA(n_nodes=2)
+    hw = B300Cluster(n_nodes=2)
     graph, layers, emb, read_input, kv_reads, output_head = \
         model.declare_model(
             batch_size=64,
@@ -272,7 +272,7 @@ def test_cp_decode_broadcasts_q_between_same_stage_layers(monkeypatch):
     monkeypatch.setattr(model, "N_EXPERTS", 8)
     monkeypatch.setattr(optimization, "N_EXPERTS", 8)
 
-    hw = B300ClusterA(n_nodes=1)
+    hw = B300Cluster(n_nodes=1)
     graph, layers, emb, read_input, kv_reads, output_head = \
         model.declare_model(
             batch_size=64,

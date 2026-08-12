@@ -1,51 +1,91 @@
 """Unit tests for hardware preset classes."""
 
 from rooflang.language.hardware.component import Compute, Memory
-from rooflang.programs.presets.b300 import B300ClusterA, B300SuperChipA
+from rooflang.programs.presets.b300 import B300Cluster, B300SuperChip
 
 
 class TestB300AggregateOverride:
     def test_intra_node(self):
-        hw = B300ClusterA(n_nodes=1)
+        hw = B300Cluster(n_nodes=1)
         gpus = [n for n in hw.nodes
                 if isinstance(n, Compute) and "nvidia-b300" in n.name]
         assert hw.find_aggregate_bandwidth(gpus) == 900.0
 
     def test_inter_node(self):
-        hw = B300ClusterA(n_nodes=2)
+        hw = B300Cluster(n_nodes=2)
         gpus = [n for n in hw.nodes
                 if isinstance(n, Compute) and "nvidia-b300" in n.name]
         assert hw.find_aggregate_bandwidth(gpus) == 800.0
 
     def test_single_device_returns_inf(self):
-        hw = B300ClusterA(n_nodes=1)
+        hw = B300Cluster(n_nodes=1)
         gpus = [n for n in hw.nodes
                 if isinstance(n, Compute) and "nvidia-b300" in n.name]
         assert hw.find_aggregate_bandwidth(gpus[:1]) == float("inf")
 
 
-class TestB300SuperChipA:
+class TestB300SuperChip:
     def test_single_gpu(self):
-        hw = B300SuperChipA()
+        hw = B300SuperChip()
         gpus = [n for n in hw.nodes
                 if isinstance(n, Compute) and "nvidia-b300" in n.name]
         assert len(gpus) == 1
 
     def test_hbm_capacity(self):
-        hw = B300SuperChipA()
+        hw = B300SuperChip()
         hbm = [n for n in hw.nodes
                 if isinstance(n, Memory) and "hbm3e" in n.name]
         assert len(hbm) == 1
-        assert hbm[0].capacity_gb == 21504.0
+        assert hbm[0].capacity_gb == 2304.0
 
     def test_topology_has_nodes(self):
-        hw = B300SuperChipA()
+        hw = B300SuperChip()
         assert len(hw.nodes) > 0
 
     def test_find_local_memory(self):
-        hw = B300SuperChipA()
+        hw = B300SuperChip()
         gpu = [n for n in hw.nodes
                if isinstance(n, Compute) and "nvidia-b300" in n.name][0]
         mem = hw.find_local_memory(gpu)
         assert isinstance(mem, Memory)
         assert "hbm3e" in mem.name
+
+    def test_aggregates_one_node(self):
+        hw = B300SuperChip()
+        components = {component.name: component for component in hw.nodes}
+
+        gpu = components["n0-nvidia-b300-sxm-0"]
+        cpu = components["n0-intel-xeon-6767p-0"]
+        assert gpu.tflops == {
+            "fp4": 108000.0, "fp8": 36000.0,
+            "bf16": 18000.0, "fp16": 18000.0, "fp32": 9000.0,
+        }
+        assert cpu.tflops == {
+            "bf16": 510.58, "fp16": 510.58, "int8": 1022.36,
+        }
+        assert components["n0-ddr5-0"].capacity_gb == 3072.0
+        assert components["n0-ssd"].capacity_gb == 3840.0
+        assert "n0-mellanox-cx8-0" in components
+        assert not any("nvswitch" in name for name in components)
+
+    def test_aggregates_node_bandwidths(self):
+        hw = B300SuperChip()
+        components = {component.name: component for component in hw.nodes}
+
+        hbm = hw.find_fabric(
+            components["n0-nvidia-b300-sxm-0"],
+            components["n0-hbm3e-0"])
+        gpu_pcie = hw.find_fabric(
+            components["n0-nvidia-b300-sxm-0"],
+            components["n0-hgx-pcie-switch"])
+        dram = hw.find_fabric(
+            components["n0-intel-xeon-6767p-0"],
+            components["n0-ddr5-0"])
+        infiniband = hw.find_fabric(
+            components["n0-mellanox-cx8-0"],
+            components["ib-switch"])
+
+        assert hbm.src_to_dst_bandwidth_gbs == 62000.0
+        assert gpu_pcie.src_to_dst_bandwidth_gbs == 1024.0
+        assert dram.src_to_dst_bandwidth_gbs == 665.6
+        assert infiniband.src_to_dst_bandwidth_gbs == 800.0

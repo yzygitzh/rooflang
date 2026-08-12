@@ -14,6 +14,7 @@ from rooflang.programs.dsv4_pro.optimization import (
     optimize_model_cluster_prefill,
 )
 from rooflang.programs.presets.b300 import B300Cluster
+from rooflang.programs.presets.gb300 import GB300Cluster
 from rooflang.programs.presets.h200 import H200Cluster
 from rooflang.runtime.simulator import Simulator
 
@@ -224,6 +225,24 @@ def test_h200_cluster_decode_uses_component_kinds(monkeypatch):
     ).run().measured_time_us > 0
 
 
+def test_decode_memory_mapping_uses_actual_node_width():
+    hardware = GB300Cluster(nvl_scope=64, n_nodes=1)
+    gpus, _, drams, ssds = optimization._cluster_resources(hardware)
+    gpus_by_node = {"n0": gpus}
+
+    mapped_drams = [optimization._nearby_memory(
+        gpu, gpus_by_node, drams) for gpu in gpus]
+    mapped_ssds = [optimization._nearby_memory(
+        gpu, gpus_by_node, ssds) for gpu in gpus]
+
+    assert mapped_drams[0] is drams["n0"][0]
+    assert mapped_drams[1] is drams["n0"][0]
+    assert mapped_drams[2] is drams["n0"][1]
+    assert mapped_drams[-1] is drams["n0"][-1]
+    assert all(mapped_drams.count(dram) == 2 for dram in drams["n0"])
+    assert mapped_ssds == ssds["n0"]
+
+
 def test_cp4_dp2_ep8_pp2_decode(monkeypatch):
     """Decode broadcasts Q and reads a disjoint KV shard on each CP rank."""
     monkeypatch.setattr(model, "N_LAYERS", 2)
@@ -302,6 +321,32 @@ def test_cp4_dp2_ep8_pp2_decode(monkeypatch):
         kernel for kernel in graph.kernels
         if isinstance(kernel, ReadInput) and "kv" in kernel.inputs
     }
+    assert all(
+        placement.get_tensor_memory(kernel.inputs["kv"]).kind == "ssd"
+        for kernel in kv_preloads
+    )
+    assert placement.get_tensor_memory(
+        read_input.inputs["tokens"]).kind == "dram"
+
+    pending = list(kv_preloads)
+    visited = set()
+    kv_roots = set()
+    while pending:
+        kernel = pending.pop()
+        if kernel in visited:
+            continue
+        visited.add(kernel)
+        predecessors = [edge.src for edge in graph._in_edges(kernel)]
+        if predecessors:
+            pending.extend(predecessors)
+        else:
+            kv_roots.add(kernel)
+    assert kv_roots
+    assert all(
+        placement.get_tensor_memory(tensor).kind == "ssd"
+        for kernel in kv_roots
+        for tensor in kernel.inputs.values()
+    )
     control_predecessors = {
         kernel for kernel in graph._dag.predecessors(read_input)
         if not graph._dag.edges[kernel, read_input]["mapping"]

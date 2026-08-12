@@ -476,6 +476,97 @@ class TestPassthroughResolution:
         assert passthrough[fan1.outputs["y"]] == [source.outputs["y"]]
         assert passthrough[fan2.outputs["y"]] == [source.outputs["y"]]
 
+    def test_converging_alias_paths_do_not_duplicate_storage_sources(self):
+        source = SyntheticKernel(outputs={"y": Tensor("bf16", (4,))})
+        fan = Nop(
+            inputs={"x": Tensor("bf16", (4,))},
+            outputs={
+                "a": Tensor("bf16", (4,)),
+                "b": Tensor("bf16", (4,)),
+            },
+        )
+        merge = Nop(
+            inputs={
+                "a": Tensor("bf16", (4,)),
+                "b": Tensor("bf16", (4,)),
+            },
+            outputs={"y": Tensor("bf16", (4,))},
+        )
+        graph = ComputeGraph()
+        for kernel in (source, fan, merge):
+            graph.add_kernel(kernel)
+        graph.add_data_edge(source, fan, {"y": "x"})
+        graph.add_data_edge(fan, merge, {"a": "a", "b": "b"})
+
+        passthrough = Simulator(
+            graph, Placement(), HardwareGraph())._build_passthrough()
+
+        assert passthrough[merge.outputs["y"]] == [source.outputs["y"]]
+
+
+class TestPeerUpdateDeduplication:
+    def test_each_running_kernel_recomputes_once_per_start_and_finish(self):
+        switch = Compute(name="switch", kind="switch")
+        gpus = [
+            Compute(name=f"gpu{i}", tflops={"bf16": 1000.0})
+            for i in range(3)
+        ]
+        hbms = [Memory(name=f"hbm{i}", capacity_gb=80.0)
+                for i in range(3)]
+        hardware = HardwareGraph()
+        hardware.add_node(switch)
+        for gpu, hbm in zip(gpus, hbms):
+            hardware.add_node(gpu)
+            hardware.add_node(hbm)
+            hardware.add_edge(FabricEdge(
+                name="hbm", src=gpu, dst=hbm,
+                src_to_dst_bandwidth_gbs=1000.0,
+                dst_to_src_bandwidth_gbs=1000.0,
+                is_full_duplex=False,
+            ))
+            hardware.add_edge(FabricEdge(
+                name="fabric", src=gpu, dst=switch,
+                src_to_dst_bandwidth_gbs=100.0,
+                dst_to_src_bandwidth_gbs=100.0,
+                is_full_duplex=True,
+            ))
+
+        graph = ComputeGraph()
+        placement = Placement(hardware=hardware, graph=graph)
+        collectives = []
+        for stream in range(2):
+            predecessor = SyntheticKernel(
+                outputs={"y": Tensor("bf16", (1,))})
+            collective = AllReduce(
+                total_bytes=200000.0, world=3, dtype="bf16")
+            collective.inputs = {
+                f"i{i}": Tensor("bf16", (1,)) for i in range(3)
+            }
+            collective.outputs = {
+                f"o{i}": Tensor("bf16", (1,)) for i in range(3)
+            }
+            graph.add_kernel(predecessor)
+            graph.add_kernel(collective)
+            graph.add_data_edge(predecessor, collective, {"y": "i0"})
+            placement.set_kernel_device(
+                predecessor, gpus[0], stream=stream)
+            _place_comm_tensors(placement, collective, hbms)
+            collectives.append(collective)
+
+        simulator = Simulator(graph, placement, hardware)
+        original = simulator._recompute_shares
+        calls = []
+
+        def record(running):
+            calls.append(running.kernel)
+            original(running)
+
+        simulator._recompute_shares = record
+        simulator.run()
+
+        assert all(calls.count(collective) == 2
+                   for collective in collectives)
+
 
 # ── OOM detection ───────────────────────────────────────────────────
 

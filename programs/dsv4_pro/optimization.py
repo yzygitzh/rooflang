@@ -104,7 +104,7 @@ def _place_comm_tensor_memories(g, placement):
 
 
 def _cluster_resources(hw):
-    """Return ordered GPUs and per-node CPU/DRAM resources."""
+    """Return ordered GPUs and per-node CPU/DRAM/SSD resources."""
     gpus = sorted(
         [c for c in hw.nodes if isinstance(c, Compute)
          and c.kind == "gpu"],
@@ -112,6 +112,7 @@ def _cluster_resources(hw):
             int(c.name.split("-")[0][1:]), int(c.name.rsplit("-", 1)[1])))
     cpus = defaultdict(list)
     drams = defaultdict(list)
+    ssds = defaultdict(list)
     for component in hw.nodes:
         prefix = component.name.split("-", 1)[0]
         if isinstance(component, Compute) \
@@ -119,10 +120,21 @@ def _cluster_resources(hw):
             cpus[prefix].append(component)
         elif isinstance(component, Memory) and component.kind == "dram":
             drams[prefix].append(component)
-    for resources in (*cpus.values(), *drams.values()):
+        elif isinstance(component, Memory) and component.kind == "ssd":
+            ssds[prefix].append(component)
+    for resources in (*cpus.values(), *drams.values(), *ssds.values()):
         resources.sort(key=lambda component: int(
             component.name.rsplit("-", 1)[1]))
-    return gpus, dict(cpus), dict(drams)
+    return gpus, dict(cpus), dict(drams), dict(ssds)
+
+
+def _nearby_memory(device, gpus_by_node, memories_by_node):
+    """Map a device to its proportional local memory within one node."""
+    node = device.name.split("-", 1)[0]
+    devices = gpus_by_node[node]
+    memories = memories_by_node[node]
+    device_rank = devices.index(device)
+    return memories[device_rank * len(memories) // len(devices)]
 
 
 def _validate_args(
@@ -280,7 +292,7 @@ def optimize_model_cluster_prefill(
         for stage, layer_count in enumerate(pp_partition)
         for _ in range(layer_count)
     ]
-    gpus, cpus, drams = _cluster_resources(hw)
+    gpus, cpus, drams, _ = _cluster_resources(hw)
 
     kv_barrier = layers[0].kv_persist_barrier
 
@@ -397,7 +409,10 @@ def optimize_model_cluster_decode(
         for stage, layer_count in enumerate(pp_partition)
         for _ in range(layer_count)
     ]
-    gpus, cpus, drams = _cluster_resources(hw)
+    gpus, cpus, drams, ssds = _cluster_resources(hw)
+    gpus_by_node = defaultdict(list)
+    for device in gpus:
+        gpus_by_node[device.name.split("-", 1)[0]].append(device)
     stage_gpus = [
         gpus[stage * ep:(stage + 1) * ep]
         for stage in range(pp_degree)
@@ -503,25 +518,24 @@ def optimize_model_cluster_decode(
 
     placement = Placement(hardware=hw, graph=g)
 
-    def nearby_dram(device):
-        node = device.name.split("-", 1)[0]
-        gpu_index = int(device.name.rsplit("-", 1)[1])
-        memories = drams[node]
-        return memories[min(gpu_index * len(memories) // 8,
-                            len(memories) - 1)]
-
+    # Keep the persistent KV source on SSD and materialize each CP×DP shard in
+    # its destination HBM during the preload phase.  The later comm-memory
+    # propagation carries this SSD placement through split-generated root
+    # Scatter kernels, so the unsplit external inputs do not consume DRAM.
     for layer_id, copies in enumerate(kv_read_cp_dp_copies):
         devices = stage_gpus[layer_stages[layer_id]]
         for rank, kernel in enumerate(copies):
             device = devices[rank]
             placement.set_kernel_device(kernel, device)
             placement.set_tensor_memory(
-                kernel.inputs["kv"], nearby_dram(device))
+                kernel.inputs["kv"],
+                _nearby_memory(device, gpus_by_node, ssds))
 
     first_devices = stage_gpus[0]
     placement.set_kernel_device(read_input, first_devices[0])
     placement.set_tensor_memory(
-        read_input.inputs["tokens"], nearby_dram(first_devices[0]))
+        read_input.inputs["tokens"],
+        _nearby_memory(first_devices[0], gpus_by_node, drams))
     for dp_rank, kernel in enumerate(emb_dp_copies):
         placement.set_kernel_device(
             kernel, first_devices[dp_rank * cp])

@@ -357,11 +357,11 @@ class Simulator:
         for fk in rk.fabric_keys:
             self._on_fab[fk].remove(rk)
         self._advance_peers(rk, now)
-        if self._on_dev.get(rk.device):
-            self._recompute_shares(self._on_dev[rk.device][0])
-        for fk in rk.fabric_keys:
-            if self._on_fab.get(fk):
-                self._recompute_shares(self._on_fab[fk][0])
+        # Every changed resource is described by rk even after rk itself has
+        # been removed.  Recompute the remaining users once as a set instead
+        # of once per fabric edge; a 64-way collective can occupy hundreds of
+        # edges that all lead to the same small set of running kernels.
+        self._recompute_shares(rk)
         self._resched_peers(rk)
         # Schedule next pending kernel on primary stream
         self._schedule_next_pending(key, now)
@@ -390,10 +390,14 @@ class Simulator:
             if kernel._requires_placement:
                 continue
             all_sources = []
+            seen_sources = set()
             for edge in self._graph._in_edges(kernel):
                 for out_name, _ in edge.mapping.items():
                     upstream_t = edge.src.outputs[out_name]
-                    all_sources.extend(pt.get(upstream_t, [upstream_t]))
+                    for source in pt.get(upstream_t, [upstream_t]):
+                        if source not in seen_sources:
+                            seen_sources.add(source)
+                            all_sources.append(source)
             if all_sources:
                 for t in kernel.outputs.values():
                     pt[t] = all_sources
@@ -475,23 +479,19 @@ class Simulator:
             else:
                 p.net_share = 1.0
 
-    def _advance_peers(self, rk: RunningKernel, now: float):
-        for p in self._on_dev.get(rk.device, []):
-            p.advance_to(now)
+    def _affected_peers(self, rk: RunningKernel) -> Set[RunningKernel]:
+        """Return each running user of rk's device/fabrics exactly once."""
+        peers = set(self._on_dev.get(rk.device, []))
         for fk in rk.fabric_keys:
-            for p in self._on_fab.get(fk, []):
-                p.advance_to(now)
+            peers.update(self._on_fab.get(fk, []))
+        return peers
+
+    def _advance_peers(self, rk: RunningKernel, now: float):
+        for p in self._affected_peers(rk):
+            p.advance_to(now)
 
     def _resched_peers(self, rk: RunningKernel):
-        seen: Set[RunningKernel] = set()
-        for p in self._on_dev.get(rk.device, []):
-            if p is not rk:
-                seen.add(p)
-        for fk in rk.fabric_keys:
-            for p in self._on_fab.get(fk, []):
-                if p is not rk:
-                    seen.add(p)
-        for p in seen:
+        for p in self._affected_peers(rk) - {rk}:
             self._push(p.eta(), "end", p.kernel, p.device, p.stream)
 
     # ── Resolution helpers ──────────────────────────────────────────

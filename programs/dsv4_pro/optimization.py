@@ -1,6 +1,6 @@
 """DeepSeek V4 Pro inference — graph splitting and placement strategies."""
 
-from collections import defaultdict
+from collections import defaultdict, deque
 
 from rooflang.language.hardware.component import Compute, Memory
 from rooflang.language.kernels.comm import (
@@ -59,30 +59,36 @@ def _place_comm_tensor_memories(g, placement):
         kernel for kernel in g.topological_sort()
         if isinstance(kernel, CommKernel)
     ]
+    comm_set = set(comms)
+    propagation = defaultdict(list)
 
-    def place_from_edges(comm):
-        changed = False
+    def connect(left, right):
+        propagation[left].append(right)
+        propagation[right].append(left)
+
+    for comm in comms:
         for edge in g._in_edges(comm):
             for output_name, input_name in edge.mapping.items():
-                memory = placement.get_tensor_memory(
-                    edge.src.outputs[output_name])
-                tensor = comm.inputs[input_name]
-                if memory is not None \
-                        and placement.get_tensor_memory(tensor) is None:
-                    placement.set_tensor_memory(tensor, memory)
-                    changed = True
+                source = edge.src.outputs[output_name]
+                target = comm.inputs[input_name]
+                if edge.src in comm_set:
+                    connect(source, target)
+                else:
+                    memory = placement.get_tensor_memory(source)
+                    if memory is not None \
+                            and placement.get_tensor_memory(target) is None:
+                        placement.set_tensor_memory(target, memory)
         for edge in g._out_edges(comm):
             for output_name, input_name in edge.mapping.items():
-                memory = placement.get_tensor_memory(
-                    edge.dst.inputs[input_name])
-                tensor = comm.outputs[output_name]
+                source = comm.outputs[output_name]
+                target = edge.dst.inputs[input_name]
+                if edge.dst in comm_set:
+                    continue
+                memory = placement.get_tensor_memory(target)
                 if memory is not None \
-                        and placement.get_tensor_memory(tensor) is None:
-                    placement.set_tensor_memory(tensor, memory)
-                    changed = True
-        return changed
+                        and placement.get_tensor_memory(source) is None:
+                    placement.set_tensor_memory(source, memory)
 
-    def place_root(comm):
         if isinstance(comm, (Gather, Reduce)):
             anchor = next(iter(comm.inputs.values()), None)
             targets = comm.outputs.values()
@@ -90,24 +96,23 @@ def _place_comm_tensor_memories(g, placement):
             anchor = next(iter(comm.outputs.values()), None)
             targets = comm.inputs.values()
         else:
-            return False
-        memory = placement.get_tensor_memory(anchor)
-        if memory is None:
-            return False
-        changed = False
+            continue
         for tensor in targets:
-            if placement.get_tensor_memory(tensor) is None:
-                placement.set_tensor_memory(tensor, memory)
-                changed = True
-        return changed
+            propagation[anchor].append(tensor)
 
-    changed = True
-    while changed:
-        changed = False
-        for sweep in (comms, reversed(comms)):
-            for comm in sweep:
-                changed |= place_from_edges(comm)
-                changed |= place_root(comm)
+    queue = deque(
+        tensor
+        for comm in comms
+        for tensor in (*comm.inputs.values(), *comm.outputs.values())
+        if placement.get_tensor_memory(tensor) is not None
+    )
+    while queue:
+        source = queue.popleft()
+        memory = placement.get_tensor_memory(source)
+        for target in propagation[source]:
+            if placement.get_tensor_memory(target) is None:
+                placement.set_tensor_memory(target, memory)
+                queue.append(target)
 
 
 def _cluster_a_resources(hw):
@@ -206,22 +211,38 @@ def _place_experts_and_routes(
 ):
     """Place expert weights and, for EP, bind routed buffers to owners."""
 
+    output_consumers = {}
+    input_producers = {}
+
+    def consumers_by_output(kernel):
+        if kernel not in output_consumers:
+            consumers = defaultdict(list)
+            for edge in g._out_edges(kernel):
+                for output_name, input_name in edge.mapping.items():
+                    consumers[output_name].append(
+                        edge.dst.inputs[input_name])
+            output_consumers[kernel] = consumers
+        return output_consumers[kernel]
+
+    def producers_by_input(kernel):
+        if kernel not in input_producers:
+            producers = defaultdict(list)
+            for edge in g._in_edges(kernel):
+                for output_name, input_name in edge.mapping.items():
+                    producers[input_name].append(
+                        edge.src.outputs[output_name])
+            input_producers[kernel] = producers
+        return input_producers[kernel]
+
     def set_output_memory(kernel, output_name, memory):
         placement.set_tensor_memory(kernel.outputs[output_name], memory)
-        for edge in g._out_edges(kernel):
-            if output_name not in edge.mapping:
-                continue
-            input_name = edge.mapping[output_name]
-            placement.set_tensor_memory(edge.dst.inputs[input_name], memory)
+        for tensor in consumers_by_output(kernel)[output_name]:
+            placement.set_tensor_memory(tensor, memory)
 
     def set_input_memory(kernel, input_name, memory):
         placement.set_tensor_memory(kernel.inputs[input_name], memory)
-        for edge in g._in_edges(kernel):
-            for output_name, mapped_input in edge.mapping.items():
-                if mapped_input != input_name:
-                    continue
-                placement.set_tensor_memory(
-                    edge.src.outputs[output_name], memory)
+        for tensor in producers_by_input(kernel)[input_name]:
+            placement.set_tensor_memory(tensor, memory)
 
     local_experts = N_EXPERTS // len(devices) if shard_experts else N_EXPERTS
     for expert_id in range(N_EXPERTS):

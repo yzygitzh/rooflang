@@ -16,4 +16,10 @@ from rooflang.programs.dsv4_pro.optimization import (
     optimize_model_superchip,
 )
 from rooflang.programs.dsv4_pro.simulation import simulate
-from rooflang.programs.dsv4_pro.visualization import visualize_layer
+
+
+def __getattr__(name):
+    if name == "visualize_layer":
+        from rooflang.programs.dsv4_pro.visualization import visualize_layer
+        return visualize_layer
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

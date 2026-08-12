@@ -28,6 +28,7 @@ Gather/Reduce left after fuse_kernels).
 
 from __future__ import annotations
 
+from collections import deque
 from typing import TYPE_CHECKING
 
 from rooflang.language.kernels.comm import (
@@ -97,10 +98,16 @@ def canonicalize_split_comms(graph: ComputeGraph, axis: str) -> None:
 
 def _same_device_set(
     collector: Kernel, distributor: Kernel, placement: Placement,
+    device_sets=None,
 ) -> bool:
     """Check whether two comm kernels use the same participant devices."""
-    return set(placement.infer_comm_devices(collector)) \
-        == set(placement.infer_comm_devices(distributor))
+    if device_sets is None:
+        device_sets = {}
+    for kernel in (collector, distributor):
+        if kernel not in device_sets:
+            device_sets[kernel] = frozenset(
+                placement.infer_comm_devices(kernel))
+    return device_sets[collector] == device_sets[distributor]
 
 
 def _create_collective(collector: Kernel, distributor: Kernel) -> Kernel | None:
@@ -129,6 +136,7 @@ def _create_collective(collector: Kernel, distributor: Kernel) -> Kernel | None:
 def _fuse_pairs(graph: ComputeGraph, placement: Placement) -> bool:
     """Fuse adjacent (Gather|Reduce) → (Scatter|Broadcast) pairs."""
     did_change = False
+    device_sets = {}
     while True:
         pairs = []
         for kernel in list(graph._dag.nodes):
@@ -143,7 +151,7 @@ def _fuse_pairs(graph: ComputeGraph, placement: Placement) -> bool:
                     if not isinstance(successor, CommKernel):
                         continue
                     if not _same_device_set(
-                            kernel, successor, placement):
+                            kernel, successor, placement, device_sets):
                         pairs.append((kernel, successor, True))
 
             if not isinstance(kernel, (Gather, Reduce)):
@@ -160,7 +168,8 @@ def _fuse_pairs(graph: ComputeGraph, placement: Placement) -> bool:
                 continue
             if kernel.world != successor.world:
                 continue
-            if not _same_device_set(kernel, successor, placement):
+            if not _same_device_set(
+                    kernel, successor, placement, device_sets):
                 continue
             pairs.append((kernel, successor, False))
 
@@ -331,23 +340,28 @@ def _bypass_pair(
 def _eliminate_dead(graph: ComputeGraph) -> bool:
     """Remove trivial comm nodes (single in-edge and single out-edge)."""
     did_change = False
-    while True:
-        to_remove = []
-        for kernel in list(graph._dag.nodes):
-            if not isinstance(kernel, CommKernel):
-                continue
-            in_edges = graph._in_edges(kernel)
-            out_edges = graph._out_edges(kernel)
-            if len(in_edges) == 1 and len(out_edges) == 1:
-                to_remove.append(kernel)
-
-        if not to_remove:
-            break
-
+    queue = deque(
+        kernel for kernel in graph._dag.nodes
+        if isinstance(kernel, CommKernel)
+    )
+    pending = set(queue)
+    while queue:
+        kernel = queue.popleft()
+        pending.discard(kernel)
+        if not graph._dag.has_node(kernel):
+            continue
+        in_edges = graph._in_edges(kernel)
+        out_edges = graph._out_edges(kernel)
+        if len(in_edges) != 1 or len(out_edges) != 1:
+            continue
+        neighbors = (in_edges[0].src, out_edges[0].dst)
+        graph.remove_identity(kernel)
         did_change = True
-        for kernel in to_remove:
-            if not graph._dag.has_node(kernel):
-                continue
-            graph.remove_identity(kernel)
+        for neighbor in neighbors:
+            if isinstance(neighbor, CommKernel) \
+                    and neighbor not in pending \
+                    and graph._dag.has_node(neighbor):
+                queue.append(neighbor)
+                pending.add(neighbor)
 
     return did_change

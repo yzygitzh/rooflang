@@ -180,6 +180,14 @@ class Placement:
 
     def _assign_tensor_memory(self, kernel: Kernel, device: Compute) -> None:
         mem = self._hardware.find_local_memory(device)
+        predecessor_memories = {}
+        if self._graph is not None:
+            for src, _, attr in self._graph._dag.in_edges(
+                    kernel, data=True):
+                for out_name, in_name in attr["mapping"].items():
+                    if in_name not in predecessor_memories:
+                        predecessor_memories[in_name] = self._memory.get(
+                            src.outputs[out_name])
 
         for t in kernel.weights.values():
             if t in self._memory:
@@ -189,25 +197,10 @@ class Placement:
         for name, t in kernel.inputs.items():
             if t in self._memory:
                 continue
-            pred_mem = self._predecessor_output_memory(kernel, name)
+            pred_mem = predecessor_memories.get(name)
             self._memory[t] = pred_mem if pred_mem else mem
 
         for t in kernel.outputs.values():
             if t in self._memory:
                 continue
             self._memory[t] = mem
-
-    def _predecessor_output_memory(
-        self, kernel: Kernel, input_name: str
-    ) -> Optional[Memory]:
-        if self._graph is None:
-            return None
-        for src, _, attr in self._graph._dag.in_edges(kernel, data=True):
-            mapping = attr["mapping"]
-            if not mapping:
-                continue
-            for out_name, in_name in mapping.items():
-                if in_name == input_name:
-                    src_tensor = src.outputs[out_name]
-                    return self._memory.get(src_tensor)
-        return None

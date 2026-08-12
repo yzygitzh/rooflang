@@ -12,7 +12,6 @@ from rooflang.programs.dsv4_pro.optimization import (
     optimize_model_superchip,
 )
 from rooflang.programs.dsv4_pro.simulation import simulate
-from rooflang.programs.dsv4_pro.visualization import visualize_layer
 
 
 HARDWARE_MAP = {
@@ -59,6 +58,8 @@ def main():
 
     # B. Visualization
     if args.visualization:
+        from rooflang.programs.dsv4_pro.visualization import visualize_layer
+
         viz_layer = None
         seeds = {emb, read_input}
         if layers:

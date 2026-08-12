@@ -11,9 +11,8 @@ from rooflang.language.optimization.comm import (
     canonicalize_split_comms, optimize_comms,
 )
 from rooflang.language.optimization.split import (
-    batch_split, batch_split_comm, context_split,
-    decode_attention_context_split, kv_persistence_split,
-    replicate_before,
+    batch_split, batch_split_comm, context_split_decode,
+    context_split_prefill, kv_persistence_split, replicate_before,
 )
 from rooflang.language.placement import Placement
 from rooflang.language.tensor import Tensor
@@ -319,11 +318,12 @@ def optimize_model_cluster_prefill(
 
     cp_emb_copies = []
     for copy in emb_copies:
-        _, split_copies, _ = g.split_kernel(context_split, copy, cp)
+        _, split_copies, _ = g.split_kernel(
+            context_split_prefill, copy, cp)
         cp_emb_copies.extend(split_copies)
     emb_copies = cp_emb_copies
     layer_copies = _split_prefill_state(
-        g, layer_copies, context_split, cp, "cp_dp")
+        g, layer_copies, context_split_prefill, cp, "cp_dp")
     barrier_copies = []
     for copy in barrier_dp_copies:
         _, split_copies, _ = g.split_kernel(
@@ -419,7 +419,7 @@ def optimize_model_cluster_decode(
     # projection chain while it is still adjacent to those kernels.
     kv_read_cp_copies = []
     for kv_read in kv_cache_reads:
-        _, copies, _ = g.split_kernel(context_split, kv_read, cp)
+        _, copies, _ = g.split_kernel(context_split_decode, kv_read, cp)
         kv_read_cp_copies.append(copies)
 
     barrier = layers[0].kv_persist_barrier
@@ -431,9 +431,9 @@ def optimize_model_cluster_decode(
     for layer in layers:
         cp_fields = {}
         _, cp_fields["kv_cache_fan"], _ = g.split_kernel(
-            context_split, layer.kv_cache_fan, cp)
+            context_split_decode, layer.kv_cache_fan, cp)
         sa_prev, cp_fields["sa"], sa_next = g.split_kernel(
-            decode_attention_context_split, layer.sa, cp)
+            context_split_decode, layer.sa, cp)
 
         q_broadcast = sa_prev["q"]
         for name in reversed(_DECODE_REPLICATED_FIELDS):

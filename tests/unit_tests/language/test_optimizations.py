@@ -20,8 +20,8 @@ from rooflang.language.optimization.comm import (
     canonicalize_split_comms, optimize_comms,
 )
 from rooflang.language.optimization.split import (
-    batch_split, batch_split_comm, column_split, context_split,
-    decode_attention_context_split, head_split, kv_persistence_split,
+    batch_split, batch_split_comm, column_split, context_split_decode,
+    context_split_prefill, head_split, kv_persistence_split,
     replicate_before, row_split,
 )
 from rooflang.language.utils import gemm_scale_bytes
@@ -664,7 +664,8 @@ class TestContextSplitGemm:
         self.kernel.inputs = {"x": Tensor("bf16", (2, 16, 64))}
         self.kernel.weights = {"w": Tensor("bf16", (64, 128))}
         self.kernel.outputs = {"y": Tensor("bf16", (2, 16, 128))}
-        self.prev, self.copies, self.nxt = context_split(self.kernel, N)
+        self.prev, self.copies, self.nxt = context_split_prefill(
+            self.kernel, N)
 
     def test_context_axis_and_kernel_work_are_sharded(self):
         assert isinstance(self.prev["x"], Scatter)
@@ -693,7 +694,7 @@ def test_context_split_attention_uses_full_logical_kv(attn_cls):
     }
     kernel.outputs = {"y": Tensor("bf16", (2, 16, 8 * 64))}
 
-    prev, copies, nxt = context_split(kernel, N)
+    prev, copies, nxt = context_split_prefill(kernel, N)
 
     assert isinstance(prev["q"], Scatter)
     assert isinstance(prev["kv"], Broadcast)
@@ -718,7 +719,7 @@ def test_context_split_dispatch_and_combine_port_axes():
     }
     dispatch.outputs = {
         f"o{i}": Tensor("bf16", (8, 64)) for i in range(8)}
-    _, dispatch_copies, dispatch_next = context_split(dispatch, N)
+    _, dispatch_copies, dispatch_next = context_split_prefill(dispatch, N)
     assert dispatch_copies[0].inputs["x"].shape == (2, 4, 64)
     assert dispatch_copies[0].outputs["o0"].shape == (2, 64)
     assert dispatch_next["o0"].dim == 0
@@ -727,7 +728,7 @@ def test_context_split_dispatch_and_combine_port_axes():
     combine.inputs = {
         f"i{i}": Tensor("bf16", (8, 64)) for i in range(8)}
     combine.outputs = {"y": Tensor("bf16", (2, 16, 64))}
-    combine_prev, combine_copies, _ = context_split(combine, N)
+    combine_prev, combine_copies, _ = context_split_prefill(combine, N)
     assert combine_prev["i0"].dim == 0
     assert combine_copies[0].inputs["i0"].shape == (2, 64)
     assert combine_copies[0].outputs["y"].shape == (2, 4, 64)
@@ -738,7 +739,7 @@ def test_context_split_nop_keeps_dummy_output_shape():
         inputs={"kv": Tensor("bf16", (8, 16, 64))},
         outputs={"done": Tensor("int32", (1,))},
     )
-    prev, copies, nxt = context_split(nop, N)
+    prev, copies, nxt = context_split_prefill(nop, N)
 
     assert isinstance(prev["kv"], Scatter)
     assert all(copy.inputs["kv"].shape == (8, 4, 64)
@@ -749,14 +750,14 @@ def test_context_split_nop_keeps_dummy_output_shape():
                for tensor in nxt["done"].inputs.values())
 
 
-def test_decode_attention_context_split_broadcasts_q_and_shards_kv():
+def test_context_split_decode_attention_broadcasts_q_and_shards_kv():
     kernel = SparseAttn(8, 8, 1, 1, 8, 12, 64, "bf16", kv_factor=1)
     kernel.inputs = {
         "q": Tensor("bf16", (8, 1, 8 * 64)),
         "kv": Tensor("bf16", (8, 12, 64)),
     }
     kernel.outputs = {"y": Tensor("bf16", (8, 1, 8 * 64))}
-    prev, copies, nxt = decode_attention_context_split(kernel, N)
+    prev, copies, nxt = context_split_decode(kernel, N)
 
     assert isinstance(prev["q"], Broadcast)
     assert isinstance(prev["kv"], Scatter)
@@ -1073,7 +1074,7 @@ class TestBatchAndContextSplitMove:
             assert copy.input_bytes == copy.output_bytes
 
     def test_context_split(self):
-        _, copies, _ = context_split(self.move, N)
+        _, copies, _ = context_split_prefill(self.move, N)
         assert len(copies) == N
         for copy in copies:
             assert copy.inputs["src0"].shape == (8, 4, 64)

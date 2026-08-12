@@ -88,7 +88,7 @@ def _make_dependency_gather(tensor, n):
     return comm
 
 
-def decode_attention_context_split(kernel, n):
+def _context_split_attn_decode(kernel, n):
     """Split one decode attention over equal-size persistent KV shards."""
     if not isinstance(kernel, SparseAttn):
         raise TypeError("decode attention split requires SparseAttn")
@@ -358,17 +358,29 @@ def head_split(kernel, n):
 # ── context_split ─────────────────────────────────────────────────────
 
 
-def context_split(kernel, n):
+def context_split_prefill(kernel, n):
+    """Apply context parallelism using the prefill attention strategy."""
+    return _context_split(kernel, n, is_prefill=True)
+
+
+def context_split_decode(kernel, n):
+    """Apply context parallelism using the decode attention strategy."""
+    return _context_split(kernel, n, is_prefill=False)
+
+
+def _context_split(kernel, n, *, is_prefill):
     """Shard token work along sequence dim 1 while preserving batch size.
 
     Expert-token tensors produced by TokenDispatch and consumed by
     TokenCombine are flattened as (M_e, D), so those ports shard dim 0.
-    Attention receives a logical full-KV input through AllGather.  Simulator
-    passthrough keeps its physical storage backed by the distributed source
-    shards, while each rank accounts for processing all KV blocks in the ring.
+    Prefill attention shards Q and receives logical full KV through AllGather;
+    decode attention broadcasts Q and keeps KV sharded.
     """
     if isinstance(kernel, (Attn, SparseAttn)):
-        return _context_split_attn(kernel, n)
+        if is_prefill:
+            return _context_split_attn_prefill(kernel, n)
+        else:
+            return _context_split_attn_decode(kernel, n)
 
     prev_comms = {
         port: _make_scatter(
@@ -400,7 +412,7 @@ def _context_port_dim(kernel, port, *, is_input):
     return 1
 
 
-def _context_split_attn(kernel, n):
+def _context_split_attn_prefill(kernel, n):
     """Context/ring split for dense and sparse attention."""
     q_tensor = kernel.inputs["q"]
     kv_tensor = kernel.inputs["kv"]

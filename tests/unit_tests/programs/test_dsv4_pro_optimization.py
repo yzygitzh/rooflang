@@ -201,16 +201,17 @@ def test_cp4_dp2_ep8_pp2_decode(monkeypatch):
         pp_partition=[1, 1], n_gpus=16)
 
     for layer_id, layer in enumerate(layers):
+        copies = layer._decode_copies
         q_broadcasts = {
             graph._in_edges(copy)[0].src
-            for copy in layer._wq_a_cp_dp_copies
+            for copy in copies["cp_dp"]["wq_a"]
         }
         assert len(q_broadcasts) == 2
         assert all(isinstance(kernel, Broadcast)
                    for kernel in q_broadcasts)
         assert all(kernel.world == 4 for kernel in q_broadcasts)
 
-        attention = layer._sa_cp_dp_copies
+        attention = copies["cp_dp"]["sa"]
         assert len(attention) == 8
         assert all(isinstance(kernel, SparseAttn)
                    for kernel in attention)
@@ -224,10 +225,11 @@ def test_cp4_dp2_ep8_pp2_decode(monkeypatch):
         assert sorted(
             int(placement.get_kernel_device(kernel).device.name.rsplit(
                 "-", 1)[1])
-            for kernel in layer._wkv_dp_copies
+            for kernel in copies["dp"]["wkv"]
         ) == [0, 4]
 
-    barriers = layers[0]._kv_persist_barrier_cp_dp_copies
+    barriers = [kernel for kernel in graph.kernels
+                if isinstance(kernel, Nop)]
     assert len(barriers) == 8
     assert all(isinstance(barrier, Nop) for barrier in barriers)
     assert all(barrier not in placement.placed_kernels
@@ -253,6 +255,7 @@ def test_cp4_dp2_ep8_pp2_decode(monkeypatch):
     ]
     assert len(reduce_scatters) == 2 * 2
     assert all(kernel.world == 4 for kernel in reduce_scatters)
+    assert not any(isinstance(kernel, Move) for kernel in graph.kernels)
 
     result = Simulator(graph, placement, hw).run()
     assert result.total_time_us > 0
@@ -279,7 +282,7 @@ def test_cp_decode_broadcasts_q_between_same_stage_layers(monkeypatch):
     q_broadcasts = {
         graph._in_edges(copy)[0].src
         for layer in layers
-        for copy in layer._wq_a_cp_dp_copies
+        for copy in layer._decode_copies["cp_dp"]["wq_a"]
     }
     assert len(q_broadcasts) == 2 * 2
     assert all(isinstance(kernel, Broadcast) and kernel.world == 4

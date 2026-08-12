@@ -6,14 +6,12 @@ from rooflang.language.hardware.component import Compute, Memory
 from rooflang.language.kernels.comm import (
     Broadcast, CommKernel, Gather, Reduce, Scatter,
 )
-from rooflang.language.kernels.identity import Move
 from rooflang.language.optimization.comm import optimize_comms
 from rooflang.language.optimization.split import (
     batch_split, context_split_decode, context_split_prefill, general_dup,
     kv_persistence_split,
 )
 from rooflang.language.placement import Placement
-from rooflang.language.tensor import Tensor
 
 from rooflang.programs.dsv4_pro.config import (
     COMPRESS_RATIOS, N_EXPERTS, TOPK, WINDOW,
@@ -30,6 +28,10 @@ _PREFILL_PARALLEL_FIELDS = (
 
 _DECODE_REPLICATED_FIELDS = (
     "wq_a", "q_norm", "wq_b",
+)
+
+_DECODE_DP_ONLY_FIELDS = (
+    "bridge", "attn_norm", "attn_fan", "wkv", "kv_norm",
 )
 
 _DECODE_SHARDED_FIELDS = (
@@ -404,84 +406,77 @@ def optimize_model_cluster_decode(
     # DP comes first so every later CP split operates within one independent
     # batch shard. Communication kernels are created only as boundaries of
     # compute splits; existing communication kernels are never split directly.
-    dp_split = batch_split
-    _, emb_dp_copies, _ = g.split_kernel(dp_split, emb, dp)
+    _, emb_dp_copies, _ = g.split_kernel(batch_split, emb, dp)
     _, final_norm_dp_copies, _ = g.split_kernel(
-        dp_split, final_norm, dp)
-    _, logits_dp_copies, _ = g.split_kernel(dp_split, logits, dp)
-    _, sampling_dp_copies, _ = g.split_kernel(dp_split, sampling, dp)
+        batch_split, final_norm, dp)
+    _, logits_dp_copies, _ = g.split_kernel(batch_split, logits, dp)
+    _, sampling_dp_copies, _ = g.split_kernel(batch_split, sampling, dp)
 
-    prefix_fields = (
-        "bridge", "attn_norm", "attn_fan", "wkv", "kv_norm",
-    )
     dp_fields_by_layer = []
+    copies_by_layer = []
     for layer in layers:
-        fields = {}
+        dp_fields = {}
         for name in (
-            *prefix_fields,
+            *_DECODE_DP_ONLY_FIELDS,
             *_DECODE_REPLICATED_FIELDS,
             *_DECODE_SHARDED_FIELDS,
             "sa", "kv_cache_fan",
         ):
             _, copies, _ = g.split_kernel(
-                dp_split, getattr(layer, name), dp)
-            fields[name] = copies
-            if name in prefix_fields:
-                setattr(layer, f"_{name}_dp_copies", copies)
-        layer._decode_dp_fields = {
-            name: fields[name] for name in prefix_fields
+                batch_split, getattr(layer, name), dp)
+            dp_fields[name] = copies
+        layer_copies = {
+            "dp": {
+                name: dp_fields[name] for name in _DECODE_DP_ONLY_FIELDS
+            },
+            "cp_dp": {},
         }
-        dp_fields_by_layer.append(fields)
+        layer._decode_copies = layer_copies
+        dp_fields_by_layer.append(dp_fields)
+        copies_by_layer.append(layer_copies)
 
     kv_read_dp_copies = []
     for kv_read in kv_cache_reads:
-        _, copies, _ = g.split_kernel(dp_split, kv_read, dp)
+        _, copies, _ = g.split_kernel(batch_split, kv_read, dp)
         kv_read_dp_copies.append(copies)
 
     barrier = layers[0].kv_persist_barrier
-    _, barrier_dp_copies, _ = g.split_kernel(dp_split, barrier, dp)
+    _, barrier_dp_copies, _ = g.split_kernel(batch_split, barrier, dp)
 
     # Restore each independent DP subgraph before CP is introduced.
     optimize_comms(g)
 
     # Apply CP separately inside every DP subgraph. Each attention split now
     # creates its own Q Broadcast and output Reduce for that DP group.
-    cp_context_split = context_split_decode
-    cp_batch_split = batch_split
-    cp_barrier_split = kv_persistence_split
-
     kv_read_cp_dp_copies = []
-    for layer_id, dp_copies in enumerate(kv_read_dp_copies):
+    for dp_copies in kv_read_dp_copies:
         cp_dp_copies = []
         for copy in dp_copies:
-            _, copies, _ = g.split_kernel(cp_context_split, copy, cp)
+            _, copies, _ = g.split_kernel(context_split_decode, copy, cp)
             cp_dp_copies.extend(copies)
         kv_read_cp_dp_copies.append(cp_dp_copies)
-        kv_cache_reads[layer_id]._cp_dp_copies = cp_dp_copies
 
     barrier_copies = []
     for copy in barrier_dp_copies:
-        _, copies, _ = g.split_kernel(cp_barrier_split, copy, cp)
+        _, copies, _ = g.split_kernel(kv_persistence_split, copy, cp)
         barrier_copies.extend(copies)
-    for layer in layers:
-        layer._kv_persist_barrier_cp_dp_copies = barrier_copies
 
-    for layer, dp_fields in zip(layers, dp_fields_by_layer):
-        cp_fields = {
-            name: []
-            for name in (
-                *_DECODE_REPLICATED_FIELDS,
-                *_DECODE_SHARDED_FIELDS,
-                "sa", "kv_cache_fan",
-            )
-        }
+    cp_field_names = (
+        *_DECODE_REPLICATED_FIELDS,
+        *_DECODE_SHARDED_FIELDS,
+        "sa", "kv_cache_fan",
+    )
+    for dp_fields, layer_copies in zip(
+            dp_fields_by_layer, copies_by_layer):
+        cp_fields = {name: [] for name in cp_field_names}
         for dp_rank in range(dp):
             _, copies, _ = g.split_kernel(
-                cp_context_split, dp_fields["kv_cache_fan"][dp_rank], cp)
+                context_split_decode,
+                dp_fields["kv_cache_fan"][dp_rank], cp)
             cp_fields["kv_cache_fan"].extend(copies)
 
             sa_prev, copies, _ = g.split_kernel(
-                cp_context_split, dp_fields["sa"][dp_rank], cp)
+                context_split_decode, dp_fields["sa"][dp_rank], cp)
             cp_fields["sa"].extend(copies)
 
             q_broadcast = sa_prev["q"]
@@ -492,13 +487,10 @@ def optimize_model_cluster_decode(
 
             for name in _DECODE_SHARDED_FIELDS:
                 _, copies, _ = g.split_kernel(
-                    cp_batch_split, dp_fields[name][dp_rank], cp)
+                    batch_split, dp_fields[name][dp_rank], cp)
                 cp_fields[name].extend(copies)
 
-        for name, copies in cp_fields.items():
-            setattr(layer, f"_{name}_cp_dp_copies", copies)
-        layer._kv_persist_fan_cp_dp_copies = (
-            layer._kv_cache_fan_cp_dp_copies)
+        layer_copies["cp_dp"] = cp_fields
 
     optimize_comms(g)
 
@@ -537,29 +529,21 @@ def optimize_model_cluster_decode(
             placement.set_kernel_device(
                 kernel, final_devices[dp_rank * cp])
 
-    for layer_id, layer in enumerate(layers):
+    for layer_id, (layer, layer_copies) in enumerate(
+            zip(layers, copies_by_layer)):
         devices = stage_gpus[layer_stages[layer_id]]
-        fields = layer._decode_dp_fields
-        for name in prefix_fields:
-            for dp_rank, kernel in enumerate(fields[name]):
+        for copies in layer_copies["dp"].values():
+            for dp_rank, kernel in enumerate(copies):
                 placement.set_kernel_device(
                     kernel, devices[dp_rank * cp])
 
-        for name in (
-            *_DECODE_REPLICATED_FIELDS,
-            *_DECODE_SHARDED_FIELDS,
-            "sa", "kv_cache_fan",
-        ):
-            copies = getattr(
-                layer, f"_{name}_cp_dp_copies", None)
-            if copies is None:
-                continue
+        for copies in layer_copies["cp_dp"].values():
             for rank, kernel in enumerate(copies):
                 placement.set_kernel_device(kernel, devices[rank])
 
         route_fields = {
-            "dispatch": layer._dispatch_cp_dp_copies,
-            "combine": layer._combine_cp_dp_copies,
+            name: layer_copies["cp_dp"][name]
+            for name in ("dispatch", "combine")
         }
         _place_experts_and_routes(
             g, layer, route_fields, devices, placement, hw,
@@ -577,46 +561,6 @@ def optimize_model_cluster_decode(
         output_memory = hw.find_local_memory(final_devices[rank])
         for tensor in barrier_copy.outputs.values():
             placement.set_tensor_memory(tensor, output_memory)
-
-    # Restore direct cross-memory dependencies simplified before final
-    # placement with explicit identity Moves.
-    for kernel in list(g.topological_sort()):
-        if isinstance(kernel, CommKernel):
-            continue
-        for edge in list(g._out_edges(kernel)):
-            if isinstance(edge.dst, CommKernel):
-                continue
-            mismatched = {}
-            tensors = []
-            for output_name, input_name in edge.mapping.items():
-                output_tensor = edge.src.outputs[output_name]
-                input_tensor = edge.dst.inputs[input_name]
-                source_memory = placement.get_tensor_memory(output_tensor)
-                target_memory = placement.get_tensor_memory(input_tensor)
-                if source_memory is target_memory:
-                    continue
-                mismatched[output_name] = input_name
-                tensors.append(
-                    (output_tensor, source_memory, target_memory))
-            if not mismatched:
-                continue
-            move = Move()
-            move.inputs = {
-                f"src{index}": Tensor(tensor.dtype, tensor.shape)
-                for index, (tensor, _, _) in enumerate(tensors)
-            }
-            move.outputs = {
-                f"dst{index}": Tensor(tensor.dtype, tensor.shape)
-                for index, (tensor, _, _) in enumerate(tensors)
-            }
-            g.insert_identity(move, edge.src, edge.dst, mismatched)
-            source_device = placement.get_tensor_device(tensors[0][0])
-            placement.set_kernel_device(move, source_device)
-            for index, (_, source_memory, target_memory) in enumerate(tensors):
-                placement.set_tensor_memory(
-                    move.inputs[f"src{index}"], source_memory)
-                placement.set_tensor_memory(
-                    move.outputs[f"dst{index}"], target_memory)
 
     _place_comm_tensor_memories(g, placement)
     g.validate()

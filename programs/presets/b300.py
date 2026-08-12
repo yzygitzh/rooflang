@@ -17,7 +17,7 @@ class B300Cluster(HardwareGraph):
       - 2 Intel Xeon 6767P CPUs connected via QPI, each with 1.5 TB DDR5.
       - 1 CPU PCIe switch connecting both CPUs to HGX PCIe switch.
       - 8 Mellanox CX8 NICs (800G NDR IB).
-      - 1 SSD (3.84 TB NVMe) under CPU-0.
+      - 8 SSDs (3.84 TB NVMe each) attached to the HGX PCIe switch.
     Inter-node: all NICs connect to a shared IB switch.
     """
 
@@ -47,14 +47,13 @@ class B300Cluster(HardwareGraph):
 
             hbms = [Memory(name=f"{p}hbm3e-{i}", capacity_gb=288.0) for i in range(8)]
             drams = [Memory(name=f"{p}ddr5-{i}", capacity_gb=1536.0) for i in range(2)]
-            ssd = Memory(name=f"{p}ssd", capacity_gb=3840.0)
+            ssds = [Memory(name=f"{p}ssd-{i}", capacity_gb=3840.0)
+                    for i in range(8)]
 
-            nvme_pcie_switch = Compute(name=f"{p}nvme-pcie-switch")
-
-            for comp in (gpus + [nvswitch, hgx_pcie_switch, cpu_pcie_switch,
-                                 nvme_pcie_switch] + cpus + nics):
+            for comp in (gpus + [nvswitch, hgx_pcie_switch,
+                                 cpu_pcie_switch] + cpus + nics):
                 self.add_node(comp)
-            for mem in (hbms + drams + [ssd]):
+            for mem in (hbms + drams + ssds):
                 self.add_node(mem)
 
             for i in range(8):
@@ -94,6 +93,12 @@ class B300Cluster(HardwareGraph):
                     dst_to_src_bandwidth_gbs=100.0,
                     is_full_duplex=True, alpha_us=1.0,
                 ))
+                self.add_edge(FabricEdge(
+                    name="pcie", src=ssds[i], dst=hgx_pcie_switch,
+                    src_to_dst_bandwidth_gbs=14.0,
+                    dst_to_src_bandwidth_gbs=7.0,
+                    is_full_duplex=True, alpha_us=50.0,
+                ))
 
             for s in range(2):
                 self.add_edge(FabricEdge(
@@ -121,18 +126,6 @@ class B300Cluster(HardwareGraph):
                 dst_to_src_bandwidth_gbs=512.0,
                 is_full_duplex=True, alpha_us=0.5,
             ))
-            self.add_edge(FabricEdge(
-                name="pcie", src=cpus[0], dst=nvme_pcie_switch,
-                src_to_dst_bandwidth_gbs=64.0,
-                dst_to_src_bandwidth_gbs=64.0,
-                is_full_duplex=True, alpha_us=0.5,
-            ))
-            self.add_edge(FabricEdge(
-                name="pcie", src=ssd, dst=nvme_pcie_switch,
-                src_to_dst_bandwidth_gbs=14.0,
-                dst_to_src_bandwidth_gbs=7.0,
-                is_full_duplex=True, alpha_us=50.0,
-            ))
 
     def find_aggregate_bandwidth(self, devices: List[Compute]) -> float:
         """B300 aggregate BW: NVLink intra-node, multi-rail IB inter-node."""
@@ -151,6 +144,8 @@ class B300SuperChip(HardwareGraph):
     components from one eight-GPU B300 node. PCIe edge bandwidths are
     aggregated over the represented links. There is intentionally no
     NVSwitch because the eight GPUs are modeled as one compute component.
+    The eight SSDs are likewise represented by one aggregate SSD attached
+    directly to the HGX PCIe switch.
     """
 
     def __init__(self):
@@ -167,14 +162,13 @@ class B300SuperChip(HardwareGraph):
         })
         nic = Compute(name="n0-mellanox-cx8-0")
         ib_switch = Compute(name="ib-switch")
-        nvme_pcie_switch = Compute(name="n0-nvme-pcie-switch")
 
         hbm = Memory(name="n0-hbm3e-0", capacity_gb=2304.0)
         dram = Memory(name="n0-ddr5-0", capacity_gb=3072.0)
-        ssd = Memory(name="n0-ssd", capacity_gb=3840.0)
+        ssd = Memory(name="n0-ssd", capacity_gb=30720.0)
 
         for comp in [gpu, hgx_pcie_switch, cpu_pcie_switch,
-                     cpu, nic, ib_switch, nvme_pcie_switch]:
+                     cpu, nic, ib_switch]:
             self.add_node(comp)
         for mem in [hbm, dram, ssd]:
             self.add_node(mem)
@@ -228,14 +222,8 @@ class B300SuperChip(HardwareGraph):
             is_full_duplex=False, alpha_us=0.1,
         ))
         self.add_edge(FabricEdge(
-            name="pcie", src=cpu, dst=nvme_pcie_switch,
-            src_to_dst_bandwidth_gbs=64.0,
-            dst_to_src_bandwidth_gbs=64.0,
-            is_full_duplex=True, alpha_us=0.5,
-        ))
-        self.add_edge(FabricEdge(
-            name="pcie", src=ssd, dst=nvme_pcie_switch,
-            src_to_dst_bandwidth_gbs=14.0,
-            dst_to_src_bandwidth_gbs=7.0,
+            name="pcie", src=ssd, dst=hgx_pcie_switch,
+            src_to_dst_bandwidth_gbs=112.0,
+            dst_to_src_bandwidth_gbs=56.0,
             is_full_duplex=True, alpha_us=50.0,
         ))

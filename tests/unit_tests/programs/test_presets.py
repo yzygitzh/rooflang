@@ -23,6 +23,20 @@ class TestB300AggregateOverride:
                 if isinstance(n, Compute) and "nvidia-b300" in n.name]
         assert hw.find_aggregate_bandwidth(gpus[:1]) == float("inf")
 
+    def test_eight_ssds_attach_directly_to_hgx(self):
+        hw = B300Cluster(n_nodes=1)
+        components = {component.name: component for component in hw.nodes}
+        hgx = components["n0-hgx-pcie-switch"]
+        ssds = [components[f"n0-ssd-{index}"] for index in range(8)]
+
+        assert "n0-nvme-pcie-switch" not in components
+        for ssd in ssds:
+            assert ssd.capacity_gb == 3840.0
+            path = hw.find_fabric_path(ssd, hgx)
+            assert len(path) == 1
+            assert path[0].src_to_dst_bandwidth_gbs == 14.0
+            assert path[0].dst_to_src_bandwidth_gbs == 7.0
+
 
 class TestB300SuperChip:
     def test_single_gpu(self):
@@ -64,9 +78,10 @@ class TestB300SuperChip:
             "bf16": 510.58, "fp16": 510.58, "int8": 1022.36,
         }
         assert components["n0-ddr5-0"].capacity_gb == 3072.0
-        assert components["n0-ssd"].capacity_gb == 3840.0
+        assert components["n0-ssd"].capacity_gb == 30720.0
         assert "n0-mellanox-cx8-0" in components
         assert not any("nvswitch" in name for name in components)
+        assert not any("nvme-pcie-switch" in name for name in components)
 
     def test_aggregates_node_bandwidths(self):
         hw = B300SuperChip()
@@ -84,8 +99,12 @@ class TestB300SuperChip:
         infiniband = hw.find_fabric(
             components["n0-mellanox-cx8-0"],
             components["ib-switch"])
+        ssd_pcie = hw.find_fabric(
+            components["n0-ssd"], components["n0-hgx-pcie-switch"])
 
         assert hbm.src_to_dst_bandwidth_gbs == 62000.0
         assert gpu_pcie.src_to_dst_bandwidth_gbs == 1024.0
         assert dram.src_to_dst_bandwidth_gbs == 665.6
         assert infiniband.src_to_dst_bandwidth_gbs == 800.0
+        assert ssd_pcie.src_to_dst_bandwidth_gbs == 112.0
+        assert ssd_pcie.dst_to_src_bandwidth_gbs == 56.0

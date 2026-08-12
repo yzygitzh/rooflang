@@ -6,7 +6,7 @@ import pytest
 
 from rooflang.language.hardware.component import Compute
 from rooflang.language.kernels.comm import Broadcast, ReduceScatter
-from rooflang.language.kernels.forward import Nop, Slice, SparseAttn
+from rooflang.language.kernels.forward import Nop, ReadInput, Slice, SparseAttn
 from rooflang.programs.dsv4_pro import optimization
 from rooflang.programs.dsv4_pro import model
 from rooflang.programs.dsv4_pro.optimization import (
@@ -247,8 +247,24 @@ def test_cp4_dp2_ep8_pp2_decode(monkeypatch):
     ]
     assert len(reduce_scatters) == 2 * 2
     assert all(kernel.world == 4 for kernel in reduce_scatters)
-    result = Simulator(graph, placement, hw).run()
+    kv_preloads = {
+        kernel for kernel in graph.kernels
+        if isinstance(kernel, ReadInput) and "kv" in kernel.inputs
+    }
+    control_predecessors = {
+        kernel for kernel in graph._dag.predecessors(read_input)
+        if not graph._dag.edges[kernel, read_input]["mapping"]
+    }
+    assert control_predecessors == kv_preloads
+
+    result = Simulator(
+        graph, placement, hw, measurement_start=read_input).run()
     assert result.total_time_us > 0
+    assert max(
+        entry.end_us for entry in result.trace
+        if entry.kernel in kv_preloads
+    ) <= result.measurement_start_us
+    assert result.measured_time_us < result.total_time_us
 
 
 def test_cp_decode_broadcasts_q_between_same_stage_layers(monkeypatch):

@@ -136,6 +136,8 @@ def export_trace(result: SimulationResult, path: str) -> None:
         "traceEvents": events,
         "otherData": {
             "total_time_us": result.total_time_us,
+            "measurement_start_us": result.measurement_start_us,
+            "measured_time_us": result.measured_time_us,
             f"mfu_{global_top_dtype}": mfu_top_global,
             "peak_memory": peak_memory,
             "gpu_stats": gpu_stats,

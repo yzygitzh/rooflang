@@ -137,6 +137,10 @@ class TestExportTrace:
             data = json.load(f)
         other = data["otherData"]
         assert other["total_time_us"] == pytest.approx(result.total_time_us)
+        assert other["measurement_start_us"] == pytest.approx(
+            result.measurement_start_us)
+        assert other["measured_time_us"] == pytest.approx(
+            result.measured_time_us)
         assert isinstance(other["peak_memory"], list)
         assert other["peak_memory"][0]["name"] == "hbm"
         assert other["peak_memory"][0]["bytes"] == result.peak_memory[hbm]

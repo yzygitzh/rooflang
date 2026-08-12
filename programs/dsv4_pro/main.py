@@ -40,6 +40,11 @@ def main():
     parser.add_argument(
         "--pp-partition", type=int, nargs="+", default=[N_LAYERS],
         help="Layer counts assigned to successive pipeline stages")
+    parser.add_argument(
+        "--measurement_start", choices=("read_input", "none"),
+        default="read_input",
+        help="Kernel marking measurement start, or measure the full run "
+             "(default: read_input)")
     parser.add_argument("--visualization", action="store_true",
                         help="Export layer graph visualization")
     args = parser.parse_args()
@@ -91,10 +96,16 @@ def main():
 
     # D. Simulation
     trace_name = f"dsv4_pro_{args.stage}_{args.hardware}.json"
-    result = simulate(g, p, hw, trace_name)
+    measurement_start = (
+        read_input if args.measurement_start == "read_input" else None)
+    result = simulate(
+        g, p, hw, trace_name, measurement_start=measurement_start)
+    duration_us = result.measured_time_us
     print(f"{args.stage} ({args.hardware}): "
-          f"{result.total_time_us:.1f} us "
-          f"({result.total_time_us / 1000:.1f} ms)")
+          f"{duration_us:.1f} us ({duration_us / 1000:.1f} ms)")
+    if result.measurement_start_us:
+        print(f"KV preload: {result.measurement_start_us:.1f} us "
+              f"({result.measurement_start_us / 1000:.1f} ms)")
 
 
 if __name__ == "__main__":

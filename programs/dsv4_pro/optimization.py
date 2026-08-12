@@ -494,6 +494,13 @@ def optimize_model_cluster_decode(
 
     optimize_comms(g)
 
+    # Treat KV loading as a preload phase. The token reader marks the start of
+    # the measured decode step and cannot run until every DP×CP KV shard has
+    # been materialized in its destination HBM.
+    for copies in kv_read_cp_dp_copies:
+        for kv_read in copies:
+            g.add_control_edge(kv_read, read_input)
+
     placement = Placement(hardware=hw, graph=g)
 
     def nearby_dram(device):

@@ -76,10 +76,13 @@ class TraceEntry:
 
 class SimulationResult:
     def __init__(self, trace: List[TraceEntry], total_time_us: float,
-                 peak_memory: Dict[Memory, float]):
+                 peak_memory: Dict[Memory, float],
+                 measurement_start_us: float = 0.0):
         self.trace = trace
         self.total_time_us = total_time_us
         self.peak_memory = peak_memory
+        self.measurement_start_us = measurement_start_us
+        self.measured_time_us = total_time_us - measurement_start_us
 
 
 class RunningKernel:
@@ -154,10 +157,12 @@ class Simulator:
     """Discrete-event roofline simulator with resource contention."""
 
     def __init__(self, graph: ComputeGraph, placement: Placement,
-                 hardware: HardwareGraph) -> None:
+                 hardware: HardwareGraph,
+                 measurement_start: Kernel | None = None) -> None:
         self._graph = graph
         self._placement = placement
         self._hardware = hardware
+        self._measurement_start = measurement_start
 
     def run(self) -> SimulationResult:
         """Execute DES and return trace + total time."""
@@ -201,8 +206,8 @@ class Simulator:
                     _seen_wid.add(key)
                 self._mem_usage[mem] += t.size_bytes
                 self._alive[mem].add((t, "weight"))
-            is_root = not list(self._graph._dag.predecessors(kernel))
-            if is_root:
+            has_data_predecessor = bool(self._graph._in_edges(kernel))
+            if not has_data_predecessor:
                 inputs_for_kernel = []
                 for t in kernel.inputs.values():
                     mem = self._placement.get_tensor_memory(t)
@@ -230,9 +235,12 @@ class Simulator:
             if typ == "start":
                 key = (dev, stream)
                 if key in self._stream_active:
-                    self._stream_pending.setdefault(key, []).append(kernel)
+                    pending = self._stream_pending.setdefault(key, [])
+                    if kernel not in pending:
+                        pending.append(kernel)
                 else:
-                    self._start_kernel(kernel, now)
+                    if not self._start_kernel(kernel, now):
+                        self._schedule_next_pending(key, now)
             else:
                 rk = self._stream_active.get((dev, stream))
                 if rk is None or rk.kernel is not kernel:
@@ -265,7 +273,15 @@ class Simulator:
                         self._push(max(t, sr), "start", succ, s_dev, s_strm)
 
         total = max(self._kernel_end.values()) if self._kernel_end else 0.0
-        return SimulationResult(self._trace, total, dict(self._mem_peak))
+        measurement_start_us = 0.0
+        if self._measurement_start is not None:
+            starts = [entry.start_us for entry in self._trace
+                      if entry.kernel is self._measurement_start]
+            if not starts:
+                raise ValueError("Measurement-start kernel was not executed")
+            measurement_start_us = min(starts)
+        return SimulationResult(
+            self._trace, total, dict(self._mem_peak), measurement_start_us)
 
     # ── Event queue ─────────────────────────────────────────────────
 
@@ -279,15 +295,17 @@ class Simulator:
         """True when a collective comm blocks ALL participant streams."""
         return isinstance(kernel, CommKernel) and len(parts) > 1
 
-    def _start_kernel(self, kernel: Kernel, now: float):
+    def _start_kernel(self, kernel: Kernel, now: float) -> bool:
         dev, stream, cap, parts = self._resolve(kernel)
 
         # Collective comm blocks ALL participant streams
         if self._is_multi_stream_comm(kernel, parts):
             for p_dev in parts:
                 if (p_dev, stream) in self._stream_active:
-                    self._multi_stream_waiting.append((now, kernel))
-                    return
+                    if all(waiting is not kernel
+                           for _, waiting in self._multi_stream_waiting):
+                        self._multi_stream_waiting.append((now, kernel))
+                    return False
 
         ct, mt, alpha, xfer, link_data = self._base_times(kernel, dev, parts)
         rk = RunningKernel(kernel, dev, stream, cap, ct, mt,
@@ -307,6 +325,18 @@ class Simulator:
         self._recompute_shares(rk)
         self._push(rk.eta(), "end", kernel, dev, stream)
         self._resched_peers(rk)
+        return True
+
+    def _schedule_next_pending(
+        self, key: Tuple[Compute, int], now: float,
+    ) -> None:
+        """Retry queued work without letting a blocked collective stall it."""
+        pending = self._stream_pending.get(key, [])
+        while pending:
+            next_k = pending.pop(0)
+            if next_k not in self._completed:
+                self._push(now, "start", next_k, key[0], key[1])
+                break
 
     def _finish_kernel(self, rk: RunningKernel, now: float):
         key = (rk.device, rk.stream)
@@ -334,20 +364,10 @@ class Simulator:
                 self._recompute_shares(self._on_fab[fk][0])
         self._resched_peers(rk)
         # Schedule next pending kernel on primary stream
-        pending = self._stream_pending.get(key, [])
-        while pending:
-            next_k = pending.pop(0)
-            if next_k not in self._completed:
-                self._push(now, "start", next_k, rk.device, rk.stream)
-                break
+        self._schedule_next_pending(key, now)
         # Schedule next pending on extra participant streams
         for p_key in extra_keys:
-            pending = self._stream_pending.get(p_key, [])
-            while pending:
-                next_k = pending.pop(0)
-                if next_k not in self._completed:
-                    self._push(now, "start", next_k, p_key[0], rk.stream)
-                    break
+            self._schedule_next_pending(p_key, now)
         # Retry multi-stream-waiting comms
         still_waiting = []
         for (earliest, k) in self._multi_stream_waiting:

@@ -92,6 +92,26 @@ class TestSingleKernel:
 
 
 class TestStreamSerial:
+    def test_measurement_starts_after_control_dependency(self):
+        hw, gpu, hbm = _hw(
+            read_bw=1000.0, write_bw=1000.0, tflops=1.0)
+        preload = SyntheticKernel(flops_val=2e6)
+        measured = SyntheticKernel(flops_val=3e6)
+        graph = ComputeGraph()
+        graph.add_kernel(preload)
+        graph.add_kernel(measured)
+        graph.add_control_edge(preload, measured)
+        placement = Placement(hardware=hw)
+        placement.set_kernel_device(preload, gpu)
+        placement.set_kernel_device(measured, gpu)
+
+        result = Simulator(
+            graph, placement, hw, measurement_start=measured).run()
+
+        assert result.total_time_us == pytest.approx(5.0)
+        assert result.measurement_start_us == pytest.approx(2.0)
+        assert result.measured_time_us == pytest.approx(3.0)
+
     def test_same_stream_serial(self):
         hw, gpu, hbm = _hw(read_bw=1000.0, write_bw=1000.0, tflops=1.0)
         # Two independent kernels on same stream, each 1 us compute
@@ -813,6 +833,58 @@ class TestCollectiveFabricSharing:
 
 class TestMultiStreamComm:
     """Tests for multi-stream collective comm blocking and retry."""
+
+    def test_blocked_collective_does_not_stall_pending_compute(self):
+        """A waiting collective must not head-of-line block its stream."""
+        hw, gpus, hbms = _hw_multi_gpu(
+            n_gpus=2, hbm_bw=1000.0, link_bw=100.0,
+            tflops=1000.0)
+
+        pred = SyntheticKernel(
+            flops_val=0.0, outputs={"y": Tensor("bf16", (1,))})
+        occupying_gpu0 = SyntheticKernel(flops_val=1e9)
+        occupying_gpu1 = SyntheticKernel(flops_val=10e9)
+        useful = SyntheticKernel(
+            flops_val=2e9, inputs={"x": Tensor("bf16", (1,))})
+
+        collective = AllReduce(
+            total_bytes=100000.0, world=2, dtype="bf16")
+        collective.inputs = {
+            "i0": Tensor("bf16", (1,)),
+            "i1": Tensor("bf16", (1,)),
+        }
+        collective.outputs = {
+            "o0": Tensor("bf16", (1,)),
+            "o1": Tensor("bf16", (1,)),
+        }
+
+        graph = ComputeGraph()
+        for kernel in (
+            pred, occupying_gpu0, occupying_gpu1, collective, useful,
+        ):
+            graph.add_kernel(kernel)
+        # Add the collective edge first so it is ahead of useful in GPU0's
+        # pending FIFO while occupying_gpu0 is running.
+        graph.add_data_edge(pred, collective, {"y": "i0"})
+        graph.add_data_edge(pred, useful, {"y": "x"})
+
+        placement = Placement(hardware=hw, graph=graph)
+        placement.set_kernel_device(pred, gpus[0])
+        placement.set_kernel_device(occupying_gpu0, gpus[0])
+        placement.set_kernel_device(occupying_gpu1, gpus[1])
+        placement.set_kernel_device(useful, gpus[0])
+        _place_comm_tensors(placement, collective, hbms)
+
+        result = _sim(graph, placement, hw)
+
+        useful_entry = next(
+            entry for entry in result.trace if entry.kernel is useful)
+        collective_entry = next(
+            entry for entry in result.trace
+            if entry.kernel is collective and entry.device is gpus[0])
+        assert useful_entry.start_us == pytest.approx(1.0, abs=1e-4)
+        assert useful_entry.end_us == pytest.approx(3.0, abs=1e-4)
+        assert collective_entry.start_us == pytest.approx(10.0, abs=1e-4)
 
     def test_allreduce_blocks_all_participant_streams(self):
         """AllReduce waits when a participant stream is already active."""

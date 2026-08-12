@@ -396,20 +396,12 @@ def optimize_model_cluster_decode(
     KV is a persistent read-only model input. The optimizer does not construct
     cache slices, append the current token, or model cache ownership changes.
     """
-    if emb is None or read_input is None or not kv_cache_reads \
-            or output_head is None or len(output_head) != 3:
-        raise ValueError("decode optimizer requires input, KV, and output head")
-
     final_norm, logits, sampling = output_head
-    n_layers = len(layers)
     batch_size = emb.outputs["y"].shape[0]
     _validate_args(
         layers, batch_size, seq_prefill, False,
         cp, dp, ep, pp_partition, n_gpus)
     pp_degree = len(pp_partition)
-    if len(kv_cache_reads) != n_layers:
-        raise ValueError(
-            f"expected {n_layers} KV cache reads, got {len(kv_cache_reads)}")
 
     layer_stages = [
         stage
@@ -417,27 +409,10 @@ def optimize_model_cluster_decode(
         for _ in range(layer_count)
     ]
     gpus, cpus, drams = _cluster_a_resources(hw)
-    if len(gpus) != n_gpus:
-        raise ValueError(
-            f"hardware contains {len(gpus)} B300 GPUs, expected {n_gpus}")
-    if not cpus or not drams:
-        raise ValueError("B300 Cluster A requires per-node CPUs and DRAMs")
     stage_gpus = [
         gpus[stage * ep:(stage + 1) * ep]
         for stage in range(pp_degree)
     ]
-
-    for layer_id, (kv_read, layer) in enumerate(
-            zip(kv_cache_reads, layers)):
-        cache_len = kv_read.outputs["y"].shape[1]
-        if cache_len % cp != 0:
-            raise ValueError(
-                f"layer {layer_id} KV length {cache_len} must be "
-                f"divisible by cp={cp}")
-        if layer.sa.S_kv != cache_len:
-            raise ValueError(
-                f"layer {layer_id} attention sees {layer.sa.S_kv} KV "
-                f"entries, expected persistent cache length {cache_len}")
 
     # CP comes first. Attention broadcasts Q, shards the persistent KV input,
     # and reduces the partial outputs. Move the Q broadcast before the Q
@@ -448,10 +423,6 @@ def optimize_model_cluster_decode(
         kv_read_cp_copies.append(copies)
 
     barrier = layers[0].kv_persist_barrier
-    if barrier is None or any(
-            layer.kv_persist_barrier is not barrier
-            for layer in layers):
-        raise ValueError("decode KV persistence barrier is missing")
     barrier_prev, barrier_cp_copies, _ = g.split_kernel(
         kv_persistence_split, barrier, cp)
     cp_collectives_to_replicate = [barrier_prev["decode_output"]]

@@ -71,7 +71,11 @@ class TestSingleKernel:
         result = _sim(g, p, hw)
         assert len(result.trace) == 1
         assert result.total_time_us == pytest.approx(2.0, rel=1e-6)
-        assert result.trace[0].bound == Bound.COMPUTE
+        entry = result.trace[0]
+        assert entry.bound == Bound.COMPUTE
+        assert entry.compute_time_us == pytest.approx(2.0)
+        assert entry.memory_time_us == pytest.approx(2e-6)
+        assert entry.network_time_us == 0.0
 
     def test_memory_bound(self):
         hw, gpu, hbm = _hw(read_bw=1.0, write_bw=1.0, tflops=1000.0)
@@ -85,7 +89,11 @@ class TestSingleKernel:
         p.set_kernel_device(k, gpu)
         result = _sim(g, p, hw)
         assert result.total_time_us == pytest.approx(2.0, rel=1e-6)
-        assert result.trace[0].bound == Bound.MEMORY
+        entry = result.trace[0]
+        assert entry.bound == Bound.MEMORY
+        assert entry.compute_time_us == pytest.approx(0.001)
+        assert entry.memory_time_us == pytest.approx(2.0)
+        assert entry.network_time_us == 0.0
 
 
 # ── Stream serialization ─────────────────────────────────────────────

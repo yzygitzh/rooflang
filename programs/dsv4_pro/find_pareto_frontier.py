@@ -1,10 +1,19 @@
 """Search and plot DSV4 Pro throughput/latency Pareto frontiers.
 
-The two maximized metrics are:
+The two maximized Pareto metrics are:
 
 * tokens/s/GPU: aggregate token throughput divided by the physical GPU count;
 * tokens/s/user: one user's token throughput (S / TTFT for prefill and
   1 / TPOT for one-step decode).
+
+Each successful point also records tokens/s/GPU-elapsed, using each GPU's
+elapsed time from its first measured kernel through its final kernel. This
+includes internal dependency and resource-contention bubbles, but excludes
+leading and trailing idle time. Compute time is each kernel's
+max(compute, local-memory) roofline bound; communication time is only the
+network bound exposed beyond that local bound. An ideal-overlap throughput
+additionally assumes that, on each GPU, the shorter of total compute and
+exposed communication time can be completely hidden by the longer one.
 
 Each simulation is an independent process.  Results are appended to JSONL as
 they finish, so an interrupted search can resume without repeating completed
@@ -25,7 +34,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
-from rooflang.language.hardware.component import Memory
+from rooflang.language.hardware.component import Compute, Memory
+from rooflang.language.kernels.forward import Sampling
 from rooflang.programs.dsv4_pro.config import (
     COMPRESS_RATIOS, N_EXPERTS, N_LAYERS, TOPK, WINDOW,
 )
@@ -208,6 +218,116 @@ def _peak_memory_gb(result, kind: str) -> float:
     return max(values, default=0.0)
 
 
+def _output_path_kernels(graph) -> tuple[set, set]:
+    """Return Sampling kernels and their inclusive dependency ancestors."""
+    outputs = {
+        kernel for kernel in graph.kernels
+        if isinstance(kernel, Sampling)
+    }
+    ancestors = set(outputs)
+    stack = list(outputs)
+    while stack:
+        kernel = stack.pop()
+        for predecessor in graph._dag.predecessors(kernel):
+            if predecessor not in ancestors:
+                ancestors.add(predecessor)
+                stack.append(predecessor)
+    return outputs, ancestors
+
+
+def _gpu_timing_totals_us(
+    result, n_gpus: int, included_kernels: set,
+) -> tuple[float, float, float, float]:
+    """Return elapsed and roofline-decomposed GPU-times.
+
+    A kernel contributes max(compute, local-memory) to compute time.  Only
+    network time exposed beyond that local bound contributes to communication
+    time, because the simulator overlaps all three resources within a kernel.
+    """
+    measurement_start = result.measurement_start_us
+    first_start_by_gpu = {}
+    final_end_by_gpu = {}
+    # Trace entries are appended as kernels complete, so end_us is
+    # nondecreasing. In reverse, the first entry for a GPU is its final one.
+    for entry in reversed(result.trace):
+        if entry.end_us <= measurement_start:
+            break
+        if entry.kernel not in included_kernels:
+            continue
+        if not isinstance(entry.device, Compute) \
+                or entry.device.kind != "gpu":
+            continue
+        final_end_by_gpu.setdefault(entry.device, entry.end_us)
+        if len(final_end_by_gpu) == n_gpus:
+            break
+
+    compute_time_by_gpu = {device: 0.0 for device in final_end_by_gpu}
+    communication_time_by_gpu = {
+        device: 0.0 for device in final_end_by_gpu
+    }
+    for entry in result.trace:
+        if entry.kernel not in included_kernels \
+                or entry.device not in final_end_by_gpu \
+                or entry.end_us <= measurement_start:
+            continue
+        start_us = max(entry.start_us, measurement_start)
+        end_us = min(entry.end_us, final_end_by_gpu[entry.device])
+        if end_us <= start_us:
+            continue
+        duration_us = entry.end_us - entry.start_us
+        visible_fraction = (end_us - start_us) / duration_us \
+            if duration_us > 0 else 1.0
+        local_bound_us = max(
+            entry.compute_time_us, entry.memory_time_us)
+        exposed_network_us = max(
+            0.0, entry.network_time_us - local_bound_us)
+        compute_time_by_gpu[entry.device] += (
+            local_bound_us * visible_fraction)
+        communication_time_by_gpu[entry.device] += (
+            exposed_network_us * visible_fraction)
+        first_start_by_gpu[entry.device] = min(
+            first_start_by_gpu.get(entry.device, start_us), start_us)
+
+    elapsed_time_us = 0.0
+    compute_time_us = 0.0
+    communication_time_us = 0.0
+    overlapped_time_us = 0.0
+    for device, final_end_us in final_end_by_gpu.items():
+        elapsed = final_end_us - first_start_by_gpu[device]
+        compute = compute_time_by_gpu[device]
+        communication = communication_time_by_gpu[device]
+        elapsed_time_us += elapsed
+        compute_time_us += compute
+        communication_time_us += communication
+        overlapped_time_us += elapsed - min(compute, communication)
+    return (
+        elapsed_time_us,
+        compute_time_us,
+        communication_time_us,
+        overlapped_time_us,
+    )
+
+
+def _gpu_timing_metrics(
+    result, total_tokens: int, n_gpus: int,
+    included_kernels: set, duration_us: float,
+) -> dict:
+    """Calculate per-GPU elapsed and ideal compute/comm-overlap metrics."""
+    elapsed_time_us, compute_time_us, communication_time_us, \
+        overlapped_time_us = _gpu_timing_totals_us(
+        result, n_gpus, included_kernels)
+    return {
+        "tokens_per_s_gpu_elapsed": total_tokens / (elapsed_time_us / 1e6),
+        "tokens_per_s_gpu_overlapped": (
+            total_tokens / (overlapped_time_us / 1e6)),
+        "compute_ratio": compute_time_us / elapsed_time_us,
+        "communication_ratio": communication_time_us / elapsed_time_us,
+        "gpu_completion_fraction": (
+            elapsed_time_us / (n_gpus * duration_us)),
+        "total_gpu_elapsed_ms": elapsed_time_us / 1000,
+    }
+
+
 def run_case(case: Case) -> dict:
     """Build, optimize, and simulate one point.  Runs inside a worker."""
     started = time.perf_counter()
@@ -248,22 +368,31 @@ def run_case(case: Case) -> dict:
         result = Simulator(
             graph, placement, hardware, measurement_start=read_input,
         ).run()
-        duration_s = result.measured_time_us / 1e6
+        output_kernels, output_path = _output_path_kernels(graph)
+        output_end_us = max(
+            entry.end_us for entry in result.trace
+            if entry.kernel in output_kernels
+        )
+        duration_us = output_end_us - result.measurement_start_us
+        duration_s = duration_us / 1e6
         tokens_per_user = seq_prefill if stage == "prefill" else 1
+        total_tokens = case.batch_size * tokens_per_user
         record.update({
             "status": "ok",
-            "latency_ms": result.measured_time_us / 1000,
+            "latency_ms": duration_us / 1000,
             "preload_ms": result.measurement_start_us / 1000,
+            "post_output_ms": (result.total_time_us - output_end_us) / 1000,
             "tokens_per_s_user": tokens_per_user / duration_s,
             "tokens_per_s_gpu": (
-                case.batch_size * tokens_per_user
-                / duration_s / case.n_gpus
+                total_tokens / duration_s / case.n_gpus
             ),
             "peak_hbm_gb": _peak_memory_gb(result, "hbm"),
             "peak_dram_gb": _peak_memory_gb(result, "dram"),
             "peak_ssd_gb": _peak_memory_gb(result, "ssd"),
             "kernel_count": len(graph.kernels),
         })
+        record.update(_gpu_timing_metrics(
+            result, total_tokens, case.n_gpus, output_path, duration_us))
     except OOMError as error:
         record.update({
             "status": "oom",

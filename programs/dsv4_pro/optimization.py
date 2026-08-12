@@ -271,6 +271,24 @@ def _place_experts_and_routes(
                 hw.find_local_memory(devices[owner]))
 
 
+def _place_pp_boundary_spawn(g, placement, spawn, memory):
+    """Write a PP boundary once into the destination stage's local HBM."""
+    for tensor in (*spawn.inputs.values(), *spawn.outputs.values()):
+        placement.set_tensor_memory(tensor, memory)
+    for edge in g._in_edges(spawn):
+        for output_name, input_name in edge.mapping.items():
+            placement.set_tensor_memory(
+                edge.src.outputs[output_name], memory)
+            placement.set_tensor_memory(
+                spawn.inputs[input_name], memory)
+    for edge in g._out_edges(spawn):
+        for output_name, input_name in edge.mapping.items():
+            placement.set_tensor_memory(
+                spawn.outputs[output_name], memory)
+            placement.set_tensor_memory(
+                edge.dst.inputs[input_name], memory)
+
+
 def optimize_model_cluster_prefill(
     g, layers, hw, emb=None, read_input=None, output_head=None, *,
     cp, dp, ep, pp_partition, n_gpus,
@@ -361,6 +379,20 @@ def optimize_model_cluster_prefill(
                 placement.set_kernel_device(copy, devices[rank])
         _place_experts_and_routes(
             g, layer, fields, devices, placement, hw, shard_experts=True)
+
+    # At a PP boundary, materialize the layer input in the destination HBM
+    # once. The input Spawn has multiple consumers (norm, compression, and
+    # residual paths); leaving its aliases in the source HBM makes every
+    # consumer repeat the same remote read.
+    for layer_id in range(1, len(layers)):
+        stage = layer_stages[layer_id]
+        if stage == layer_stages[layer_id - 1]:
+            continue
+        bridges = copies_by_layer[id(layers[layer_id])]["bridge"]
+        for rank, bridge in enumerate(bridges):
+            _place_pp_boundary_spawn(
+                g, placement, bridge,
+                hw.find_local_memory(stage_gpus[stage][rank]))
 
     final_devices = stage_gpus[layer_stages[-1]]
     for copies in output_head_dp_copies:
@@ -569,6 +601,16 @@ def optimize_model_cluster_decode(
         _place_experts_and_routes(
             g, layer, route_fields, devices, placement, hw,
             shard_experts=True)
+
+    for layer_id in range(1, len(layers)):
+        stage = layer_stages[layer_id]
+        if stage == layer_stages[layer_id - 1]:
+            continue
+        bridges = copies_by_layer[layer_id]["dp"]["bridge"]
+        for dp_rank, bridge in enumerate(bridges):
+            device = stage_gpus[stage][dp_rank * cp]
+            _place_pp_boundary_spawn(
+                g, placement, bridge, hw.find_local_memory(device))
 
     for rank, barrier_copy in enumerate(barrier_copies):
         for input_name, tensor in barrier_copy.inputs.items():

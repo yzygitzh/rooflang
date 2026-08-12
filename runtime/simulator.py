@@ -63,15 +63,22 @@ class OOMError(Exception):
 
 
 class TraceEntry:
-    __slots__ = ("kernel", "device", "stream", "start_us", "end_us", "bound")
+    __slots__ = (
+        "kernel", "device", "stream", "start_us", "end_us", "bound",
+        "compute_time_us", "memory_time_us", "network_time_us",
+    )
 
-    def __init__(self, kernel, device, stream, start_us, end_us, bound):
+    def __init__(self, kernel, device, stream, start_us, end_us, bound,
+                 compute_time_us, memory_time_us, network_time_us):
         self.kernel = kernel
         self.device = device
         self.stream = stream
         self.start_us = start_us
         self.end_us = end_us
         self.bound = bound
+        self.compute_time_us = compute_time_us
+        self.memory_time_us = memory_time_us
+        self.network_time_us = network_time_us
 
 
 class SimulationResult:
@@ -144,8 +151,11 @@ class RunningKernel:
         worst = max(worst, net_remaining)
         return self.seg_start + worst
 
+    def _network_time(self) -> float:
+        return self.network_alpha + self.network_transfer_time
+
     def bound(self) -> Bound:
-        nt = self.network_alpha + self.network_transfer_time
+        nt = self._network_time()
         if nt >= self.compute_time and nt >= self.memory_time and nt > 0:
             return Bound.NETWORK
         if self.compute_time >= self.memory_time and self.compute_time > 0:
@@ -253,13 +263,20 @@ class Simulator:
                 self._kernel_end[kernel] = now
                 self._stream_end[(dev, stream)] = now
                 bound = rk.bound()
+                component_times = (
+                    rk.compute_time,
+                    rk.memory_time,
+                    rk._network_time(),
+                )
                 if isinstance(kernel, CommKernel) and len(rk.participants) > 1:
                     for part_dev in rk.participants:
                         self._trace.append(TraceEntry(
-                            kernel, part_dev, stream, rk.start_us, now, bound))
+                            kernel, part_dev, stream, rk.start_us, now, bound,
+                            *component_times))
                 else:
                     self._trace.append(TraceEntry(
-                        kernel, dev, stream, rk.start_us, now, bound))
+                        kernel, dev, stream, rk.start_us, now, bound,
+                        *component_times))
                 self._complete_kernel_memory(kernel)
                 self._finish_kernel(rk, now)
                 for succ in self._graph._dag.successors(kernel):

@@ -1,9 +1,15 @@
 """Tests for the DSV4 Pro Pareto-frontier search driver."""
 
+from types import SimpleNamespace
+
+from rooflang.language.graph import ComputeGraph
 from rooflang.language.hardware.component import Compute
+from rooflang.language.kernels.forward import Nop, Sampling
 from rooflang.programs.dsv4_pro.find_pareto_frontier import (
     Case,
     ParallelConfig,
+    _gpu_timing_metrics,
+    _output_path_kernels,
     _parser,
     batch_quantum,
     build_hardware,
@@ -100,6 +106,77 @@ def test_pareto_frontier_removes_dominated_and_duplicate_points():
     assert [point["case_id"] for point in pareto_frontier(records)] == [
         "b", "a",
     ]
+
+
+def test_gpu_activity_includes_bubbles_until_each_gpus_final_kernel():
+    gpu0 = Compute(name="gpu0", kind="gpu")
+    gpu1 = Compute(name="gpu1", kind="gpu")
+    cpu = Compute(name="cpu0", kind="cpu")
+    compute0, compute1 = Nop(), Nop()
+    communication0, communication1 = Nop(), Nop()
+    barrier = Nop()
+    result = SimpleNamespace(
+        measurement_start_us=100.0,
+        measured_time_us=200.0,
+        trace=[
+            SimpleNamespace(kernel=compute0, device=gpu0,
+                            start_us=50.0, end_us=150.0,
+                            compute_time_us=100.0, memory_time_us=80.0,
+                            network_time_us=0.0),
+            SimpleNamespace(kernel=compute1, device=gpu1,
+                            start_us=120.0, end_us=160.0,
+                            compute_time_us=40.0, memory_time_us=20.0,
+                            network_time_us=0.0),
+            SimpleNamespace(kernel=communication0, device=gpu0,
+                            start_us=150.0, end_us=180.0,
+                            compute_time_us=0.0, memory_time_us=0.0,
+                            network_time_us=30.0),
+            SimpleNamespace(kernel=compute0, device=gpu0,
+                            start_us=180.0, end_us=200.0,
+                            compute_time_us=10.0, memory_time_us=20.0,
+                            network_time_us=15.0),
+            SimpleNamespace(kernel=communication1, device=gpu1,
+                            start_us=180.0, end_us=220.0,
+                            compute_time_us=0.0, memory_time_us=0.0,
+                            network_time_us=40.0),
+            SimpleNamespace(kernel=barrier, device=gpu0,
+                            start_us=250.0, end_us=300.0,
+                            compute_time_us=0.0, memory_time_us=0.0,
+                            network_time_us=0.0),
+            SimpleNamespace(kernel=barrier, device=cpu,
+                            start_us=100.0, end_us=300.0,
+                            compute_time_us=0.0, memory_time_us=0.0,
+                            network_time_us=0.0),
+        ],
+    )
+
+    metrics = _gpu_timing_metrics(
+        result, total_tokens=100, n_gpus=2,
+        included_kernels={
+            compute0, compute1, communication0, communication1,
+        },
+        duration_us=120.0)
+
+    assert metrics["total_gpu_elapsed_ms"] == 0.2
+    assert metrics["tokens_per_s_gpu_elapsed"] == 100 / 0.0002
+    assert metrics["compute_ratio"] == 110 / 200
+    assert metrics["communication_ratio"] == 70 / 200
+    assert metrics["tokens_per_s_gpu_overlapped"] == 100 / 0.00013
+    assert metrics["gpu_completion_fraction"] == 200 / (2 * 120)
+
+
+def test_output_path_excludes_kv_persistence_barrier():
+    graph = ComputeGraph()
+    producer, sampling, barrier = Nop(), Sampling(1, 1), Nop()
+    for kernel in (producer, sampling, barrier):
+        graph.add_kernel(kernel)
+    graph.add_control_edge(producer, sampling)
+    graph.add_control_edge(sampling, barrier)
+
+    outputs, output_path = _output_path_kernels(graph)
+
+    assert outputs == {sampling}
+    assert output_path == {producer, sampling}
 
 
 def test_write_outputs_honors_filtered_workloads(tmp_path):

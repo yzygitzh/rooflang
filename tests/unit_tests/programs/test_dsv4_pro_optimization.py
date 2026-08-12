@@ -174,6 +174,27 @@ def test_cp4_dp2_ep8_pp2_prefill(monkeypatch):
         assert all(isinstance(device, Compute)
                    for device in expert_devices)
 
+    for bridge in layers[1]._bridge_cp_dp_copies:
+        memories = {
+            placement.get_tensor_memory(tensor)
+            for tensor in (*bridge.inputs.values(), *bridge.outputs.values())
+        }
+        assert len(memories) == 1
+        memory = next(iter(memories))
+        assert memory.name.startswith("n1-")
+        for edge in graph._in_edges(bridge):
+            for output_name, input_name in edge.mapping.items():
+                assert placement.get_tensor_memory(
+                    edge.src.outputs[output_name]) is memory
+                assert placement.get_tensor_memory(
+                    bridge.inputs[input_name]) is memory
+        for edge in graph._out_edges(bridge):
+            for output_name, input_name in edge.mapping.items():
+                assert placement.get_tensor_memory(
+                    bridge.outputs[output_name]) is memory
+                assert placement.get_tensor_memory(
+                    edge.dst.inputs[input_name]) is memory
+
 
 def test_h200_cluster_resources_use_component_kinds(monkeypatch):
     """H200 placement must not depend on a B300 model-name substring."""

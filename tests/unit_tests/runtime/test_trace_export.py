@@ -86,6 +86,9 @@ class TestExportTrace:
         assert ev["args"]["input_bandwidth_gbs"] >= 0.0
         assert ev["args"]["weight_bandwidth_gbs"] >= 0.0
         assert ev["args"]["output_bandwidth_gbs"] >= 0.0
+        assert ev["args"]["compute_time_us"] == entry.compute_time_us
+        assert ev["args"]["memory_time_us"] == entry.memory_time_us
+        assert ev["args"]["network_time_us"] == entry.network_time_us
 
     def test_metadata_events_present(self, tmp_path):
         hw, gpu, hbm = _hw()

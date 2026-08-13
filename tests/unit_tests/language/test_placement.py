@@ -130,6 +130,38 @@ class TestPlacementGetKernelDevice:
             p.get_kernel_device(Kernel())
 
 
+class TestPlacementDeviceInference:
+    def test_infer_comm_devices_requires_hardware(self):
+        with pytest.raises(ValueError, match="without hardware"):
+            Placement().infer_comm_devices(AllReduce(8.0, 1))
+
+    def test_infer_comm_devices_requires_placed_ports(self):
+        hw, _, _ = _simple_hw()
+        comm = AllReduce(8.0, 1)
+        comm.inputs = {"x": Tensor("bf16", (4,))}
+
+        with pytest.raises(ValueError, match="tensor has no memory"):
+            Placement(hardware=hw).infer_comm_devices(comm)
+
+    def test_infer_comm_devices_requires_ports(self):
+        hw, _, _ = _simple_hw()
+
+        with pytest.raises(ValueError, match="no input/output tensors"):
+            Placement(hardware=hw).infer_comm_devices(AllReduce(8.0, 1))
+
+    def test_get_tensor_device_errors_and_success(self):
+        tensor = Tensor("bf16", (4,))
+        with pytest.raises(ValueError, match="without hardware"):
+            Placement().get_tensor_device(tensor)
+
+        hw, gpu, hbm = _simple_hw()
+        placement = Placement(hardware=hw)
+        with pytest.raises(ValueError, match="no memory placement"):
+            placement.get_tensor_device(tensor)
+        placement.set_tensor_memory(tensor, hbm)
+        assert placement.get_tensor_device(tensor) is gpu
+
+
 # ── Placement.placed_kernels tests ───────────────────────────────────
 
 
@@ -211,6 +243,19 @@ class TestPlacementValidate:
 
         with pytest.raises(ValueError, match="input.*has no memory"):
             Placement().validate(graph)
+
+    @pytest.mark.parametrize("port", ["weight", "output"])
+    def test_missing_weight_or_output_memory_raises(self, port):
+        tensor = Tensor("bf16", (4,))
+        kwargs = {"weights" if port == "weight" else "outputs": {"x": tensor}}
+        kernel = Kernel(**kwargs)
+        graph = ComputeGraph()
+        graph.add_kernel(kernel)
+        placement = Placement()
+        placement.set_kernel_device(kernel, Compute(name="gpu0"))
+
+        with pytest.raises(ValueError, match=rf"{port} of.*has no memory"):
+            placement.validate(graph)
 
     @pytest.mark.parametrize(
         "kernel", [Spawn(world=1), Concat(), Slice()],

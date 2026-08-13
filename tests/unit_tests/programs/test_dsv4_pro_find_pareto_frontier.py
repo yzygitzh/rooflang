@@ -1,23 +1,33 @@
 """Tests for the DSV4 Pro Pareto-frontier search driver."""
 
+import json
 from types import SimpleNamespace
 
+import pytest
+
 from rooflang.language.graph import ComputeGraph
-from rooflang.language.hardware.component import Compute
+from rooflang.language.hardware.component import Compute, Memory
 from rooflang.language.kernels.forward import Nop, Sampling
+from rooflang.programs.dsv4_pro import find_pareto_frontier as finder
 from rooflang.programs.dsv4_pro.find_pareto_frontier import (
     Case,
     ParallelConfig,
     _gpu_timing_metrics,
     _output_path_kernels,
+    _peak_memory_gb,
+    _read_jsonl,
+    _run_parallel,
     _parser,
     batch_quantum,
     build_hardware,
     enumerate_cases,
     enumerate_parallel_configs,
+    grouped_frontiers,
     pareto_frontier,
+    run_case,
     write_outputs,
 )
+from rooflang.runtime.simulator import OOMError
 
 
 def test_default_worker_count_is_eight():
@@ -72,6 +82,16 @@ def test_case_enumeration_applies_batch_multipliers_and_limit():
     assert all(case.pp_partition == (61,) for case in cases)
 
 
+def test_parallel_config_enumeration_rejects_expert_and_compression_cases(
+        monkeypatch):
+    monkeypatch.setattr(finder, "N_EXPERTS", 10)
+    assert enumerate_parallel_configs(8, 8192)
+
+    monkeypatch.setattr(finder, "N_EXPERTS", 384)
+    monkeypatch.setattr(finder, "COMPRESS_RATIOS", (3,))
+    assert enumerate_parallel_configs(8, 8192) == []
+
+
 def test_single_node_scopes_and_eight_gpu_nodes():
     for name in ("gh200", "gb300", "ascend950dt"):
         hardware = build_hardware(name, 48)
@@ -88,6 +108,26 @@ def test_single_node_scopes_and_eight_gpu_nodes():
                 and component.kind == "gpu"]
         assert len(gpus) == 48
         assert len({gpu.name.split("-", 1)[0] for gpu in gpus}) == 6
+
+
+@pytest.mark.parametrize("name", ["h200", "b300"])
+def test_eight_gpu_node_hardware_rejects_partial_nodes(name):
+    with pytest.raises(ValueError, match="divisible by 8"):
+        build_hardware(name, 7)
+
+
+def test_build_hardware_rejects_unknown_name():
+    with pytest.raises(ValueError, match="Unknown hardware"):
+        build_hardware("unknown", 8)
+
+
+def test_peak_memory_filters_component_kind():
+    hbm = Memory("hbm", kind="hbm")
+    dram = Memory("dram", kind="dram")
+    result = SimpleNamespace(peak_memory={hbm: 2e9, dram: 3e9, object(): 9e9})
+
+    assert _peak_memory_gb(result, "hbm") == 2.0
+    assert _peak_memory_gb(result, "ssd") == 0.0
 
 
 def test_pareto_frontier_removes_dominated_and_duplicate_points():
@@ -179,6 +219,131 @@ def test_output_path_excludes_kv_persistence_barrier():
     assert output_path == {producer, sampling}
 
 
+def _case(stage="prefill"):
+    return Case(
+        workload=f"{stage}-8k", hardware="b300", n_gpus=8,
+        batch_size=8, cp=1, dp=8, ep=8, pp_partition=(61,),
+    )
+
+
+def test_run_case_success_for_prefill_and_decode(monkeypatch):
+    sampling = Sampling(1, 1)
+    graph = SimpleNamespace(kernels={sampling})
+    declared = (graph, ["layer"], "emb", "read", ["kv"], "head")
+    monkeypatch.setattr(finder, "build_hardware", lambda *args: "hardware")
+    monkeypatch.setattr(finder, "declare_model", lambda **kwargs: declared)
+    optimizer_calls = []
+    monkeypatch.setattr(
+        finder, "optimize_model_cluster_prefill",
+        lambda *args, **kwargs: optimizer_calls.append(("prefill", kwargs))
+        or (graph, "placement"),
+    )
+    monkeypatch.setattr(
+        finder, "optimize_model_cluster_decode",
+        lambda *args, **kwargs: optimizer_calls.append(("decode", kwargs))
+        or (graph, "placement"),
+    )
+    result = SimpleNamespace(
+        trace=[SimpleNamespace(kernel=sampling, end_us=110.0)],
+        measurement_start_us=10.0,
+        total_time_us=120.0,
+        peak_memory={},
+    )
+
+    class FakeSimulator:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+        def run(self):
+            return result
+
+    monkeypatch.setattr(finder, "Simulator", FakeSimulator)
+    monkeypatch.setattr(
+        finder, "_output_path_kernels",
+        lambda _: ({sampling}, {sampling}),
+    )
+    monkeypatch.setattr(
+        finder, "_gpu_timing_metrics",
+        lambda *args: {"compute_ratio": 0.5},
+    )
+    times = iter((1.0, 2.0, 3.0, 5.0))
+    monkeypatch.setattr(finder.time, "perf_counter", lambda: next(times))
+
+    prefill = run_case(_case("prefill"))
+    decode = run_case(_case("decode"))
+
+    assert prefill["status"] == decode["status"] == "ok"
+    assert prefill["tokens_per_s_user"] == 8192 / 0.0001
+    assert decode["tokens_per_s_user"] == 1 / 0.0001
+    assert prefill["post_output_ms"] == 0.01
+    assert prefill["compute_ratio"] == 0.5
+    assert [name for name, _ in optimizer_calls] == ["prefill", "decode"]
+    assert "seq_prefill" in optimizer_calls[1][1]
+
+
+def test_run_case_reports_oom(monkeypatch):
+    memory = Memory("hbm0", capacity_gb=1.0, kind="hbm")
+    error = OOMError(memory, 2e9, 1e9, [], Nop())
+    monkeypatch.setattr(
+        finder, "build_hardware",
+        lambda *args: (_ for _ in ()).throw(error),
+    )
+    times = iter((1.0, 2.0))
+    monkeypatch.setattr(finder.time, "perf_counter", lambda: next(times))
+
+    record = run_case(_case())
+
+    assert record["status"] == "oom"
+    assert record["oom_memory"] == "hbm0"
+    assert record["oom_memory_kind"] == "hbm"
+    assert record["oom_used_gb"] == 2.0
+    assert record["oom_capacity_gb"] == 1.0
+
+
+def test_run_case_keeps_sweep_running_after_error(monkeypatch):
+    monkeypatch.setattr(
+        finder, "build_hardware",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("broken")),
+    )
+    times = iter((1.0, 2.0))
+    monkeypatch.setattr(finder.time, "perf_counter", lambda: next(times))
+
+    record = run_case(_case())
+
+    assert record["status"] == "error"
+    assert record["error"] == "RuntimeError: broken"
+
+
+def test_grouped_frontiers_skips_failures():
+    records = [
+        {"case_id": "ok", "status": "ok", "workload": "prefill-8k",
+         "hardware": "b300", "n_gpus": 8,
+         "tokens_per_s_user": 1.0, "tokens_per_s_gpu": 1.0},
+        {"case_id": "bad", "status": "oom"},
+    ]
+
+    assert list(grouped_frontiers(records)) == [("prefill-8k", "b300", 8)]
+
+
+def test_read_jsonl_handles_missing_blank_valid_and_invalid(tmp_path):
+    path = tmp_path / "records.jsonl"
+    assert _read_jsonl(path) == []
+    path.write_text('\n{"case_id": "one"}\n', encoding="utf-8")
+    assert _read_jsonl(path) == [{"case_id": "one"}]
+    path.write_text('{"case_id":\n', encoding="utf-8")
+    with pytest.raises(ValueError, match=r"records.jsonl:1"):
+        _read_jsonl(path)
+
+
+def test_write_outputs_handles_no_records(tmp_path):
+    write_outputs(tmp_path, [])
+
+    assert (tmp_path / "all_points.csv").read_text() == ""
+    assert (tmp_path / "pareto_frontier.csv").read_text() == ""
+    assert not list(tmp_path.glob("*.png"))
+
+
 def test_write_outputs_honors_filtered_workloads(tmp_path):
     record = {
         "case_id": "one",
@@ -197,3 +362,151 @@ def test_write_outputs_honors_filtered_workloads(tmp_path):
     assert (tmp_path / "pareto_frontier.csv").is_file()
     assert (tmp_path / "pareto_decode-8k.png").is_file()
     assert not (tmp_path / "pareto_prefill-8k.png").exists()
+
+
+def test_write_outputs_handles_empty_frontiers_and_extra_axes(tmp_path):
+    records = [
+        {"case_id": str(n_gpus), "status": "oom",
+         "workload": "prefill-8k", "hardware": "b300",
+         "n_gpus": n_gpus, "pp_partition": [61]}
+        for n_gpus in (8, 16, 32, 48)
+    ]
+
+    write_outputs(tmp_path, records)
+
+    assert (tmp_path / "pareto_prefill-8k.png").is_file()
+
+
+class _Future:
+    def __init__(self, case):
+        self.case = case
+
+    def result(self):
+        if self.case.hardware == "h200":
+            raise RuntimeError("worker failed")
+        return {"case_id": self.case.case_id, "status": "ok"}
+
+
+class _Executor:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def submit(self, function, case):
+        return _Future(case)
+
+
+def test_run_parallel_skips_completed_and_records_worker_errors(
+        tmp_path, monkeypatch):
+    cases = [
+        _case(),
+        Case("prefill-8k", "gb300", 8, 8, 1, 8, 8, (61,)),
+        Case("prefill-8k", "h200", 8, 8, 1, 8, 8, (61,)),
+    ]
+    monkeypatch.setattr(finder, "ProcessPoolExecutor", _Executor)
+    monkeypatch.setattr(
+        finder, "wait",
+        lambda futures, return_when: ({next(iter(futures))}, set()),
+    )
+    raw_path = tmp_path / "raw.jsonl"
+
+    records = _run_parallel(
+        cases, workers=2, raw_path=raw_path,
+        completed_ids={cases[0].case_id},
+    )
+
+    assert [record["status"] for record in records] == [
+        "ok", "worker_error",
+    ]
+    written = [json.loads(line) for line in raw_path.read_text().splitlines()]
+    assert [record["case_id"] for record in written] == [
+        record["case_id"] for record in records
+    ]
+    assert [record["status"] for record in written] == [
+        "ok", "worker_error",
+    ]
+
+
+def test_main_validates_workers_and_batch_multipliers(tmp_path):
+    with pytest.raises(ValueError, match="workers"):
+        finder.main(["--output-dir", str(tmp_path), "--workers", "0"])
+    with pytest.raises(ValueError, match="batch-multipliers"):
+        finder.main([
+            "--output-dir", str(tmp_path),
+            "--batch-multipliers", "0",
+        ])
+
+
+def test_main_plot_only_requires_and_writes_existing_records(
+        tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="No records"):
+        finder.main(["--output-dir", str(tmp_path), "--plot-only"])
+
+    raw_path = tmp_path / "raw_results.jsonl"
+    record = {"case_id": "one", "status": "oom"}
+    raw_path.write_text(json.dumps(record) + "\n")
+    writes = []
+    monkeypatch.setattr(
+        finder, "write_outputs",
+        lambda output_dir, records: writes.append((output_dir, records)),
+    )
+
+    assert finder.main([
+        "--output-dir", str(tmp_path), "--plot-only",
+    ]) == 0
+    assert writes == [(tmp_path, [record])]
+
+
+def test_main_dry_run_and_overwrite(tmp_path, monkeypatch, capsys):
+    raw_path = tmp_path / "raw_results.jsonl"
+    tmp_path.mkdir(exist_ok=True)
+    raw_path.write_text("old\n")
+    monkeypatch.setattr(finder, "enumerate_cases", lambda **kwargs: [_case()])
+
+    assert finder.main([
+        "--output-dir", str(tmp_path), "--overwrite", "--dry-run",
+    ]) == 0
+    assert not raw_path.exists()
+    assert "Generated 1 cases" in capsys.readouterr().out
+
+
+def test_main_resumes_and_optionally_reruns_failures(tmp_path, monkeypatch):
+    cases = [
+        _case(),
+        Case("prefill-8k", "h200", 8, 8, 1, 8, 8, (61,)),
+        Case("prefill-8k", "gb300", 8, 8, 1, 8, 8, (61,)),
+    ]
+    existing = [
+        {"case_id": cases[0].case_id, "status": "ok"},
+        {"case_id": cases[1].case_id, "status": "oom"},
+    ]
+    monkeypatch.setattr(finder, "_read_jsonl", lambda path: existing)
+    monkeypatch.setattr(finder, "enumerate_cases", lambda **kwargs: cases)
+    parallel_calls = []
+    monkeypatch.setattr(
+        finder, "_run_parallel",
+        lambda cases, workers, raw_path, completed_ids:
+        parallel_calls.append(set(completed_ids)) or [
+            {"case_id": "new", "status": "ok"}
+        ],
+    )
+    writes = []
+    monkeypatch.setattr(
+        finder, "write_outputs",
+        lambda output_dir, records: writes.append(list(records)),
+    )
+
+    assert finder.main(["--output-dir", str(tmp_path)]) == 0
+    assert parallel_calls[-1] == {cases[0].case_id, cases[1].case_id}
+    assert writes[-1] == existing + [{"case_id": "new", "status": "ok"}]
+
+    assert finder.main([
+        "--output-dir", str(tmp_path), "--rerun-failures", "--no-plot",
+    ]) == 0
+    assert parallel_calls[-1] == {cases[0].case_id}
+    assert len(writes) == 1

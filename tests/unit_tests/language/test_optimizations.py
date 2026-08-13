@@ -16,7 +16,9 @@ from rooflang.language.kernels.identity import Concat, Spawn
 from rooflang.language.tensor import Tensor
 from rooflang.language.placement import Placement
 from rooflang.language.hardware.component import Compute, Memory
-from rooflang.language.optimization.comm import optimize_comms
+from rooflang.language.optimization.comm import (
+    _create_collective, optimize_comms,
+)
 from rooflang.language.optimization.split import (
     batch_split, column_split, context_split_decode, context_split_prefill,
     general_dup, head_split, kv_persistence_split, row_split,
@@ -335,11 +337,63 @@ class TestEliminateDead:
         optimize_comms(g)
         assert comm in g.kernels
 
+    def test_removed_neighbor_can_make_an_earlier_comm_trivial(self):
+        graph = ComputeGraph()
+        pred = Kernel(outputs={"y": SHARD})
+        first = Scatter(total_bytes=128, world=2, dim=0)
+        first.inputs = {"x": SHARD}
+        first.outputs = {"y0": SHARD, "y1": SHARD}
+        second = Send(total_bytes=32)
+        second.inputs = {"x": SHARD}
+        second.outputs = {"y": SHARD}
+        succ = Kernel(inputs={"a": SHARD, "b": SHARD})
+        for kernel in (pred, first, second, succ):
+            graph.add_kernel(kernel)
+        graph.add_data_edge(pred, first, {"y": "x"})
+        graph.add_data_edge(first, second, {"y0": "x"})
+        graph.add_data_edge(first, succ, {"y1": "b"})
+        graph.add_data_edge(second, succ, {"y": "a"})
+
+        optimize_comms(graph)
+
+        assert graph.kernels == frozenset({pred, succ})
+
 
 # ── Guard clause tests (_fuse_pairs skips) ───────────────────────────
 
 
 class TestFusePairsGuards:
+    def test_create_collective_rejects_unexpected_pair(self):
+        with pytest.raises(ValueError, match="Unexpected pair"):
+            _create_collective(
+                Broadcast(total_bytes=8, world=2),
+                Gather(total_bytes=8, world=2, dim=0),
+            )
+
+    def test_same_dim_mismatched_shards_are_preserved(self):
+        gather = Gather(total_bytes=128.0, world=2, dim=0)
+        scatter = Scatter(total_bytes=128.0, world=2, dim=0)
+        graph, _, _, _ = _build_chain(gather, scatter, n=2)
+        scatter.outputs["y0"] = Tensor("bf16", (2, 8))
+
+        optimize_comms(graph)
+
+        assert gather in graph.kernels
+        assert scatter in graph.kernels
+
+    def test_bypass_tolerates_an_unconsumed_rank(self):
+        gather = Gather(total_bytes=128.0, world=2, dim=0)
+        scatter = Scatter(total_bytes=128.0, world=2, dim=0)
+        graph, _, preds, succs = _build_chain(gather, scatter, n=2)
+        graph.remove_kernel(succs[1])
+
+        optimize_comms(graph)
+
+        assert gather not in graph.kernels
+        assert scatter not in graph.kernels
+        assert graph._out_edges(preds[0])[0].dst is succs[0]
+        assert not graph._out_edges(preds[1])
+
     def test_collector_multi_successor_is_preserved(self):
         gather = Gather(total_bytes=128.0, world=2, dim=0)
         scatter = Scatter(total_bytes=128.0, world=2, dim=0)

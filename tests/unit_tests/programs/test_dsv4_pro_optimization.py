@@ -16,6 +16,7 @@ from rooflang.programs.dsv4_pro.optimization import (
 from rooflang.programs.presets.b300 import B300Cluster
 from rooflang.programs.presets.gb300 import GB300Cluster
 from rooflang.programs.presets.h200 import H200Cluster
+from rooflang.programs.presets.b300 import B300SuperChip
 from rooflang.runtime.simulator import Simulator
 
 
@@ -81,6 +82,59 @@ def test_cluster_optimizers_require_partition_to_cover_model():
             layers=[object(), object()], batch_size=64, seq_prefill=512,
             is_prefill=False,
             cp=2, dp=2, ep=4, pp_partition=[1, 2], n_gpus=8)
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"n_gpus": 16}, r"ep \* PP == n_gpus"),
+        ({"cp": 1, "dp": 3, "ep": 3, "n_gpus": 3}, "N_EXPERTS"),
+        ({"batch_size": 62}, "batch size"),
+        ({"seq_prefill": 511}, "prefill sequence"),
+        ({"seq_prefill": 520}, "compression ratio"),
+        ({"seq_prefill": 768, "cp": 8, "dp": 1, "ep": 8},
+         "compressed sequence"),
+        ({"batch_size": 8, "seq_prefill": 512, "is_prefill": False},
+         "expert-token count"),
+    ],
+)
+def test_cluster_optimizer_argument_validation(overrides, message,
+                                               monkeypatch):
+    monkeypatch.setattr(optimization, "N_EXPERTS", 8)
+    kwargs = dict(
+        layers=[object()], batch_size=64, seq_prefill=512,
+        is_prefill=True, cp=2, dp=4, ep=8,
+        pp_partition=[1], n_gpus=8,
+    )
+    kwargs.update(overrides)
+
+    with pytest.raises(ValueError, match=message):
+        optimization._validate_args(**kwargs)
+
+
+def test_cluster_optimizer_requires_window_divisible_by_cp(monkeypatch):
+    monkeypatch.setattr(optimization, "N_EXPERTS", 8)
+    monkeypatch.setattr(optimization, "WINDOW", 130)
+
+    with pytest.raises(ValueError, match="WINDOW"):
+        optimization._validate_args(
+            layers=[object()], batch_size=64, seq_prefill=512,
+            is_prefill=True, cp=4, dp=2, ep=8,
+            pp_partition=[1], n_gpus=8,
+        )
+
+
+def test_superchip_optimizer_places_the_graph(monkeypatch):
+    monkeypatch.setattr(model, "N_LAYERS", 1)
+    monkeypatch.setattr(model, "N_EXPERTS", 8)
+    graph = model.declare_model(batch_size=8, seq_prefill=512)[0]
+    hardware = B300SuperChip()
+
+    graph, placement = optimization.optimize_model_superchip(graph, hardware)
+
+    assert placement.placed_kernels == graph.kernels
+    assert len({assignment.device for assignment in
+                placement._mapping.values()}) == 1
 
 
 def test_declare_model_marks_kv_cache_for_persistence(monkeypatch):

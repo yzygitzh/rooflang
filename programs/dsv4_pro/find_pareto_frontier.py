@@ -502,7 +502,11 @@ def _point_label(point: dict) -> str:
     )
 
 
-def write_outputs(output_dir: Path, records: Sequence[dict]) -> None:
+def write_outputs(
+    output_dir: Path,
+    records: Sequence[dict],
+    point_labels: bool = False,
+) -> None:
     """Write all points plus original, elapsed, and overlapped frontiers."""
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_csv(output_dir / "all_points.csv", records)
@@ -560,16 +564,17 @@ def write_outputs(output_dir: Path, records: Sequence[dict]) -> None:
                         marker="o",
                         label=hardware,
                     )
-                    for point, user_value, gpu_value in zip(
-                            points, user_values, gpu_values):
-                        axis.annotate(
-                            _point_label(point),
-                            (user_value, gpu_value),
-                            xytext=(3, 3),
-                            textcoords="offset points",
-                            fontsize=6,
-                            alpha=0.85,
-                        )
+                    if point_labels:
+                        for point, user_value, gpu_value in zip(
+                                points, user_values, gpu_values):
+                            axis.annotate(
+                                _point_label(point),
+                                (user_value, gpu_value),
+                                xytext=(3, 3),
+                                textcoords="offset points",
+                                fontsize=6,
+                                alpha=0.85,
+                            )
                 axis.set_title(f"{n_gpus} GPUs")
                 axis.set_xlim(left=0)
                 axis.set_ylim(bottom=0)
@@ -701,6 +706,10 @@ def _parser() -> argparse.ArgumentParser:
         "--no-plot", action="store_true",
         help="Collect JSONL data without producing CSV and plots",
     )
+    parser.add_argument(
+        "--point-labels", action="store_true",
+        help="Label Pareto points with batch size and parallelism",
+    )
     return parser
 
 
@@ -720,7 +729,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.plot_only:
         if not existing:
             raise ValueError(f"No records found in {raw_path}")
-        write_outputs(args.output_dir, existing)
+        write_outputs(
+            args.output_dir, existing, point_labels=args.point_labels)
         return 0
 
     cases = list(enumerate_cases(
@@ -749,7 +759,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         cases, args.workers, raw_path, completed_ids)
     records = existing + new_records
     if not args.no_plot:
-        write_outputs(args.output_dir, records)
+        write_outputs(
+            args.output_dir, records, point_labels=args.point_labels)
     return 0
 
 

@@ -32,7 +32,11 @@ from rooflang.runtime.simulator import OOMError
 
 
 def test_default_worker_count_is_eight():
-    assert _parser().parse_args([]).workers == 8
+    args = _parser().parse_args([])
+
+    assert args.workers == 8
+    assert not args.point_labels
+    assert _parser().parse_args(["--point-labels"]).point_labels
 
 
 def test_parallel_configs_obey_optimizer_equalities():
@@ -458,6 +462,30 @@ def test_write_outputs_honors_filtered_workloads(tmp_path):
     assert not (tmp_path / "pareto_prefill-8k.png").exists()
 
 
+def test_write_outputs_point_labels_are_opt_in(tmp_path, monkeypatch):
+    record = {
+        "case_id": "one", "status": "ok", "workload": "prefill-8k",
+        "hardware": "b300", "n_gpus": 8, "batch_size": 8,
+        "cp": 1, "dp": 8, "ep": 8, "pp": 1, "pp_partition": [61],
+        "tokens_per_s_user": 10.0, "tokens_per_s_gpu": 20.0,
+        "tokens_per_s_user_elapsed": 10.0,
+        "tokens_per_s_gpu_elapsed": 20.0,
+        "tokens_per_s_user_overlapped": 10.0,
+        "tokens_per_s_gpu_overlapped": 20.0,
+    }
+    labels = []
+    monkeypatch.setattr(
+        finder, "_point_label",
+        lambda point: labels.append(point["case_id"]) or "label",
+    )
+
+    write_outputs(tmp_path, [record])
+    assert not labels
+
+    write_outputs(tmp_path, [record], point_labels=True)
+    assert labels == ["one"] * len(finder.THROUGHPUT_METRICS)
+
+
 def test_write_outputs_handles_empty_frontiers_and_extra_axes(tmp_path):
     records = [
         {"case_id": str(n_gpus), "status": "oom",
@@ -547,13 +575,14 @@ def test_main_plot_only_requires_and_writes_existing_records(
     writes = []
     monkeypatch.setattr(
         finder, "write_outputs",
-        lambda output_dir, records: writes.append((output_dir, records)),
+        lambda output_dir, records, point_labels=False:
+        writes.append((output_dir, records, point_labels)),
     )
 
     assert finder.main([
-        "--output-dir", str(tmp_path), "--plot-only",
+        "--output-dir", str(tmp_path), "--plot-only", "--point-labels",
     ]) == 0
-    assert writes == [(tmp_path, [record])]
+    assert writes == [(tmp_path, [record], True)]
 
 
 def test_main_dry_run_and_overwrite(tmp_path, monkeypatch, capsys):
@@ -592,12 +621,14 @@ def test_main_resumes_and_optionally_reruns_failures(tmp_path, monkeypatch):
     writes = []
     monkeypatch.setattr(
         finder, "write_outputs",
-        lambda output_dir, records: writes.append(list(records)),
+        lambda output_dir, records, point_labels=False:
+        writes.append((list(records), point_labels)),
     )
 
     assert finder.main(["--output-dir", str(tmp_path)]) == 0
     assert parallel_calls[-1] == {cases[0].case_id, cases[1].case_id}
-    assert writes[-1] == existing + [{"case_id": "new", "status": "ok"}]
+    assert writes[-1] == (
+        existing + [{"case_id": "new", "status": "ok"}], False)
 
     assert finder.main([
         "--output-dir", str(tmp_path), "--rerun-failures", "--no-plot",

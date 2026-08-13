@@ -178,6 +178,29 @@ class TestPlacedKernels:
         assert p.placed_kernels == frozenset({k1, k2})
 
 
+class TestMemoryFootprints:
+    def test_record_memory_footprint_aggregates_by_memory_and_role(self):
+        memory = Memory(name="hbm", capacity_gb=1.0)
+        placement = Placement()
+
+        placement.record_memory_footprint(memory, 1024.0, "kv_cache")
+        placement.record_memory_footprint(memory, 512.0, "kv_cache")
+
+        footprint, = placement.memory_footprints
+        assert footprint.memory is memory
+        assert footprint.size_bytes == 1536.0
+        assert footprint.role == "kv_cache"
+
+    def test_zero_is_ignored_and_negative_raises(self):
+        memory = Memory(name="hbm", capacity_gb=1.0)
+        placement = Placement()
+
+        placement.record_memory_footprint(memory, 0.0, "unused")
+        assert not placement.memory_footprints
+        with pytest.raises(ValueError, match="non-negative"):
+            placement.record_memory_footprint(memory, -1.0, "invalid")
+
+
 # ── Placement.validate tests ─────────────────────────────────────────
 
 

@@ -16,6 +16,12 @@ Ideal-overlap variants additionally assume that, on each GPU, the shorter of
 total compute and exposed communication time can be completely hidden by the
 longer one.
 
+The simulator executes and accounts for one batch.  Memory feasibility is
+then evaluated separately for each frontier: original uses one KV copy,
+elapsed uses ``PP`` concurrent copies, and overlapped uses ``2 * PP`` copies.
+Only the tagged KV-cache footprint is replicated; weights and activations keep
+their simulated peak usage.
+
 Each simulation is an independent process.  Results are appended to JSONL as
 they finish, so an interrupted search can resume without repeating completed
 cases.
@@ -68,6 +74,11 @@ THROUGHPUT_METRICS = {
         "tokens_per_s_user_elapsed", "tokens_per_s_gpu_elapsed"),
     "overlapped": (
         "tokens_per_s_user_overlapped", "tokens_per_s_gpu_overlapped"),
+}
+MEMORY_FEASIBILITY_FIELDS = {
+    "original": None,
+    "elapsed": "memory_feasible_elapsed",
+    "overlapped": "memory_feasible_overlapped",
 }
 
 
@@ -217,13 +228,43 @@ def build_hardware(name: str, n_gpus: int):
     raise ValueError(f"Unknown hardware: {name}")
 
 
-def _peak_memory_gb(result, kind: str) -> float:
+def _max_memory_gb(memory_usage, kind: str) -> float:
     values = [
         value / 1e9
-        for memory, value in result.peak_memory.items()
+        for memory, value in memory_usage.items()
         if isinstance(memory, Memory) and memory.kind == kind
     ]
     return max(values, default=0.0)
+
+
+def _peak_memory_gb(result, kind: str) -> float:
+    return _max_memory_gb(result.peak_memory, kind)
+
+
+def _kv_cache_memory(result) -> dict[Memory, float]:
+    usage = {}
+    for footprint in result.memory_footprints:
+        if footprint.role != "kv_cache":
+            continue
+        usage[footprint.memory] = \
+            usage.get(footprint.memory, 0.0) + footprint.size_bytes
+    return usage
+
+
+def _project_memory(result, concurrent_batches: int) -> dict[Memory, float]:
+    """Project peaks while replicating only persistent KV cache state."""
+    projected = dict(result.peak_memory)
+    for memory, size_bytes in _kv_cache_memory(result).items():
+        projected[memory] = projected.get(memory, 0.0) \
+            + (concurrent_batches - 1) * size_bytes
+    return projected
+
+
+def _memory_feasible(memory_usage) -> bool:
+    return all(
+        size_bytes <= memory.capacity_gb * 1e9
+        for memory, size_bytes in memory_usage.items()
+    )
 
 
 def _output_path_kernels(graph) -> tuple[set, set]:
@@ -401,6 +442,31 @@ def run_case(case: Case) -> dict:
             "peak_ssd_gb": _peak_memory_gb(result, "ssd"),
             "kernel_count": len(graph.kernels),
         })
+        kv_cache_memory = _kv_cache_memory(result)
+        pp_degree = len(case.pp_partition)
+        elapsed_memory = _project_memory(result, pp_degree)
+        overlapped_memory = _project_memory(result, pp_degree * 2)
+        record.update({
+            "concurrent_batches_elapsed": pp_degree,
+            "concurrent_batches_overlapped": pp_degree * 2,
+            "kv_cache_hbm_gb": _max_memory_gb(kv_cache_memory, "hbm"),
+            "kv_cache_ssd_gb": _max_memory_gb(kv_cache_memory, "ssd"),
+            "memory_feasible_elapsed": _memory_feasible(elapsed_memory),
+            "memory_feasible_overlapped": _memory_feasible(
+                overlapped_memory),
+            "peak_hbm_gb_elapsed": _max_memory_gb(
+                elapsed_memory, "hbm"),
+            "peak_dram_gb_elapsed": _max_memory_gb(
+                elapsed_memory, "dram"),
+            "peak_ssd_gb_elapsed": _max_memory_gb(
+                elapsed_memory, "ssd"),
+            "peak_hbm_gb_overlapped": _max_memory_gb(
+                overlapped_memory, "hbm"),
+            "peak_dram_gb_overlapped": _max_memory_gb(
+                overlapped_memory, "dram"),
+            "peak_ssd_gb_overlapped": _max_memory_gb(
+                overlapped_memory, "ssd"),
+        })
         record.update(_gpu_timing_metrics(
             result, total_tokens, tokens_per_user, case.n_gpus, output_path,
             duration_us))
@@ -426,9 +492,15 @@ def pareto_frontier(
     records: Iterable[dict],
     user_metric: str = "tokens_per_s_user",
     gpu_metric: str = "tokens_per_s_gpu",
+    memory_feasible_field: str | None = None,
 ) -> list[dict]:
     """Return points not dominated on both maximized throughput metrics."""
-    points = [record for record in records if record.get("status") == "ok"]
+    points = [
+        record for record in records
+        if record.get("status") == "ok"
+        and (memory_feasible_field is None
+             or record.get(memory_feasible_field, False))
+    ]
     points.sort(
         key=lambda record: (
             -record[user_metric],
@@ -450,6 +522,7 @@ def grouped_frontiers(
     records: Sequence[dict],
     user_metric: str = "tokens_per_s_user",
     gpu_metric: str = "tokens_per_s_gpu",
+    memory_feasible_field: str | None = None,
 ) -> dict[tuple, list[dict]]:
     groups = {}
     for record in records:
@@ -458,7 +531,8 @@ def grouped_frontiers(
         key = (record["workload"], record["hardware"], record["n_gpus"])
         groups.setdefault(key, []).append(record)
     return {
-        key: pareto_frontier(group, user_metric, gpu_metric)
+        key: pareto_frontier(
+            group, user_metric, gpu_metric, memory_feasible_field)
         for key, group in groups.items()
     }
 
@@ -512,7 +586,9 @@ def write_outputs(
     _write_csv(output_dir / "all_points.csv", records)
     frontiers_by_timing = {}
     for timing, (user_metric, gpu_metric) in THROUGHPUT_METRICS.items():
-        frontiers = grouped_frontiers(records, user_metric, gpu_metric)
+        frontiers = grouped_frontiers(
+            records, user_metric, gpu_metric,
+            MEMORY_FEASIBILITY_FIELDS[timing])
         frontiers_by_timing[timing] = frontiers
         frontier_records = [
             point for group in frontiers.values() for point in group

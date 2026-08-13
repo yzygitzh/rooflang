@@ -17,7 +17,7 @@ from rooflang.language.graph import ComputeGraph, FabricEdge, HardwareGraph
 from rooflang.language.hardware.component import Compute, Memory
 from rooflang.language.kernels.comm import AllToAll, CommKernel, Recv, Send
 from rooflang.language.kernels.kernel import Kernel
-from rooflang.language.placement import Placement
+from rooflang.language.placement import MemoryFootprint, Placement
 from rooflang.language.tensor import Tensor
 
 FabricKey = Tuple[FabricEdge, Optional[str]]
@@ -88,12 +88,14 @@ class TraceEntry:
 class SimulationResult:
     def __init__(self, trace: List[TraceEntry], total_time_us: float,
                  peak_memory: Dict[Memory, float],
-                 measurement_start_us: float = 0.0):
+                 measurement_start_us: float = 0.0,
+                 memory_footprints: tuple[MemoryFootprint, ...] = ()):
         self.trace = trace
         self.total_time_us = total_time_us
         self.peak_memory = peak_memory
         self.measurement_start_us = measurement_start_us
         self.measured_time_us = total_time_us - measurement_start_us
+        self.memory_footprints = memory_footprints
 
 
 class RunningKernel:
@@ -332,7 +334,8 @@ class Simulator:
                 raise ValueError("Measurement-start kernel was not executed")
             measurement_start_us = min(starts)
         return SimulationResult(
-            self._trace, total, dict(self._mem_peak), measurement_start_us)
+            self._trace, total, dict(self._mem_peak), measurement_start_us,
+            self._placement.memory_footprints)
 
     # ── Event queue ─────────────────────────────────────────────────
 

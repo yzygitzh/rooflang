@@ -137,6 +137,46 @@ def _nearby_memory(device, gpus_by_node, memories_by_node):
     return memories[device_rank * len(memories) // len(devices)]
 
 
+def _record_kv_cache_footprints(
+    g, placement, barrier_copies, kv_read_copies=None,
+):
+    """Record one batch's per-memory KV usage as trace metadata."""
+    for barrier in barrier_copies:
+        for input_name, tensor in barrier.inputs.items():
+            if not input_name.startswith("kv"):
+                continue
+            placement.record_memory_footprint(
+                placement.get_tensor_memory(tensor),
+                tensor.size_bytes,
+                "kv_cache",
+            )
+
+    pending = [
+        kv_read
+        for copies in kv_read_copies or ()
+        for kv_read in copies
+    ]
+    visited = set()
+    roots = set()
+    while pending:
+        kernel = pending.pop()
+        if kernel in visited:
+            continue
+        visited.add(kernel)
+        predecessors = [edge.src for edge in g._in_edges(kernel)]
+        if predecessors:
+            pending.extend(predecessors)
+        else:
+            roots.add(kernel)
+    for root in roots:
+        for tensor in root.inputs.values():
+            placement.record_memory_footprint(
+                placement.get_tensor_memory(tensor),
+                tensor.size_bytes,
+                "kv_cache",
+            )
+
+
 def _validate_args(
     layers, batch_size, seq_prefill, is_prefill,
     cp, dp, ep, pp_partition, n_gpus,
@@ -417,6 +457,7 @@ def optimize_model_cluster_prefill(
 
     g.validate()
     placement.validate(g)
+    _record_kv_cache_footprints(g, placement, barrier_copies)
     return g, placement
 
 
@@ -628,6 +669,8 @@ def optimize_model_cluster_decode(
     _place_comm_tensor_memories(g, placement)
     g.validate()
     placement.validate(g)
+    _record_kv_cache_footprints(
+        g, placement, barrier_copies, kv_read_cp_dp_copies)
     return g, placement
 
 

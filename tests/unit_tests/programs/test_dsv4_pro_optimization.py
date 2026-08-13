@@ -213,6 +213,22 @@ def test_cp4_dp2_ep8_pp2_prefill(monkeypatch):
                     edge.src.outputs[output_name]) is \
                     placement.get_tensor_memory(barrier.inputs[input_name])
 
+    footprints = [
+        footprint for footprint in placement.memory_footprints
+        if footprint.role == "kv_cache" and footprint.memory.kind == "hbm"
+    ]
+    kv_tensors = [
+        tensor
+        for barrier in barriers
+        for input_name, tensor in barrier.inputs.items()
+        if input_name.startswith("kv")
+    ]
+    assert {footprint.memory for footprint in footprints} == {
+        placement.get_tensor_memory(tensor) for tensor in kv_tensors
+    }
+    assert sum(footprint.size_bytes for footprint in footprints) == \
+        sum(tensor.size_bytes for tensor in kv_tensors)
+
     for layer_id, layer in enumerate(layers):
         copies = layer._ffn_add_cp_dp_copies
         assert len(copies) == 8
@@ -271,6 +287,10 @@ def test_h200_cluster_resources_use_component_kinds(monkeypatch):
     assert devices
     assert all(device.kind == "gpu" for device in devices)
     assert all("nvidia-h200" in device.name for device in devices)
+    assert placement.memory_footprints
+    assert all(footprint.role == "kv_cache"
+               and footprint.memory.kind == "hbm"
+               for footprint in placement.memory_footprints)
     assert Simulator(graph, placement, hw).run().total_time_us > 0
 
 
@@ -295,6 +315,8 @@ def test_h200_cluster_decode_uses_component_kinds(monkeypatch):
     assert devices
     assert all(device.kind == "gpu" for device in devices)
     assert all("nvidia-h200" in device.name for device in devices)
+    assert {footprint.memory.kind
+            for footprint in placement.memory_footprints} == {"hbm", "ssd"}
     assert Simulator(
         graph, placement, hw, measurement_start=read_input,
     ).run().measured_time_us > 0
@@ -400,6 +422,24 @@ def test_cp4_dp2_ep8_pp2_decode(monkeypatch):
         placement.get_tensor_memory(kernel.inputs["kv"]).kind == "ssd"
         for kernel in kv_preloads
     )
+
+    hbm_footprints = [
+        footprint for footprint in placement.memory_footprints
+        if footprint.role == "kv_cache" and footprint.memory.kind == "hbm"
+    ]
+    kv_tensors = [
+        tensor
+        for barrier in barriers
+        for input_name, tensor in barrier.inputs.items()
+        if input_name.startswith("kv")
+    ]
+    assert sum(footprint.size_bytes for footprint in hbm_footprints) == \
+        sum(tensor.size_bytes for tensor in kv_tensors)
+
+    ssd_footprints = [
+        footprint for footprint in placement.memory_footprints
+        if footprint.role == "kv_cache" and footprint.memory.kind == "ssd"
+    ]
     assert placement.get_tensor_memory(
         read_input.inputs["tokens"]).kind == "dram"
 
@@ -422,6 +462,9 @@ def test_cp4_dp2_ep8_pp2_decode(monkeypatch):
         for kernel in kv_roots
         for tensor in kernel.inputs.values()
     )
+    assert sum(footprint.size_bytes for footprint in ssd_footprints) == \
+        sum(tensor.size_bytes
+            for kernel in kv_roots for tensor in kernel.inputs.values())
     control_predecessors = {
         kernel for kernel in graph._dag.predecessors(read_input)
         if not graph._dag.edges[kernel, read_input]["mapping"]

@@ -34,6 +34,15 @@ class DeviceAssignment:
     resource_cap: float = 1.0
 
 
+@dataclass(frozen=True)
+class MemoryFootprint:
+    """Tagged memory usage metadata for one simulated graph wave."""
+
+    memory: Memory
+    size_bytes: float
+    role: str
+
+
 class Placement:
     """Placement mapping: kernel -> DeviceAssignment, tensor -> Memory.
 
@@ -47,6 +56,7 @@ class Placement:
         self._graph = graph
         self._mapping: Dict[Kernel, DeviceAssignment] = {}
         self._memory: Dict[Tensor, Memory] = {}
+        self._memory_footprints: Dict[tuple[Memory, str], float] = {}
 
     # ── Kernel device placement ──────────────────────────────────────
 
@@ -76,6 +86,19 @@ class Placement:
     def get_tensor_memory(self, tensor: Tensor) -> Optional[Memory]:
         """Get the memory location for a tensor, or None if unset."""
         return self._memory.get(tensor)
+
+    def record_memory_footprint(
+        self, memory: Memory, size_bytes: float, role: str,
+    ) -> None:
+        """Record tagged usage without changing simulated memory accounting."""
+        if size_bytes < 0:
+            raise ValueError(
+                f"memory footprint must be non-negative, got {size_bytes}")
+        if size_bytes == 0:
+            return
+        key = (memory, role)
+        self._memory_footprints[key] = \
+            self._memory_footprints.get(key, 0.0) + size_bytes
 
     def infer_comm_devices(self, kernel: Kernel) -> List[Compute]:
         """Infer comm participants solely from its placed tensor ports."""
@@ -113,6 +136,14 @@ class Placement:
     def placed_kernels(self) -> FrozenSet[Kernel]:
         """All kernels that have been assigned a placement."""
         return frozenset(self._mapping.keys())
+
+    @property
+    def memory_footprints(self) -> tuple[MemoryFootprint, ...]:
+        """Tagged per-memory usage metadata attached to this placement."""
+        return tuple(
+            MemoryFootprint(memory, size_bytes, role)
+            for (memory, role), size_bytes in self._memory_footprints.items()
+        )
 
     # ── Validation ───────────────────────────────────────────────────
 

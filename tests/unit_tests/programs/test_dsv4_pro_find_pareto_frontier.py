@@ -13,9 +13,11 @@ from rooflang.programs.dsv4_pro.find_pareto_frontier import (
     Case,
     ParallelConfig,
     _gpu_timing_metrics,
+    _memory_feasible,
     _output_path_kernels,
     _peak_memory_gb,
     _point_label,
+    _project_memory,
     _read_jsonl,
     _run_parallel,
     _parser,
@@ -141,6 +143,25 @@ def test_peak_memory_filters_component_kind():
     assert _peak_memory_gb(result, "ssd") == 0.0
 
 
+def test_project_memory_replicates_only_kv_cache():
+    hbm = Memory("hbm", capacity_gb=10.0, kind="hbm")
+    result = SimpleNamespace(
+        peak_memory={hbm: 6e9},
+        memory_footprints=[
+            SimpleNamespace(
+                memory=hbm, size_bytes=2e9, role="kv_cache"),
+            SimpleNamespace(
+                memory=hbm, size_bytes=1e9, role="other"),
+        ],
+    )
+
+    projected = _project_memory(result, concurrent_batches=3)
+
+    assert projected[hbm] == 10e9
+    assert _memory_feasible(projected)
+    assert not _memory_feasible(_project_memory(result, 4))
+
+
 def test_pareto_frontier_removes_dominated_and_duplicate_points():
     records = [
         {"case_id": "a", "status": "ok",
@@ -177,6 +198,28 @@ def test_pareto_frontier_uses_selected_timing_metrics():
 
     assert [point["case_id"] for point in original] == ["original"]
     assert [point["case_id"] for point in elapsed] == ["elapsed"]
+
+
+def test_pareto_frontier_uses_timing_specific_memory_feasibility():
+    records = [
+        {"case_id": "infeasible", "status": "ok",
+         "tokens_per_s_user_elapsed": 12.0,
+         "tokens_per_s_gpu_elapsed": 12.0,
+         "memory_feasible_elapsed": False},
+        {"case_id": "feasible", "status": "ok",
+         "tokens_per_s_user_elapsed": 8.0,
+         "tokens_per_s_gpu_elapsed": 8.0,
+         "memory_feasible_elapsed": True},
+    ]
+
+    frontier = pareto_frontier(
+        records,
+        "tokens_per_s_user_elapsed",
+        "tokens_per_s_gpu_elapsed",
+        "memory_feasible_elapsed",
+    )
+
+    assert [point["case_id"] for point in frontier] == ["feasible"]
 
 
 def test_gpu_activity_includes_bubbles_until_each_gpus_final_kernel():
@@ -331,6 +374,7 @@ def test_run_case_success_for_prefill_and_decode(monkeypatch):
         measurement_start_us=10.0,
         total_time_us=120.0,
         peak_memory={},
+        memory_footprints=(),
     )
 
     class FakeSimulator:
@@ -361,6 +405,10 @@ def test_run_case_success_for_prefill_and_decode(monkeypatch):
     assert decode["tokens_per_s_user"] == 1 / 0.0001
     assert prefill["post_output_ms"] == 0.01
     assert prefill["compute_ratio"] == 0.5
+    assert prefill["concurrent_batches_elapsed"] == 1
+    assert prefill["concurrent_batches_overlapped"] == 2
+    assert prefill["memory_feasible_elapsed"]
+    assert prefill["memory_feasible_overlapped"]
     assert [name for name, _ in optimizer_calls] == ["prefill", "decode"]
     assert "seq_prefill" in optimizer_calls[1][1]
 
@@ -448,6 +496,8 @@ def test_write_outputs_honors_filtered_workloads(tmp_path):
         "tokens_per_s_gpu_elapsed": 24.0,
         "tokens_per_s_user_overlapped": 15.0,
         "tokens_per_s_gpu_overlapped": 30.0,
+        "memory_feasible_elapsed": True,
+        "memory_feasible_overlapped": True,
     }
 
     write_outputs(tmp_path, [record])
@@ -472,6 +522,8 @@ def test_write_outputs_point_labels_are_opt_in(tmp_path, monkeypatch):
         "tokens_per_s_gpu_elapsed": 20.0,
         "tokens_per_s_user_overlapped": 10.0,
         "tokens_per_s_gpu_overlapped": 20.0,
+        "memory_feasible_elapsed": True,
+        "memory_feasible_overlapped": True,
     }
     labels = []
     monkeypatch.setattr(

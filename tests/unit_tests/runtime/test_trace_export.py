@@ -135,6 +135,7 @@ class TestExportTrace:
         g.add_kernel(k)
         p = Placement(hardware=hw)
         p.set_kernel_device(k, gpu)
+        p.record_memory_footprint(hbm, 4096.0, "kv_cache")
         result = Simulator(g, p, hw).run()
 
         out = str(tmp_path / "trace.json")
@@ -151,3 +152,9 @@ class TestExportTrace:
         assert isinstance(other["peak_memory"], list)
         assert other["peak_memory"][0]["name"] == "hbm"
         assert other["peak_memory"][0]["bytes"] == result.peak_memory[hbm]
+        assert other["memory_footprints"] == [{
+            "name": "hbm",
+            "kind": None,
+            "role": "kv_cache",
+            "bytes": 4096.0,
+        }]

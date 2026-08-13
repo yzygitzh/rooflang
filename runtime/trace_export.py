@@ -82,6 +82,15 @@ def export_trace(result: SimulationResult, path: str) -> None:
 
     peak_memory = [{"name": mem.name, "bytes": bytes_val}
                    for mem, bytes_val in result.peak_memory.items()]
+    memory_footprints = [
+        {
+            "name": footprint.memory.name,
+            "kind": footprint.memory.kind,
+            "role": footprint.role,
+            "bytes": footprint.size_bytes,
+        }
+        for footprint in result.memory_footprints
+    ]
 
     total_s = result.total_time_us / 1e6 if result.total_time_us > 0 else 0.0
     device_stats: Dict[str, Dict[str, float]] = {}
@@ -145,6 +154,7 @@ def export_trace(result: SimulationResult, path: str) -> None:
             "measured_time_us": result.measured_time_us,
             f"mfu_{global_top_dtype}": mfu_top_global,
             "peak_memory": peak_memory,
+            "memory_footprints": memory_footprints,
             "gpu_stats": gpu_stats,
         },
     }

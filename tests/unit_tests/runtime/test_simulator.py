@@ -619,6 +619,23 @@ class TestOOM:
         assert hbm in result.peak_memory
         assert result.peak_memory[hbm] == t_in.size_bytes
 
+    def test_memory_footprint_is_metadata_not_simulated_usage(self):
+        hw, gpu, hbm = _hw_small(capacity_gb=0.000001)  # 1000 bytes
+        kernel = SyntheticKernel(flops_val=1e6)
+        graph = ComputeGraph()
+        graph.add_kernel(kernel)
+        placement = Placement(hardware=hw)
+        placement.set_kernel_device(kernel, gpu)
+        placement.record_memory_footprint(hbm, 1200.0, "kv_cache")
+
+        result = _sim(graph, placement, hw)
+
+        assert result.peak_memory.get(hbm, 0.0) == 0.0
+        footprint, = result.memory_footprints
+        assert footprint.memory is hbm
+        assert footprint.size_bytes == 1200.0
+        assert footprint.role == "kv_cache"
+
     def test_oom_raises(self):
         hw, gpu, hbm = _hw_small(capacity_gb=0.000001)  # 1000 bytes
         # output = 10000 bf16 elements = 20000 bytes > 1000

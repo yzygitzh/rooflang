@@ -66,10 +66,12 @@ class TraceEntry:
     __slots__ = (
         "kernel", "device", "stream", "start_us", "end_us", "bound",
         "compute_time_us", "memory_time_us", "network_time_us",
+        "local_elapsed_time_us", "network_elapsed_time_us",
     )
 
     def __init__(self, kernel, device, stream, start_us, end_us, bound,
-                 compute_time_us, memory_time_us, network_time_us):
+                 compute_time_us, memory_time_us, network_time_us,
+                 local_elapsed_time_us, network_elapsed_time_us):
         self.kernel = kernel
         self.device = device
         self.stream = stream
@@ -79,6 +81,8 @@ class TraceEntry:
         self.compute_time_us = compute_time_us
         self.memory_time_us = memory_time_us
         self.network_time_us = network_time_us
+        self.local_elapsed_time_us = local_elapsed_time_us
+        self.network_elapsed_time_us = network_elapsed_time_us
 
 
 class SimulationResult:
@@ -100,7 +104,8 @@ class RunningKernel:
                  "network_alpha", "network_transfer_time",
                  "link_data", "fabric_keys", "participants", "start_us",
                  "cp", "mp", "tp", "alpha_remaining",
-                 "seg_start", "dev_share", "net_share")
+                 "seg_start", "dev_share", "net_share",
+                 "local_elapsed_time", "network_elapsed_time")
 
     def __init__(self, kernel, device, stream, cap, ct, mt,
                  alpha, xfer, link_data, parts, t0):
@@ -120,23 +125,50 @@ class RunningKernel:
         self.alpha_remaining = alpha
         self.seg_start = t0
         self.dev_share = self.net_share = 1.0
+        self.local_elapsed_time = 0.0
+        self.network_elapsed_time = 0.0
 
     def advance_to(self, now):
         dt = now - self.seg_start
         if dt <= 0:
             return
+        local_remaining = 0.0
+        if self.compute_time > 0 and self.cp < 1.0:
+            local_remaining = max(
+                local_remaining,
+                (1.0 - self.cp) * self.compute_time / self.dev_share,
+            )
+        if self.memory_time > 0 and self.mp < 1.0:
+            local_remaining = max(
+                local_remaining,
+                (1.0 - self.mp) * self.memory_time / self.dev_share,
+            )
+        self.local_elapsed_time += min(dt, local_remaining)
         if self.compute_time > 0:
-            self.cp += dt * self.dev_share / self.compute_time
+            self.cp = min(
+                1.0, self.cp + dt * self.dev_share / self.compute_time)
         if self.memory_time > 0:
-            self.mp += dt * self.dev_share / self.memory_time
+            self.mp = min(
+                1.0, self.mp + dt * self.dev_share / self.memory_time)
         if self.alpha_remaining > 0:
             consumed = min(dt, self.alpha_remaining)
+            self.network_elapsed_time += consumed
             self.alpha_remaining -= consumed
             net_dt = dt - consumed
         else:
             net_dt = dt
-        if self.network_transfer_time > 0 and net_dt > 0:
-            self.tp += net_dt * self.net_share / self.network_transfer_time
+        if self.network_transfer_time > 0 and net_dt > 0 and self.tp < 1.0:
+            transfer_remaining = (
+                (1.0 - self.tp) * self.network_transfer_time
+                / self.net_share
+            )
+            transferred_dt = min(net_dt, transfer_remaining)
+            self.network_elapsed_time += transferred_dt
+            self.tp = min(
+                1.0,
+                self.tp
+                + transferred_dt * self.net_share / self.network_transfer_time,
+            )
         self.seg_start = now
 
     def eta(self) -> float:
@@ -267,6 +299,8 @@ class Simulator:
                     rk.compute_time,
                     rk.memory_time,
                     rk.network_time(),
+                    rk.local_elapsed_time,
+                    rk.network_elapsed_time,
                 )
                 if isinstance(kernel, CommKernel) and len(rk.participants) > 1:
                     for part_dev in rk.participants:

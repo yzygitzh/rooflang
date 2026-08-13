@@ -89,6 +89,10 @@ class TestExportTrace:
         assert ev["args"]["compute_time_us"] == entry.compute_time_us
         assert ev["args"]["memory_time_us"] == entry.memory_time_us
         assert ev["args"]["network_time_us"] == entry.network_time_us
+        assert ev["args"]["local_elapsed_time_us"] \
+            == entry.local_elapsed_time_us
+        assert ev["args"]["network_elapsed_time_us"] \
+            == entry.network_elapsed_time_us
 
     def test_metadata_events_present(self, tmp_path):
         hw, gpu, hbm = _hw()

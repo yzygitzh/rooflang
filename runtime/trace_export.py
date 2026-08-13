@@ -72,6 +72,8 @@ def export_trace(result: SimulationResult, path: str) -> None:
                 "compute_time_us": entry.compute_time_us,
                 "memory_time_us": entry.memory_time_us,
                 "network_time_us": entry.network_time_us,
+                "local_elapsed_time_us": entry.local_elapsed_time_us,
+                "network_elapsed_time_us": entry.network_elapsed_time_us,
                 "inputs": inputs,
                 "weights": weights,
                 "outputs": outputs,

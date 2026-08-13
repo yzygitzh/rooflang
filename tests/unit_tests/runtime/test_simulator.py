@@ -76,6 +76,8 @@ class TestSingleKernel:
         assert entry.compute_time_us == pytest.approx(2.0)
         assert entry.memory_time_us == pytest.approx(2e-6)
         assert entry.network_time_us == 0.0
+        assert entry.local_elapsed_time_us == pytest.approx(2.0)
+        assert entry.network_elapsed_time_us == 0.0
 
     def test_memory_bound(self):
         hw, gpu, hbm = _hw(read_bw=1.0, write_bw=1.0, tflops=1000.0)
@@ -94,6 +96,8 @@ class TestSingleKernel:
         assert entry.compute_time_us == pytest.approx(0.001)
         assert entry.memory_time_us == pytest.approx(2.0)
         assert entry.network_time_us == 0.0
+        assert entry.local_elapsed_time_us == pytest.approx(2.0)
+        assert entry.network_elapsed_time_us == 0.0
 
 
 # ── Stream serialization ─────────────────────────────────────────────
@@ -153,6 +157,9 @@ class TestStreamSerial:
         p.set_kernel_device(k2, gpu, stream=1)
         result = _sim(g, p, hw)
         assert result.total_time_us == pytest.approx(2.0, rel=1e-6)
+        for entry in result.trace:
+            assert entry.local_elapsed_time_us == pytest.approx(2.0)
+            assert entry.network_elapsed_time_us == 0.0
 
     def test_three_on_same_stream(self):
         hw, gpu, hbm = _hw(read_bw=1000.0, write_bw=1000.0, tflops=1.0)
@@ -193,6 +200,12 @@ class TestResourceSharing:
         p.set_kernel_device(k2, gpu, stream=1, resource_cap=0.25)
         result = _sim(g, p, hw)
         assert result.total_time_us == pytest.approx(4.0, rel=1e-6)
+        elapsed_by_kernel = {
+            entry.kernel: entry.local_elapsed_time_us
+            for entry in result.trace
+        }
+        assert elapsed_by_kernel[k1] == pytest.approx(4 / 3)
+        assert elapsed_by_kernel[k2] == pytest.approx(4.0)
 
 
 # ── Read/write bandwidth direction ──────────────────────────────────
@@ -820,6 +833,9 @@ class TestCrossDeviceFabric:
         # With sharing (GPU0↔switch has 2 users): net_share = 0.5 → 2.0 us each
         # Total = k1(0.2) + max(k2, k3)(2.0) = 2.2 us
         assert result.total_time_us == pytest.approx(2.2, rel=1e-2)
+        for entry in result.trace:
+            if entry.kernel in (k2, k3):
+                assert entry.network_elapsed_time_us == pytest.approx(2.0)
 
     def test_remote_write_uses_link_bandwidth(self):
         """A kernel writing output to remote memory uses link bandwidth."""
@@ -1196,6 +1212,8 @@ class TestNetSharePureCompute:
         assert len(comp_entry) == 1
         comp_time = comp_entry[0].end_us - comp_entry[0].start_us
         assert comp_time == pytest.approx(15.0, rel=0.01)
+        assert comp_entry[0].local_elapsed_time_us == pytest.approx(
+            15.0, rel=0.01)
 
 
 class TestMultipleRemoteReadsAccumulate:

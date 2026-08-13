@@ -189,31 +189,45 @@ def test_gpu_activity_includes_bubbles_until_each_gpus_final_kernel():
             SimpleNamespace(kernel=compute0, device=gpu0,
                             start_us=50.0, end_us=150.0,
                             compute_time_us=100.0, memory_time_us=80.0,
-                            network_time_us=0.0),
+                            network_time_us=0.0,
+                            local_elapsed_time_us=100.0,
+                            network_elapsed_time_us=0.0),
             SimpleNamespace(kernel=compute1, device=gpu1,
                             start_us=120.0, end_us=160.0,
                             compute_time_us=40.0, memory_time_us=20.0,
-                            network_time_us=0.0),
+                            network_time_us=0.0,
+                            local_elapsed_time_us=40.0,
+                            network_elapsed_time_us=0.0),
             SimpleNamespace(kernel=communication0, device=gpu0,
                             start_us=150.0, end_us=180.0,
                             compute_time_us=0.0, memory_time_us=0.0,
-                            network_time_us=30.0),
+                            network_time_us=30.0,
+                            local_elapsed_time_us=0.0,
+                            network_elapsed_time_us=30.0),
             SimpleNamespace(kernel=compute0, device=gpu0,
                             start_us=180.0, end_us=200.0,
                             compute_time_us=10.0, memory_time_us=20.0,
-                            network_time_us=15.0),
+                            network_time_us=15.0,
+                            local_elapsed_time_us=20.0,
+                            network_elapsed_time_us=15.0),
             SimpleNamespace(kernel=communication1, device=gpu1,
                             start_us=180.0, end_us=220.0,
                             compute_time_us=0.0, memory_time_us=0.0,
-                            network_time_us=40.0),
+                            network_time_us=40.0,
+                            local_elapsed_time_us=0.0,
+                            network_elapsed_time_us=40.0),
             SimpleNamespace(kernel=barrier, device=gpu0,
                             start_us=250.0, end_us=300.0,
                             compute_time_us=0.0, memory_time_us=0.0,
-                            network_time_us=0.0),
+                            network_time_us=0.0,
+                            local_elapsed_time_us=0.0,
+                            network_elapsed_time_us=0.0),
             SimpleNamespace(kernel=barrier, device=cpu,
                             start_us=100.0, end_us=300.0,
                             compute_time_us=0.0, memory_time_us=0.0,
-                            network_time_us=0.0),
+                            network_time_us=0.0,
+                            local_elapsed_time_us=0.0,
+                            network_elapsed_time_us=0.0),
         ],
     )
 
@@ -232,6 +246,42 @@ def test_gpu_activity_includes_bubbles_until_each_gpus_final_kernel():
     assert metrics["communication_ratio"] == 70 / 200
     assert metrics["tokens_per_s_gpu_overlapped"] == 100 / 0.00013
     assert metrics["gpu_completion_fraction"] == 200 / (2 * 120)
+
+
+@pytest.mark.parametrize(
+    ("local_elapsed_us", "network_elapsed_us", "compute_ratio",
+     "communication_ratio"),
+    [
+        (0.0, 100.0, 0.0, 1.0),
+        (100.0, 20.0, 1.0, 0.0),
+    ],
+)
+def test_gpu_activity_attributes_contention_to_its_resource(
+    local_elapsed_us, network_elapsed_us, compute_ratio,
+    communication_ratio,
+):
+    gpu = Compute(name="gpu0", kind="gpu")
+    communication = Nop()
+    result = SimpleNamespace(
+        measurement_start_us=0.0,
+        trace=[
+            SimpleNamespace(
+                kernel=communication, device=gpu,
+                start_us=-20.0, end_us=80.0,
+                compute_time_us=0.0, memory_time_us=0.0,
+                network_time_us=0.0,
+                local_elapsed_time_us=local_elapsed_us,
+                network_elapsed_time_us=network_elapsed_us),
+        ],
+    )
+
+    metrics = _gpu_timing_metrics(
+        result, total_tokens=1, tokens_per_user=1, n_gpus=1,
+        included_kernels={communication}, duration_us=80.0)
+
+    assert metrics["compute_ratio"] == compute_ratio
+    assert metrics["communication_ratio"] == communication_ratio
+    assert metrics["tokens_per_s_gpu_overlapped"] == 1 / 0.00008
 
 
 def test_output_path_excludes_kv_persistence_barrier():

@@ -10,10 +10,11 @@ Each successful point also records tokens/s/user and tokens/s/GPU variants
 using each GPU's elapsed time from its first measured kernel through its final
 kernel. This includes internal dependency and resource-contention bubbles, but
 excludes leading and trailing idle time. Compute time is each kernel's
-max(compute, local-memory) roofline bound; communication time is only the
-network bound exposed beyond that local bound. Ideal-overlap variants
-additionally assume that, on each GPU, the shorter of total compute and
-exposed communication time can be completely hidden by the longer one.
+elapsed local compute/memory path after resource contention; communication
+time is only the elapsed network path exposed beyond that local path.
+Ideal-overlap variants additionally assume that, on each GPU, the shorter of
+total compute and exposed communication time can be completely hidden by the
+longer one.
 
 Each simulation is an independent process.  Results are appended to JSONL as
 they finish, so an interrupted search can resume without repeating completed
@@ -247,9 +248,10 @@ def _gpu_timing_totals_us(
 ) -> tuple[float, float, float, float]:
     """Return elapsed and roofline-decomposed GPU-times.
 
-    A kernel contributes max(compute, local-memory) to compute time.  Only
-    network time exposed beyond that local bound contributes to communication
-    time, because the simulator overlaps all three resources within a kernel.
+    The simulator records the elapsed local compute/memory path and network
+    path separately after resource contention.  Their overlap belongs to the
+    local path; only the exposed network tail belongs to communication.  Time
+    not covered by either path remains a dependency/scheduling bubble.
     """
     measurement_start = result.measurement_start_us
     first_start_by_gpu = {}
@@ -281,17 +283,14 @@ def _gpu_timing_totals_us(
         end_us = min(entry.end_us, final_end_by_gpu[entry.device])
         if end_us <= start_us:
             continue
-        duration_us = entry.end_us - entry.start_us
-        visible_fraction = (end_us - start_us) / duration_us \
-            if duration_us > 0 else 1.0
-        local_bound_us = max(
-            entry.compute_time_us, entry.memory_time_us)
-        exposed_network_us = max(
-            0.0, entry.network_time_us - local_bound_us)
-        compute_time_by_gpu[entry.device] += (
-            local_bound_us * visible_fraction)
-        communication_time_by_gpu[entry.device] += (
-            exposed_network_us * visible_fraction)
+        local_end_us = entry.start_us + entry.local_elapsed_time_us
+        network_end_us = entry.start_us + entry.network_elapsed_time_us
+        local_elapsed_us = max(0.0, min(end_us, local_end_us) - start_us)
+        network_elapsed_us = max(
+            0.0, min(end_us, network_end_us) - start_us)
+        compute_time_by_gpu[entry.device] += local_elapsed_us
+        communication_time_by_gpu[entry.device] += max(
+            0.0, network_elapsed_us - local_elapsed_us)
         first_start_by_gpu[entry.device] = min(
             first_start_by_gpu.get(entry.device, start_us), start_us)
 

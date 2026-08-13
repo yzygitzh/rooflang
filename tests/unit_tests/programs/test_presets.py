@@ -190,7 +190,7 @@ class TestH200Cluster:
             "fp4": 1979.0, "fp8": 1979.0,
             "bf16": 989.5, "fp16": 989.5, "fp32": 494.5,
         }
-        assert hbm.capacity_gb == 141.0
+        assert hbm.capacity_gb == 144.0
         assert hbm_fabric.src_to_dst_bandwidth_gbs == 4800.0
 
     def test_aggregate_bandwidth(self):
@@ -297,7 +297,7 @@ class TestH200SuperChip:
             "fp4": 15832.0, "fp8": 15832.0,
             "bf16": 7916.0, "fp16": 7916.0, "fp32": 3956.0,
         }
-        assert components["n0-hbm3e-0"].capacity_gb == 1128.0
+        assert components["n0-hbm3e-0"].capacity_gb == 1152.0
         assert components["n0-ddr5-0"].capacity_gb == 3072.0
         assert components["n0-ssd"].capacity_gb == 245760.0
         assert "n0-mellanox-cx7-0" in components

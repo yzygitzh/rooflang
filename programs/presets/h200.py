@@ -11,7 +11,7 @@ class H200Cluster(HardwareGraph):
     """H200 cluster.
 
     Per-node topology:
-      - 8 NVIDIA H200 SXM GPUs, each with 141 GB HBM3e.
+      - 8 NVIDIA H200 SXM GPUs, each with 144 GB HBM3e.
       - 1 logical NVSwitch connecting all 8 GPUs.
       - 8 HGX PCIe switches, each connecting one GPU, NIC, and SSD.
       - 2 Intel Xeon 6767P CPUs connected via QPI, each with 1.5 TB DDR5.
@@ -47,7 +47,7 @@ class H200Cluster(HardwareGraph):
             nics = [Compute(name=f"{p}mellanox-cx7-{i}", kind="nic")
                     for i in range(8)]
 
-            hbms = [Memory(name=f"{p}hbm3e-{i}", capacity_gb=141.0,
+            hbms = [Memory(name=f"{p}hbm3e-{i}", capacity_gb=144.0,
                            kind="hbm")
                     for i in range(8)]
             drams = [Memory(name=f"{p}ddr5-{i}", capacity_gb=1536.0,
@@ -160,7 +160,7 @@ class H200SuperChip(HardwareGraph):
         ib_switch = Compute(name="ib-switch", kind="switch")
 
         hbm = Memory(
-            name="n0-hbm3e-0", capacity_gb=1128.0, kind="hbm")
+            name="n0-hbm3e-0", capacity_gb=1152.0, kind="hbm")
         dram = Memory(
             name="n0-ddr5-0", capacity_gb=3072.0, kind="dram")
         ssd = Memory(name="n0-ssd", capacity_gb=245760.0, kind="ssd")

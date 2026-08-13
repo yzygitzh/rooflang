@@ -6,13 +6,13 @@ The two maximized Pareto metrics are:
 * tokens/s/user: one user's token throughput (S / TTFT for prefill and
   1 / TPOT for one-step decode).
 
-Each successful point also records tokens/s/GPU-elapsed, using each GPU's
-elapsed time from its first measured kernel through its final kernel. This
-includes internal dependency and resource-contention bubbles, but excludes
-leading and trailing idle time. Compute time is each kernel's
+Each successful point also records tokens/s/user and tokens/s/GPU variants
+using each GPU's elapsed time from its first measured kernel through its final
+kernel. This includes internal dependency and resource-contention bubbles, but
+excludes leading and trailing idle time. Compute time is each kernel's
 max(compute, local-memory) roofline bound; communication time is only the
-network bound exposed beyond that local bound. An ideal-overlap throughput
-additionally assumes that, on each GPU, the shorter of total compute and
+network bound exposed beyond that local bound. Ideal-overlap variants
+additionally assume that, on each GPU, the shorter of total compute and
 exposed communication time can be completely hidden by the longer one.
 
 Each simulation is an independent process.  Results are appended to JSONL as
@@ -61,6 +61,13 @@ WORKLOADS = {
 HARDWARE_NAMES = ("h200", "gh200", "b300", "gb300", "ascend950dt")
 GPU_COUNTS = (8, 16, 32, 48, 64)
 DEFAULT_BATCH_MULTIPLIERS = (1, 2, 4, 8, 16, 32, 64)
+THROUGHPUT_METRICS = {
+    "original": ("tokens_per_s_user", "tokens_per_s_gpu"),
+    "elapsed": (
+        "tokens_per_s_user_elapsed", "tokens_per_s_gpu_elapsed"),
+    "overlapped": (
+        "tokens_per_s_user_overlapped", "tokens_per_s_gpu_overlapped"),
+}
 
 
 @dataclass(frozen=True)
@@ -309,14 +316,18 @@ def _gpu_timing_totals_us(
 
 
 def _gpu_timing_metrics(
-    result, total_tokens: int, n_gpus: int,
+    result, total_tokens: int, tokens_per_user: int, n_gpus: int,
     included_kernels: set, duration_us: float,
 ) -> dict:
-    """Calculate per-GPU elapsed and ideal compute/comm-overlap metrics."""
+    """Calculate elapsed and ideal compute/comm-overlap throughput metrics."""
     elapsed_time_us, compute_time_us, communication_time_us, \
         overlapped_time_us = _gpu_timing_totals_us(
         result, n_gpus, included_kernels)
     return {
+        "tokens_per_s_user_elapsed": (
+            tokens_per_user / (elapsed_time_us / n_gpus / 1e6)),
+        "tokens_per_s_user_overlapped": (
+            tokens_per_user / (overlapped_time_us / n_gpus / 1e6)),
         "tokens_per_s_gpu_elapsed": total_tokens / (elapsed_time_us / 1e6),
         "tokens_per_s_gpu_overlapped": (
             total_tokens / (overlapped_time_us / 1e6)),
@@ -392,7 +403,8 @@ def run_case(case: Case) -> dict:
             "kernel_count": len(graph.kernels),
         })
         record.update(_gpu_timing_metrics(
-            result, total_tokens, case.n_gpus, output_path, duration_us))
+            result, total_tokens, tokens_per_user, case.n_gpus, output_path,
+            duration_us))
     except OOMError as error:
         record.update({
             "status": "oom",
@@ -411,34 +423,45 @@ def run_case(case: Case) -> dict:
     return record
 
 
-def pareto_frontier(records: Iterable[dict]) -> list[dict]:
+def pareto_frontier(
+    records: Iterable[dict],
+    user_metric: str = "tokens_per_s_user",
+    gpu_metric: str = "tokens_per_s_gpu",
+) -> list[dict]:
     """Return points not dominated on both maximized throughput metrics."""
     points = [record for record in records if record.get("status") == "ok"]
     points.sort(
         key=lambda record: (
-            -record["tokens_per_s_user"],
-            -record["tokens_per_s_gpu"],
+            -record[user_metric],
+            -record[gpu_metric],
             record["case_id"],
         )
     )
     frontier = []
     best_gpu_throughput = -math.inf
     for point in points:
-        gpu_throughput = point["tokens_per_s_gpu"]
+        gpu_throughput = point[gpu_metric]
         if gpu_throughput > best_gpu_throughput:
             frontier.append(point)
             best_gpu_throughput = gpu_throughput
-    return sorted(frontier, key=lambda record: record["tokens_per_s_user"])
+    return sorted(frontier, key=lambda record: record[user_metric])
 
 
-def grouped_frontiers(records: Sequence[dict]) -> dict[tuple, list[dict]]:
+def grouped_frontiers(
+    records: Sequence[dict],
+    user_metric: str = "tokens_per_s_user",
+    gpu_metric: str = "tokens_per_s_gpu",
+) -> dict[tuple, list[dict]]:
     groups = {}
     for record in records:
         if record.get("status") != "ok":
             continue
         key = (record["workload"], record["hardware"], record["n_gpus"])
         groups.setdefault(key, []).append(record)
-    return {key: pareto_frontier(group) for key, group in groups.items()}
+    return {
+        key: pareto_frontier(group, user_metric, gpu_metric)
+        for key, group in groups.items()
+    }
 
 
 def _read_jsonl(path: Path) -> list[dict]:
@@ -472,12 +495,21 @@ def _write_csv(path: Path, records: Sequence[dict]) -> None:
 
 
 def write_outputs(output_dir: Path, records: Sequence[dict]) -> None:
-    """Write all points, frontier points, and one plot per workload."""
+    """Write all points plus original, elapsed, and overlapped frontiers."""
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_csv(output_dir / "all_points.csv", records)
-    frontiers = grouped_frontiers(records)
-    frontier_records = [point for group in frontiers.values() for point in group]
-    _write_csv(output_dir / "pareto_frontier.csv", frontier_records)
+    frontiers_by_timing = {}
+    for timing, (user_metric, gpu_metric) in THROUGHPUT_METRICS.items():
+        frontiers = grouped_frontiers(records, user_metric, gpu_metric)
+        frontiers_by_timing[timing] = frontiers
+        frontier_records = [
+            point for group in frontiers.values() for point in group
+        ]
+        suffix = "" if timing == "original" else f"_{timing}"
+        _write_csv(
+            output_dir / f"pareto_frontier{suffix}.csv",
+            frontier_records,
+        )
 
     if not records:
         return
@@ -500,40 +532,45 @@ def write_outputs(output_dir: Path, records: Sequence[dict]) -> None:
     ]
     columns = min(3, len(gpu_counts))
     rows = math.ceil(len(gpu_counts) / columns)
-    for workload in workloads:
-        figure, axes = plt.subplots(
-            rows, columns, figsize=(6 * columns, 5 * rows), squeeze=False)
-        flat_axes = list(axes.flat)
-        for axis, n_gpus in zip(flat_axes, gpu_counts):
-            for hardware in hardware_names:
-                points = frontiers.get((workload, hardware, n_gpus), [])
-                if not points:
-                    continue
-                axis.plot(
-                    [point["tokens_per_s_user"] for point in points],
-                    [point["tokens_per_s_gpu"] for point in points],
-                    marker="o",
-                    label=hardware,
-                )
-            axis.set_title(f"{n_gpus} GPUs")
-            axis.set_xlim(left=0)
-            axis.set_ylim(bottom=0)
-            axis.set_xlabel("tokens/s/user")
-            axis.set_ylabel("tokens/s/GPU")
-            axis.grid(True, which="both", alpha=0.25)
-        for axis in flat_axes[len(gpu_counts):]:
-            axis.axis("off")
-        handles, labels = [], []
-        for axis in flat_axes[:len(gpu_counts)]:
-            handles, labels = axis.get_legend_handles_labels()
+    for timing, (user_metric, gpu_metric) in THROUGHPUT_METRICS.items():
+        frontiers = frontiers_by_timing[timing]
+        suffix = "" if timing == "original" else f"_{timing}"
+        for workload in workloads:
+            figure, axes = plt.subplots(
+                rows, columns, figsize=(6 * columns, 5 * rows), squeeze=False)
+            flat_axes = list(axes.flat)
+            for axis, n_gpus in zip(flat_axes, gpu_counts):
+                for hardware in hardware_names:
+                    points = frontiers.get((workload, hardware, n_gpus), [])
+                    if not points:
+                        continue
+                    axis.plot(
+                        [point[user_metric] for point in points],
+                        [point[gpu_metric] for point in points],
+                        marker="o",
+                        label=hardware,
+                    )
+                axis.set_title(f"{n_gpus} GPUs")
+                axis.set_xlim(left=0)
+                axis.set_ylim(bottom=0)
+                axis.set_xlabel(f"tokens/s/user ({timing})")
+                axis.set_ylabel(f"tokens/s/GPU ({timing})")
+                axis.grid(True, which="both", alpha=0.25)
+            for axis in flat_axes[len(gpu_counts):]:
+                axis.axis("off")
+            handles, labels = [], []
+            for axis in flat_axes[:len(gpu_counts)]:
+                handles, labels = axis.get_legend_handles_labels()
+                if handles:
+                    break
             if handles:
-                break
-        if handles:
-            figure.legend(handles, labels, loc="lower right")
-        figure.suptitle(f"DSV4 Pro Pareto Frontier: {workload}")
-        figure.tight_layout(rect=(0, 0.04, 1, 0.96))
-        figure.savefig(output_dir / f"pareto_{workload}.png", dpi=160)
-        plt.close(figure)
+                figure.legend(handles, labels, loc="lower right")
+            figure.suptitle(
+                f"DSV4 Pro Pareto Frontier ({timing}): {workload}")
+            figure.tight_layout(rect=(0, 0.04, 1, 0.96))
+            figure.savefig(
+                output_dir / f"pareto_{workload}{suffix}.png", dpi=160)
+            plt.close(figure)
 
 
 def _run_parallel(

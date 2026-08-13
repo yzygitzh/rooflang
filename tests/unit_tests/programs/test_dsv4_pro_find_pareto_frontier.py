@@ -148,6 +148,26 @@ def test_pareto_frontier_removes_dominated_and_duplicate_points():
     ]
 
 
+def test_pareto_frontier_uses_selected_timing_metrics():
+    records = [
+        {"case_id": "original", "status": "ok",
+         "tokens_per_s_user": 12.0, "tokens_per_s_gpu": 12.0,
+         "tokens_per_s_user_elapsed": 8.0,
+         "tokens_per_s_gpu_elapsed": 8.0},
+        {"case_id": "elapsed", "status": "ok",
+         "tokens_per_s_user": 8.0, "tokens_per_s_gpu": 8.0,
+         "tokens_per_s_user_elapsed": 12.0,
+         "tokens_per_s_gpu_elapsed": 12.0},
+    ]
+
+    original = pareto_frontier(records)
+    elapsed = pareto_frontier(
+        records, "tokens_per_s_user_elapsed", "tokens_per_s_gpu_elapsed")
+
+    assert [point["case_id"] for point in original] == ["original"]
+    assert [point["case_id"] for point in elapsed] == ["elapsed"]
+
+
 def test_gpu_activity_includes_bubbles_until_each_gpus_final_kernel():
     gpu0 = Compute(name="gpu0", kind="gpu")
     gpu1 = Compute(name="gpu1", kind="gpu")
@@ -191,13 +211,15 @@ def test_gpu_activity_includes_bubbles_until_each_gpus_final_kernel():
     )
 
     metrics = _gpu_timing_metrics(
-        result, total_tokens=100, n_gpus=2,
+        result, total_tokens=100, tokens_per_user=10, n_gpus=2,
         included_kernels={
             compute0, compute1, communication0, communication1,
         },
         duration_us=120.0)
 
     assert metrics["total_gpu_elapsed_ms"] == 0.2
+    assert metrics["tokens_per_s_user_elapsed"] == 10 / 0.0001
+    assert metrics["tokens_per_s_user_overlapped"] == 10 / 0.000065
     assert metrics["tokens_per_s_gpu_elapsed"] == 100 / 0.0002
     assert metrics["compute_ratio"] == 110 / 200
     assert metrics["communication_ratio"] == 70 / 200
@@ -341,6 +363,8 @@ def test_write_outputs_handles_no_records(tmp_path):
 
     assert (tmp_path / "all_points.csv").read_text() == ""
     assert (tmp_path / "pareto_frontier.csv").read_text() == ""
+    assert (tmp_path / "pareto_frontier_elapsed.csv").read_text() == ""
+    assert (tmp_path / "pareto_frontier_overlapped.csv").read_text() == ""
     assert not list(tmp_path.glob("*.png"))
 
 
@@ -354,13 +378,21 @@ def test_write_outputs_honors_filtered_workloads(tmp_path):
         "pp_partition": [61],
         "tokens_per_s_user": 10.0,
         "tokens_per_s_gpu": 20.0,
+        "tokens_per_s_user_elapsed": 12.0,
+        "tokens_per_s_gpu_elapsed": 24.0,
+        "tokens_per_s_user_overlapped": 15.0,
+        "tokens_per_s_gpu_overlapped": 30.0,
     }
 
     write_outputs(tmp_path, [record])
 
     assert (tmp_path / "all_points.csv").is_file()
     assert (tmp_path / "pareto_frontier.csv").is_file()
+    assert (tmp_path / "pareto_frontier_elapsed.csv").is_file()
+    assert (tmp_path / "pareto_frontier_overlapped.csv").is_file()
     assert (tmp_path / "pareto_decode-8k.png").is_file()
+    assert (tmp_path / "pareto_decode-8k_elapsed.png").is_file()
+    assert (tmp_path / "pareto_decode-8k_overlapped.png").is_file()
     assert not (tmp_path / "pareto_prefill-8k.png").exists()
 
 

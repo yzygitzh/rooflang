@@ -15,6 +15,7 @@ from rooflang.programs.dsv4_pro.find_pareto_frontier import (
     _gpu_timing_metrics,
     _output_path_kernels,
     _peak_memory_gb,
+    _point_label,
     _read_jsonl,
     _run_parallel,
     _parser,
@@ -66,6 +67,12 @@ def test_case_ids_include_the_full_search_configuration():
 
     assert case.case_id == (
         "prefill-8k:gb300:g64:b16:cp4:dp16:ep64:pp31-30")
+
+
+def test_point_label_contains_batch_and_parallel_degrees():
+    point = {"batch_size": 16, "cp": 4, "dp": 2, "ep": 8, "pp": 2}
+
+    assert _point_label(point) == "B16 CP4 DP2 EP8 PP2"
 
 
 def test_case_enumeration_applies_batch_multipliers_and_limit():
@@ -375,6 +382,11 @@ def test_write_outputs_honors_filtered_workloads(tmp_path):
         "workload": "decode-8k",
         "hardware": "gb300",
         "n_gpus": 8,
+        "batch_size": 8,
+        "cp": 1,
+        "dp": 8,
+        "ep": 8,
+        "pp": 1,
         "pp_partition": [61],
         "tokens_per_s_user": 10.0,
         "tokens_per_s_gpu": 20.0,

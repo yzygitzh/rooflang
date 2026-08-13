@@ -49,7 +49,7 @@ class Ascend950DTCluster(HardwareGraph):
                            kind="hbm") for i in range(ub_scope)]
             drams = [Memory(name=f"{p}ddr5-{i}", capacity_gb=1536.0,
                             kind="dram") for i in range(n_cpus)]
-            ssds = [Memory(name=f"{p}ssd-{i}", capacity_gb=3840.0,
+            ssds = [Memory(name=f"{p}ssd-{i}", capacity_gb=30720.0,
                            kind="ssd") for i in range(ub_scope)]
 
             for comp in gpus + [ub_switch] + cpus:
@@ -146,7 +146,7 @@ class Ascend950DTSuperChip(HardwareGraph):
             name="n0-ddr5-0", capacity_gb=1536.0 * n_cpus,
             kind="dram")
         ssd = Memory(
-            name="n0-ssd", capacity_gb=3840.0 * ub_scope,
+            name="n0-ssd", capacity_gb=30720.0 * ub_scope,
             kind="ssd")
 
         for comp in [gpu, cpu, eth_switch]:

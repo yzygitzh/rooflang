@@ -17,7 +17,7 @@ class H200Cluster(HardwareGraph):
       - 2 Intel Xeon 6767P CPUs connected via QPI, each with 1.5 TB DDR5.
       - 1 CPU PCIe switch connecting both CPUs to the HGX PCIe switch.
       - 8 Mellanox ConnectX-7 NICs (400 Gb/s InfiniBand each).
-      - 8 SSDs (3.84 TB NVMe each) attached to the HGX PCIe switch.
+      - 8 SSDs (30.72 TB NVMe each) attached to the HGX PCIe switch.
     Inter-node: all NICs connect to a shared IB switch.
     """
 
@@ -54,7 +54,7 @@ class H200Cluster(HardwareGraph):
             drams = [Memory(name=f"{p}ddr5-{i}", capacity_gb=1536.0,
                             kind="dram")
                      for i in range(2)]
-            ssds = [Memory(name=f"{p}ssd-{i}", capacity_gb=3840.0,
+            ssds = [Memory(name=f"{p}ssd-{i}", capacity_gb=30720.0,
                            kind="ssd")
                     for i in range(8)]
 
@@ -168,7 +168,7 @@ class H200SuperChip(HardwareGraph):
             name="n0-hbm3e-0", capacity_gb=1128.0, kind="hbm")
         dram = Memory(
             name="n0-ddr5-0", capacity_gb=3072.0, kind="dram")
-        ssd = Memory(name="n0-ssd", capacity_gb=30720.0, kind="ssd")
+        ssd = Memory(name="n0-ssd", capacity_gb=245760.0, kind="ssd")
 
         for comp in [gpu, hgx_pcie_switch, cpu_pcie_switch,
                      cpu, nic, ib_switch]:

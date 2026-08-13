@@ -494,6 +494,15 @@ def _write_csv(path: Path, records: Sequence[dict]) -> None:
             writer.writerow(row)
 
 
+def _point_label(point: dict) -> str:
+    """Return a compact batch and parallelism label for a frontier point."""
+    return (
+        f"B{point['batch_size']} "
+        f"CP{point['cp']} DP{point['dp']} "
+        f"EP{point['ep']} PP{point['pp']}"
+    )
+
+
 def write_outputs(output_dir: Path, records: Sequence[dict]) -> None:
     """Write all points plus original, elapsed, and overlapped frontiers."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -544,12 +553,24 @@ def write_outputs(output_dir: Path, records: Sequence[dict]) -> None:
                     points = frontiers.get((workload, hardware, n_gpus), [])
                     if not points:
                         continue
+                    user_values = [point[user_metric] for point in points]
+                    gpu_values = [point[gpu_metric] for point in points]
                     axis.plot(
-                        [point[user_metric] for point in points],
-                        [point[gpu_metric] for point in points],
+                        user_values,
+                        gpu_values,
                         marker="o",
                         label=hardware,
                     )
+                    for point, user_value, gpu_value in zip(
+                            points, user_values, gpu_values):
+                        axis.annotate(
+                            _point_label(point),
+                            (user_value, gpu_value),
+                            xytext=(3, 3),
+                            textcoords="offset points",
+                            fontsize=6,
+                            alpha=0.85,
+                        )
                 axis.set_title(f"{n_gpus} GPUs")
                 axis.set_xlim(left=0)
                 axis.set_ylim(bottom=0)

@@ -576,6 +576,29 @@ def _point_label(point: dict) -> str:
     )
 
 
+def _shared_axis_limits(
+    frontiers: dict[tuple, list[dict]],
+    workload: str,
+    gpu_counts: Sequence[int],
+    hardware_names: Sequence[str],
+    user_metric: str,
+    gpu_metric: str,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Return common zero-based limits for every subplot in one figure."""
+    points = [
+        point
+        for n_gpus in gpu_counts
+        for hardware in hardware_names
+        for point in frontiers.get((workload, hardware, n_gpus), [])
+    ]
+    max_user = max((point[user_metric] for point in points), default=0.0)
+    max_gpu = max((point[gpu_metric] for point in points), default=0.0)
+    return (
+        (0.0, max_user * 1.05 if max_user else 1.0),
+        (0.0, max_gpu * 1.05 if max_gpu else 1.0),
+    )
+
+
 def write_outputs(
     output_dir: Path,
     records: Sequence[dict],
@@ -624,8 +647,12 @@ def write_outputs(
         frontiers = frontiers_by_timing[timing]
         suffix = "" if timing == "original" else f"_{timing}"
         for workload in workloads:
+            x_limits, y_limits = _shared_axis_limits(
+                frontiers, workload, gpu_counts, hardware_names,
+                user_metric, gpu_metric)
             figure, axes = plt.subplots(
-                rows, columns, figsize=(6 * columns, 5 * rows), squeeze=False)
+                rows, columns, figsize=(6 * columns, 5 * rows), squeeze=False,
+                sharex=True, sharey=True)
             flat_axes = list(axes.flat)
             for axis, n_gpus in zip(flat_axes, gpu_counts):
                 for hardware in hardware_names:
@@ -652,8 +679,8 @@ def write_outputs(
                                 alpha=0.85,
                             )
                 axis.set_title(f"{n_gpus} GPUs")
-                axis.set_xlim(left=0)
-                axis.set_ylim(bottom=0)
+                axis.set_xlim(x_limits)
+                axis.set_ylim(y_limits)
                 axis.set_xlabel(f"tokens/s/user ({timing})")
                 axis.set_ylabel(f"tokens/s/GPU ({timing})")
                 axis.grid(True, which="both", alpha=0.25)

@@ -477,6 +477,25 @@ def test_write_outputs_handles_no_records(tmp_path):
     assert not list(tmp_path.glob("*.png"))
 
 
+def test_shared_axis_limits_cover_all_subplots_with_same_scale():
+    frontiers = {
+        ("decode-8k", "h200", 8): [
+            {"tokens_per_s_user": 10.0, "tokens_per_s_gpu": 20.0},
+        ],
+        ("decode-8k", "gb300", 16): [
+            {"tokens_per_s_user": 100.0, "tokens_per_s_gpu": 200.0},
+        ],
+        ("prefill-8k", "gb300", 16): [
+            {"tokens_per_s_user": 1000.0, "tokens_per_s_gpu": 2000.0},
+        ],
+    }
+
+    assert finder._shared_axis_limits(
+        frontiers, "decode-8k", [8, 16], ["h200", "gb300"],
+        "tokens_per_s_user", "tokens_per_s_gpu",
+    ) == ((0.0, 105.0), (0.0, 210.0))
+
+
 def test_write_outputs_honors_filtered_workloads(tmp_path):
     record = {
         "case_id": "one",

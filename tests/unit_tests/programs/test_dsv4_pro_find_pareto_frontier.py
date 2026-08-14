@@ -564,8 +564,8 @@ def test_shared_axis_limits_cover_all_subplots_with_same_scale():
         frontiers, "decode-8k", [8, 16], ["h200", "gb300"],
         "tokens_per_s_user", "tokens_per_s_gpu",
     )
-    assert x_limits == pytest.approx((1.0, 105.0))
-    assert y_limits == pytest.approx((1.0, 210.0))
+    assert x_limits == pytest.approx((10.0 / 1.05, 105.0))
+    assert y_limits == pytest.approx((20.0 / 1.05, 210.0))
 
 
 def test_shared_axis_limits_are_valid_for_empty_and_single_point_log_axes():
@@ -582,7 +582,7 @@ def test_shared_axis_limits_are_valid_for_empty_and_single_point_log_axes():
     assert finder._shared_axis_limits(
         frontiers, "decode-8k", [8], ["h200"],
         "tokens_per_s_user", "tokens_per_s_gpu",
-    ) == ((1.0, 32.0), (1.0, 64.0))
+    ) == ((8.0, 32.0), (16.0, 64.0))
 
 
 @pytest.mark.parametrize(("value", "label"), [

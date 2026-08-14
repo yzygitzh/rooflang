@@ -613,7 +613,7 @@ def _shared_axis_limits(
     user_metric: str,
     gpu_metric: str,
 ) -> tuple[tuple[float, float], tuple[float, float]]:
-    """Return shared log limits with every subplot rooted at (1, 1)."""
+    """Return common positive log-scale limits for one figure's subplots."""
     points = [
         point
         for n_gpus in gpu_counts
@@ -625,9 +625,10 @@ def _shared_axis_limits(
         values = [point[metric] for point in points if point[metric] > 0]
         if not values:
             return 1.0, 2.0
-        upper = max(values)
-        padded_upper = upper * (2 if min(values) == upper else 1.05)
-        return 1.0, max(2.0, padded_upper)
+        lower, upper = min(values), max(values)
+        if lower == upper:
+            return lower / 2, upper * 2
+        return lower / 1.05, upper * 1.05
 
     return padded_limits(user_metric), padded_limits(gpu_metric)
 

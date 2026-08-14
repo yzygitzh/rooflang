@@ -1,6 +1,7 @@
 """Unit tests for rooflang.runtime.trace_export."""
 
 import json
+from fractions import Fraction
 
 import pytest
 
@@ -93,6 +94,32 @@ class TestExportTrace:
             == entry.local_elapsed_time_us
         assert ev["args"]["network_elapsed_time_us"] \
             == entry.network_elapsed_time_us
+
+    def test_fractional_shape_and_weight_reads_are_json_serializable(
+            self, tmp_path):
+        hw, gpu, hbm = _hw()
+        kernel = SyntheticKernel(
+            inputs={"x": Tensor("bf16", (Fraction(1, 2), 4))},
+            weights={"w": Tensor("bf16", (4, 4))},
+        )
+        kernel.weight_read_fraction = Fraction(1, 4)
+        graph = ComputeGraph()
+        graph.add_kernel(kernel)
+        placement = Placement(hardware=hw)
+        placement.set_kernel_device(kernel, gpu)
+        result = Simulator(graph, placement, hw).run()
+
+        output = str(tmp_path / "fractional-trace.json")
+        export_trace(result, output)
+
+        with open(output) as file:
+            data = json.load(file)
+        event = next(item for item in data["traceEvents"]
+                     if item["ph"] == "X")
+        assert event["args"]["inputs"]["x"] == [0.5, 4]
+        assert event["args"]["weight_read_fraction"] == 0.25
+        assert event["args"]["weight_bytes"] == 8.0
+        assert event["args"]["resident_weight_bytes"] == 32.0
 
     def test_metadata_events_present(self, tmp_path):
         hw, gpu, hbm = _hw()

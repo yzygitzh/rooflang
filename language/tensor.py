@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from fractions import Fraction
 from typing import Tuple
 
 from rooflang.language.utils import dtype_bytes
@@ -10,14 +11,14 @@ from rooflang.language.utils import dtype_bytes
 class Tensor:
     """Descriptor for a tensor slot (input, weight, or output)."""
 
-    def __init__(self, dtype: str, shape: Tuple[int, ...],
+    def __init__(self, dtype: str, shape: Tuple[int | Fraction, ...],
                  weight_id: str = None) -> None:
         self.dtype = dtype
         self.shape = shape
         self.weight_id = weight_id
 
     @property
-    def n_elements(self) -> int:
+    def n_elements(self) -> int | Fraction:
         n = 1
         for d in self.shape:
             n *= d

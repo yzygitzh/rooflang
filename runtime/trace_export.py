@@ -6,6 +6,7 @@ Output can be loaded in chrome://tracing or Perfetto UI.
 from __future__ import annotations
 
 import json
+from fractions import Fraction
 from typing import Any, Dict, List
 
 from rooflang.runtime.simulator import Simulator, SimulationResult
@@ -16,6 +17,16 @@ def _peak_dtype(device) -> str:
     if not device.tflops:
         return "unknown"
     return max(device.tflops, key=device.tflops.get)
+
+
+def _trace_shape(tensor) -> list:
+    """Convert exact fractional workload dimensions to JSON values."""
+    return [
+        int(dim) if isinstance(dim, Fraction) and dim.denominator == 1
+        else float(dim) if isinstance(dim, Fraction)
+        else dim
+        for dim in tensor.shape
+    ]
 
 
 def export_trace(result: SimulationResult, path: str) -> None:
@@ -43,11 +54,12 @@ def export_trace(result: SimulationResult, path: str) -> None:
         top_flops = top_tflops * 1e12
         mfu_top = kernel.flops / (top_flops * dur_s) if top_flops > 0 and dur_s > 0 else 0.0
         input_bw = kernel.input_bytes / (dur_s * 1e9) if dur_s > 0 else 0.0
-        weight_bw = kernel.weight_bytes / (dur_s * 1e9) if dur_s > 0 else 0.0
+        weight_bw = kernel.loaded_weight_bytes / (dur_s * 1e9) \
+            if dur_s > 0 else 0.0
         output_bw = kernel.output_bytes / (dur_s * 1e9) if dur_s > 0 else 0.0
-        inputs = {k: list(t.shape) for k, t in kernel.inputs.items()}
-        weights = {k: list(t.shape) for k, t in kernel.weights.items()}
-        outputs = {k: list(t.shape) for k, t in kernel.outputs.items()}
+        inputs = {k: _trace_shape(t) for k, t in kernel.inputs.items()}
+        weights = {k: _trace_shape(t) for k, t in kernel.weights.items()}
+        outputs = {k: _trace_shape(t) for k, t in kernel.outputs.items()}
         events.append({
             "name": type(kernel).__name__,
             "cat": entry.bound.value,
@@ -61,7 +73,9 @@ def export_trace(result: SimulationResult, path: str) -> None:
                 "peak_tflops": peak_tflops,
                 "flops": kernel.flops,
                 "input_bytes": kernel.input_bytes,
-                "weight_bytes": kernel.weight_bytes,
+                "weight_bytes": kernel.loaded_weight_bytes,
+                "resident_weight_bytes": kernel.weight_bytes,
+                "weight_read_fraction": float(kernel.weight_read_fraction),
                 "output_bytes": kernel.output_bytes,
                 "input_bandwidth_gbs": input_bw,
                 "weight_bandwidth_gbs": weight_bw,

@@ -16,6 +16,7 @@ Each next_comm has n inputs ("i0".."i{n-1}") and 1 output ("y").
 """
 
 from copy import deepcopy
+from fractions import Fraction
 
 from rooflang.language.kernels.comm import Broadcast, Gather, Reduce, Scatter
 from rooflang.language.kernels.forward import (
@@ -35,7 +36,10 @@ def _shard_shape(shape, n, dim=0):
     if dim < 0:
         dim = len(shape) + dim
     lst = list(shape)
-    lst[dim] = lst[dim] // n
+    if isinstance(lst[dim], Fraction):
+        lst[dim] /= n
+    else:
+        lst[dim] //= n
     return tuple(lst)
 
 

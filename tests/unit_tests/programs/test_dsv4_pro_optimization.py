@@ -1,12 +1,16 @@
 """Tests for DeepSeek V4 Pro placement strategies."""
 
 import inspect
+from fractions import Fraction
+from types import SimpleNamespace
 
 import pytest
 
 from rooflang.language.hardware.component import Compute
 from rooflang.language.kernels.comm import Broadcast, ReduceScatter
 from rooflang.language.kernels.forward import Nop, ReadInput, Slice, SparseAttn
+from rooflang.language.kernels.kernel import Kernel
+from rooflang.language.tensor import Tensor
 from rooflang.programs.dsv4_pro import optimization
 from rooflang.programs.dsv4_pro import model
 from rooflang.programs.dsv4_pro.optimization import (
@@ -94,8 +98,6 @@ def test_cluster_optimizers_require_partition_to_cover_model():
         ({"seq_prefill": 520}, "compression ratio"),
         ({"seq_prefill": 768, "cp": 8, "dp": 1, "ep": 8},
          "compressed sequence"),
-        ({"batch_size": 8, "seq_prefill": 512, "is_prefill": False},
-         "expert-token count"),
     ],
 )
 def test_cluster_optimizer_argument_validation(overrides, message,
@@ -122,6 +124,39 @@ def test_cluster_optimizer_requires_window_divisible_by_cp(monkeypatch):
             is_prefill=True, cp=4, dp=2, ep=8,
             pp_partition=[1], n_gpus=8,
         )
+
+
+def test_expert_weight_reads_scale_without_shrinking_resident_weights(
+        monkeypatch):
+    monkeypatch.setattr(optimization, "N_EXPERTS", 12)
+    experts = [
+        Kernel(weights={"w": Tensor("bf16", (8, 16))})
+        for _ in range(24)
+    ]
+    layer = SimpleNamespace(experts=experts)
+
+    read_fraction = optimization._set_expert_weight_read_fraction(
+        [layer], batch_size=1, context_length=1, ep=3)
+
+    assert read_fraction == Fraction(1, 2)
+    assert layer._expert_weight_read_fraction == Fraction(1, 2)
+    assert all(kernel.weight_read_fraction == Fraction(1, 2)
+               for kernel in experts)
+    assert all(kernel.loaded_weight_bytes == kernel.weight_bytes / 2
+               for kernel in experts)
+    assert all(kernel.weight_bytes == 8 * 16 * 2 for kernel in experts)
+
+
+def test_expert_weight_read_fraction_is_capped_at_one(monkeypatch):
+    monkeypatch.setattr(optimization, "N_EXPERTS", 12)
+    experts = [Kernel() for _ in range(24)]
+
+    read_fraction = optimization._set_expert_weight_read_fraction(
+        [SimpleNamespace(experts=experts)],
+        batch_size=8, context_length=1, ep=3)
+
+    assert read_fraction == 1
+    assert all(kernel.weight_read_fraction == 1 for kernel in experts)
 
 
 def test_superchip_optimizer_places_the_graph(monkeypatch):

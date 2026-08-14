@@ -6,6 +6,7 @@ subclass carrying roofline metrics as @property methods.
 
 from __future__ import annotations
 
+from fractions import Fraction
 from typing import TYPE_CHECKING, Dict
 
 from rooflang.language.utils import dtype_bytes
@@ -35,6 +36,9 @@ class Kernel:
         self.weights: Dict[str, Tensor] = weights or {}
         self.outputs: Dict[str, Tensor] = outputs or {}
         self.has_side_effect = has_side_effect
+        # Physical weights remain resident in full. This factor controls only
+        # the expected fraction read by one logical kernel invocation.
+        self.weight_read_fraction = Fraction(1, 1)
 
     @property
     def flops(self) -> float:
@@ -49,12 +53,16 @@ class Kernel:
         return sum(t.size_bytes for t in self.weights.values())
 
     @property
+    def loaded_weight_bytes(self) -> float:
+        return float(self.weight_bytes * self.weight_read_fraction)
+
+    @property
     def output_bytes(self) -> float:
         return sum(t.size_bytes for t in self.outputs.values())
 
     @property
     def transferred_bytes(self) -> float:
-        return self.input_bytes + self.weight_bytes + self.output_bytes
+        return self.input_bytes + self.loaded_weight_bytes + self.output_bytes
 
     def to_dict(self) -> dict:
         d = {
@@ -64,6 +72,9 @@ class Kernel:
             "weight_bytes":      self.weight_bytes,
             "output_bytes":      self.output_bytes,
         }
+        if self.weight_read_fraction != 1:
+            d["loaded_weight_bytes"] = self.loaded_weight_bytes
+            d["weight_read_fraction"] = float(self.weight_read_fraction)
         if self.has_side_effect:
             d["has_side_effect"] = True
         if self.inputs:
@@ -82,5 +93,3 @@ class Kernel:
                 for k, v in self.outputs.items()
             }
         return d
-
-

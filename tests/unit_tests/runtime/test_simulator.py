@@ -1,5 +1,7 @@
 """Unit tests for rooflang.runtime.simulator (Simulator DES)."""
 
+from fractions import Fraction
+
 import pytest
 
 from rooflang.language.graph import ComputeGraph, FabricEdge, HardwareGraph
@@ -98,6 +100,21 @@ class TestSingleKernel:
         assert entry.network_time_us == 0.0
         assert entry.local_elapsed_time_us == pytest.approx(2.0)
         assert entry.network_elapsed_time_us == 0.0
+
+    def test_fractional_weight_read_keeps_full_resident_capacity(self):
+        hw, gpu, hbm = _hw(read_bw=1.0, write_bw=1.0, tflops=1.0)
+        weight = Tensor("bf16", (1000,))
+        kernel = SyntheticKernel(weights={"w": weight})
+        kernel.weight_read_fraction = Fraction(1, 4)
+        graph = ComputeGraph()
+        graph.add_kernel(kernel)
+        placement = Placement(hardware=hw)
+        placement.set_kernel_device(kernel, gpu)
+
+        result = _sim(graph, placement, hw)
+
+        assert result.trace[0].memory_time_us == pytest.approx(0.5)
+        assert result.peak_memory[hbm] == 2000.0
 
 
 # ── Stream serialization ─────────────────────────────────────────────

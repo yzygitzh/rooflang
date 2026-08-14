@@ -16,6 +16,8 @@ that accumulate in bf16 / fp8 / fp4 should pass that explicitly.
 Activation gradients (dX, dQ/dK/dV) stay at the activation dtype.
 """
 
+from fractions import Fraction
+
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.utils import dtype_bytes, gemm_scale_bytes
 
@@ -381,7 +383,7 @@ class TokenDispatch(Kernel):
         self.N_experts = N_experts
         self.topk = topk
         self.a_dtype = a_dtype
-        self.M_e = M * topk // N_experts
+        self.M_e = Fraction(M * topk, N_experts)
         super().__init__()
 
     @property
@@ -421,7 +423,7 @@ class TokenCombine(Kernel):
         self.N_experts = N_experts
         self.topk = topk
         self.a_dtype = a_dtype
-        self.M_e = M * topk // N_experts
+        self.M_e = Fraction(M * topk, N_experts)
         super().__init__()
 
     @property

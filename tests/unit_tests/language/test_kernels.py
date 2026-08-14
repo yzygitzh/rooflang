@@ -1,5 +1,7 @@
 """Unit tests for rooflang.language.kernels (Kernel base + all subclasses)."""
 
+from fractions import Fraction
+
 import pytest
 
 from rooflang.language.kernels.kernel import Kernel
@@ -31,6 +33,14 @@ class TestKernelInit:
     def test_with_tensors(self):
         k = Kernel(inputs={"x": Tensor("bf16", (4,))})
         assert "x" in k.inputs
+
+    def test_fractional_weight_reads_do_not_change_resident_weights(self):
+        k = Kernel(weights={"w": Tensor("bf16", (8,))})
+        k.weight_read_fraction = Fraction(3, 8)
+
+        assert k.weight_bytes == 16.0
+        assert k.loaded_weight_bytes == 6.0
+        assert k.transferred_bytes == 6.0
 
 
 class TestKernelToDict:
@@ -511,6 +521,9 @@ class TestTokenDispatch(TestKernelBase):
     def test_m_e(self):
         assert self.kernel.M_e == 8192 * 6 // 384
 
+    def test_fractional_m_e(self):
+        assert TokenDispatch(32, 7168, 384, 6).M_e == Fraction(1, 2)
+
 
 class TestTokenCombine(TestKernelBase):
     __test__ = True
@@ -522,6 +535,9 @@ class TestTokenCombine(TestKernelBase):
 
     def test_m_e(self):
         assert self.kernel.M_e == 8192 * 6 // 384
+
+    def test_fractional_m_e(self):
+        assert TokenCombine(32, 7168, 384, 6).M_e == Fraction(1, 2)
 
 
 class TestBwdTokenDispatch(TestKernelBase):
@@ -537,6 +553,10 @@ class TestBwdTokenDispatch(TestKernelBase):
     def test_m_e(self):
         assert self.kernel.M_e == 8192 * 6 // 384
 
+    def test_fractional_m_e(self):
+        assert backward.TokenDispatch(
+            32, 7168, 384, 6).M_e == Fraction(1, 2)
+
 
 class TestBwdTokenCombine(TestKernelBase):
     __test__ = True
@@ -550,6 +570,10 @@ class TestBwdTokenCombine(TestKernelBase):
 
     def test_m_e(self):
         assert self.kernel.M_e == 8192 * 6 // 384
+
+    def test_fractional_m_e(self):
+        assert backward.TokenCombine(
+            32, 7168, 384, 6).M_e == Fraction(1, 2)
 
 
 # ── Identity kernels (Spawn / Concat) ──────────────────────────────────

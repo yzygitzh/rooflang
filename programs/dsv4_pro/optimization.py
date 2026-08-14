@@ -1,6 +1,7 @@
 """DeepSeek V4 Pro inference — graph splitting and placement strategies."""
 
 from collections import defaultdict, deque
+from fractions import Fraction
 
 from rooflang.language.hardware.component import Compute, Memory
 from rooflang.language.kernels.comm import (
@@ -199,7 +200,6 @@ def _validate_args(
         raise ValueError(
             f"N_EXPERTS={N_EXPERTS} must be divisible by ep={ep}")
 
-    context_length = seq_prefill if is_prefill else 1
     batch_degree = dp if is_prefill else cp * dp
     if batch_size % batch_degree != 0:
         raise ValueError(
@@ -222,11 +222,26 @@ def _validate_args(
                 f"compressed sequence {seq_prefill // ratio} must "
                 f"be divisible by cp={cp}")
 
-    routed_tokens = batch_size * context_length * TOPK
-    if routed_tokens % (N_EXPERTS * ep) != 0:
-        raise ValueError(
-            "expert-token count must be divisible by EP copies; got "
-            f"B*S*TOPK={routed_tokens}, N_EXPERTS*ep={N_EXPERTS * ep}")
+
+def _set_expert_weight_read_fraction(
+    layers, batch_size, context_length, ep,
+):
+    """Set expected expert-weight reads without changing resident weights.
+
+    Routed-token dimensions are balanced fractionally across all experts.
+    Each EP rank reads at most one full copy of every local expert weight, and
+    no more expert weights than the number of routes it receives.
+    """
+    local_experts = N_EXPERTS // ep
+    routes_per_ep_rank = Fraction(
+        batch_size * context_length * TOPK, ep)
+    activated_experts = min(local_experts, routes_per_ep_rank)
+    read_fraction = Fraction(activated_experts, local_experts)
+    for layer in layers:
+        layer._expert_weight_read_fraction = read_fraction
+        for kernel in layer.experts:
+            kernel.weight_read_fraction = read_fraction
+    return read_fraction
 
 
 def _split_prefill_state(g, layer_copies, split, degree, attr_suffix):
@@ -344,6 +359,8 @@ def optimize_model_cluster_prefill(
     _validate_args(
         layers, batch_size, seq_prefill, True,
         cp, dp, ep, pp_partition, n_gpus)
+    _set_expert_weight_read_fraction(
+        layers, batch_size, seq_prefill, ep)
     pp_degree = len(pp_partition)
     layer_stages = [
         stage
@@ -475,6 +492,7 @@ def optimize_model_cluster_decode(
     _validate_args(
         layers, batch_size, seq_prefill, False,
         cp, dp, ep, pp_partition, n_gpus)
+    _set_expert_weight_read_fraction(layers, batch_size, 1, ep)
     pp_degree = len(pp_partition)
 
     layer_stages = [

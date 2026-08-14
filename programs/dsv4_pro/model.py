@@ -4,6 +4,7 @@ Builds the logical compute graph (add_kernel + add_data_edge).
 """
 
 from dataclasses import dataclass, field
+from fractions import Fraction
 from typing import List
 
 from rooflang.language.graph import ComputeGraph
@@ -375,7 +376,7 @@ def _build_layers(g, B, S, context_len, prev_out):
         L.gate = gate
 
         # Dispatch: softmax routing + token scatter to experts
-        M_e = M * TOPK // N_EXPERTS
+        M_e = Fraction(M * TOPK, N_EXPERTS)
         dispatch = TokenDispatch(M, D, N_EXPERTS, TOPK)
         dispatch.inputs = {"x": Tensor("bf16", (B, S, D)),
                            "routing": Tensor("fp32", (B, S, N_EXPERTS))}

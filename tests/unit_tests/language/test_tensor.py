@@ -1,5 +1,7 @@
 """Unit tests for rooflang.language.tensor (Tensor dataclass)."""
 
+from fractions import Fraction
+
 from rooflang.language.tensor import Tensor
 
 
@@ -15,6 +17,12 @@ class TestNElements:
 
     def test_scalar(self):
         assert Tensor("bf16", (1,)).n_elements == 1
+
+    def test_fractional_workload_dimension(self):
+        tensor = Tensor("bf16", (Fraction(1, 2), 8))
+
+        assert tensor.n_elements == 4
+        assert tensor.size_bytes == 8.0
 
 
 class TestSizeBytes:

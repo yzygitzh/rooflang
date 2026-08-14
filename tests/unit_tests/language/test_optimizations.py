@@ -1,5 +1,7 @@
 """Unit tests for rooflang.language.optimization (split + optimize_comms)."""
 
+from fractions import Fraction
+
 import pytest
 
 from rooflang.language.graph import ComputeGraph, FabricEdge, HardwareGraph
@@ -772,6 +774,26 @@ def test_context_split_dispatch_and_combine_port_axes():
     assert combine_prev["i0"].dim == 0
     assert combine_copies[0].inputs["i0"].shape == (2, 64)
     assert combine_copies[0].outputs["y"].shape == (2, 4, 64)
+
+
+def test_batch_split_preserves_fractional_expert_token_workload():
+    dispatch = TokenDispatch(M=4, D=64, N_experts=8, topk=1)
+    dispatch.inputs = {
+        "x": Tensor("bf16", (4, 64)),
+        "routing": Tensor("fp32", (4, 8)),
+    }
+    dispatch.outputs = {
+        f"o{i}": Tensor("bf16", (Fraction(1, 2), 64))
+        for i in range(8)
+    }
+
+    _, copies, next_comms = batch_split(dispatch, 4)
+
+    assert all(copy.M_e == Fraction(1, 8) for copy in copies)
+    assert all(copy.outputs["o0"].shape == (Fraction(1, 8), 64)
+               for copy in copies)
+    assert next_comms["o0"].inputs["i0"].shape == (Fraction(1, 8), 64)
+    assert next_comms["o0"].outputs["y"].shape == (Fraction(1, 2), 64)
 
 
 def test_context_split_nop_keeps_dummy_output_shape():

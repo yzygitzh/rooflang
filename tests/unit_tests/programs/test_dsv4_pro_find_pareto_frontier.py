@@ -52,11 +52,11 @@ def test_parallel_configs_obey_optimizer_equalities():
                for config in configs)
 
 
-def test_batch_quantum_matches_prefill_and_decode_routing_constraints():
+def test_batch_quantum_matches_prefill_and_decode_split_constraints():
     config = ParallelConfig(cp=4, dp=16, ep=64, pp_partition=(61,))
 
     assert batch_quantum("prefill", 8192, config) == 16
-    assert batch_quantum("decode", 8192, config) == 4096
+    assert batch_quantum("decode", 8192, config) == 64
 
 
 def test_case_ids_include_the_full_search_configuration():
@@ -75,10 +75,10 @@ def test_case_ids_include_the_full_search_configuration():
         "prefill-8k:gb300:g64:b16:cp4:dp16:ep64:pp31-30")
 
 
-def test_point_label_contains_batch_and_parallel_degrees():
+def test_point_label_contains_only_ep_degree():
     point = {"batch_size": 16, "cp": 4, "dp": 2, "ep": 8, "pp": 2}
 
-    assert _point_label(point) == "B16 CP4 DP2 EP8 PP2"
+    assert _point_label(point) == "EP=8"
 
 
 def test_case_enumeration_applies_batch_multipliers_and_limit():
@@ -91,7 +91,7 @@ def test_case_enumeration_applies_batch_multipliers_and_limit():
         max_batch_size=8192,
     ))
 
-    assert {case.batch_size for case in cases} == {4096, 8192}
+    assert {case.batch_size for case in cases} == {64, 128, 256}
     assert all(case.pp_partition == (61,) for case in cases)
 
 

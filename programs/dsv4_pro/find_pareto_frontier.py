@@ -44,7 +44,7 @@ from typing import Iterable, Iterator, Sequence
 from rooflang.language.hardware.component import Compute, Memory
 from rooflang.language.kernels.forward import Sampling
 from rooflang.programs.dsv4_pro.config import (
-    COMPRESS_RATIOS, N_EXPERTS, N_LAYERS, TOPK, WINDOW,
+    COMPRESS_RATIOS, N_EXPERTS, N_LAYERS, WINDOW,
 )
 from rooflang.programs.dsv4_pro.model import declare_model
 from rooflang.programs.dsv4_pro.optimization import (
@@ -166,12 +166,7 @@ def enumerate_parallel_configs(
 
 def batch_quantum(stage: str, seq_prefill: int, config: ParallelConfig) -> int:
     """Return the smallest batch satisfying optimizer divisibility checks."""
-    context_length = seq_prefill if stage == "prefill" else 1
-    batch_degree = config.dp if stage == "prefill" else config.cp * config.dp
-    routed_denominator = N_EXPERTS * config.ep
-    routing_degree = routed_denominator // math.gcd(
-        context_length * TOPK, routed_denominator)
-    return math.lcm(batch_degree, routing_degree)
+    return config.dp if stage == "prefill" else config.cp * config.dp
 
 
 def enumerate_cases(
@@ -582,12 +577,8 @@ def _write_csv(path: Path, records: Sequence[dict]) -> None:
 
 
 def _point_label(point: dict) -> str:
-    """Return a compact batch and parallelism label for a frontier point."""
-    return (
-        f"B{point['batch_size']} "
-        f"CP{point['cp']} DP{point['dp']} "
-        f"EP{point['ep']} PP{point['pp']}"
-    )
+    """Return the expert-parallel degree for a frontier point."""
+    return f"EP={point['ep']}"
 
 
 def _shared_axis_limits(

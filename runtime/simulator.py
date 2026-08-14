@@ -682,17 +682,24 @@ class Simulator:
 
         if kernel._requires_placement:
             local_mem = self._hardware.find_local_memory(device)
-            for t in list(kernel.inputs.values()) + list(kernel.weights.values()):
+            read_tensors = [
+                (tensor, 1) for tensor in kernel.inputs.values()
+            ] + [
+                (tensor, kernel.weight_read_fraction)
+                for tensor in kernel.weights.values()
+            ]
+            for t, read_fraction in read_tensors:
+                size_bytes = t.size_bytes * read_fraction
                 mem = self._placement.get_tensor_memory(t) or local_mem
                 if mem is local_mem:
                     fab = self._hardware.find_fabric(device, mem)
                     bw = fab.dst_to_src_bandwidth_gbs * 1e3
-                    if t.size_bytes > 0 and bw <= 0:
+                    if size_bytes > 0 and bw <= 0:
                         raise ValueError(
                             f"Zero read bandwidth on fabric '{fab.name}' "
-                            f"for tensor with {t.size_bytes} bytes")
+                            f"for tensor with {size_bytes} bytes")
                     if bw > 0:
-                        mt += t.size_bytes / bw
+                        mt += size_bytes / bw
                 else:
                     path = self._hardware.find_fabric_path_directed(device, mem)
                     for edge, direction in path:
@@ -700,9 +707,9 @@ class Simulator:
                         key = _fabric_key(edge, rev_dir)
                         bw_gbs = _direction_bw(edge, rev_dir)
                         if key in link_data:
-                            link_data[key][0] += t.size_bytes
+                            link_data[key][0] += size_bytes
                         else:
-                            link_data[key] = [t.size_bytes, bw_gbs]
+                            link_data[key] = [size_bytes, bw_gbs]
             for t in kernel.outputs.values():
                 mem = self._placement.get_tensor_memory(t) or local_mem
                 if mem is local_mem:

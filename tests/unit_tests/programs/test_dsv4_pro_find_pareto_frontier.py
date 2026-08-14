@@ -95,6 +95,35 @@ def test_case_enumeration_applies_batch_multipliers_and_limit():
     assert all(case.pp_partition == (61,) for case in cases)
 
 
+def test_default_batch_range_reaches_64_batches_per_gpu():
+    cases = list(enumerate_cases(
+        workloads=["decode-8k"],
+        hardware_names=["gb300"],
+        gpu_counts=[8],
+        batch_multipliers=None,
+    ))
+    maxima = {}
+    for case in cases:
+        config = (case.cp, case.dp, case.ep, case.pp_partition)
+        maxima[config] = max(maxima.get(config, 0), case.batch_size)
+
+    assert maxima
+    assert set(maxima.values()) == {8 * 64}
+
+
+def test_default_batch_range_includes_non_power_of_two_cap():
+    cases = list(enumerate_cases(
+        workloads=["decode-8k"],
+        hardware_names=["gb300"],
+        gpu_counts=[48],
+        batch_multipliers=None,
+        pp_degrees=[3],
+    ))
+
+    assert max(case.batch_size for case in cases) == 48 * 64
+    assert any(case.batch_size == 48 * 64 for case in cases)
+
+
 def test_parallel_config_enumeration_rejects_expert_and_compression_cases(
         monkeypatch):
     monkeypatch.setattr(finder, "N_EXPERTS", 10)

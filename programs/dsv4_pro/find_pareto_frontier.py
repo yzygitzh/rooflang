@@ -67,7 +67,7 @@ WORKLOADS = {
 }
 HARDWARE_NAMES = ("h200", "gh200", "b300", "gb300", "ascend950dt")
 GPU_COUNTS = (8, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512)
-DEFAULT_BATCH_MULTIPLIERS = (1, 2, 4, 8, 16, 32, 64)
+MAX_BATCH_SIZE_PER_GPU = 64
 THROUGHPUT_METRICS = {
     "original": ("tokens_per_s_user", "tokens_per_s_gpu"),
     "elapsed": (
@@ -169,11 +169,22 @@ def batch_quantum(stage: str, seq_prefill: int, config: ParallelConfig) -> int:
     return config.dp if stage == "prefill" else config.cp * config.dp
 
 
+def _default_batch_multipliers(maximum: int) -> list[int]:
+    """Double from one and include an exact, possibly non-power-of-two cap."""
+    multipliers = []
+    multiplier = 1
+    while multiplier < maximum:
+        multipliers.append(multiplier)
+        multiplier *= 2
+    multipliers.append(maximum)
+    return multipliers
+
+
 def enumerate_cases(
     workloads: Sequence[str],
     hardware_names: Sequence[str],
     gpu_counts: Sequence[int],
-    batch_multipliers: Sequence[int],
+    batch_multipliers: Sequence[int] | None,
     pp_degrees: Sequence[int] | None = None,
     max_batch_size: int | None = None,
 ) -> Iterator[Case]:
@@ -184,11 +195,17 @@ def enumerate_cases(
                 n_gpus, seq_prefill, pp_degrees)
             for config in configs:
                 quantum = batch_quantum(stage, seq_prefill, config)
+                batch_limit = n_gpus * MAX_BATCH_SIZE_PER_GPU
+                if max_batch_size is not None:
+                    batch_limit = min(batch_limit, max_batch_size)
+                multipliers = batch_multipliers
+                if multipliers is None:
+                    multipliers = _default_batch_multipliers(
+                        n_gpus * MAX_BATCH_SIZE_PER_GPU // quantum)
                 batches = sorted({
                     quantum * multiplier
-                    for multiplier in batch_multipliers
-                    if max_batch_size is None
-                    or quantum * multiplier <= max_batch_size
+                    for multiplier in multipliers
+                    if quantum * multiplier <= batch_limit
                 })
                 for hardware in hardware_names:
                     for batch_size in batches:
@@ -783,8 +800,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--batch-multipliers", nargs="+", type=int,
-        default=list(DEFAULT_BATCH_MULTIPLIERS),
-        help="Multipliers applied to each configuration's legal batch quantum",
+        help="Explicit multipliers applied to each configuration's legal "
+             "batch quantum; by default doubles through 64 batches/GPU",
     )
     parser.add_argument(
         "--pp-degrees", nargs="+", type=int,
@@ -825,7 +842,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.workers <= 0:
         raise ValueError("--workers must be positive")
-    if any(multiplier <= 0 for multiplier in args.batch_multipliers):
+    if args.batch_multipliers is not None and any(
+            multiplier <= 0 for multiplier in args.batch_multipliers):
         raise ValueError("--batch-multipliers must be positive")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)

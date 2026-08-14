@@ -53,7 +53,7 @@ class TestB300AggregateOverride:
         for index in range(8):
             ssd = components[f"n0-ssd-{index}"]
             hgx = components[f"n0-hgx-pcie-switch-{index}"]
-            assert ssd.capacity_gb == 30720.0
+            assert ssd.capacity_gb == 256000.0
             path = hw.find_fabric_path(ssd, hgx)
             assert len(path) == 1
             assert path[0].src_to_dst_bandwidth_gbs == 14.0
@@ -129,7 +129,7 @@ class TestB300SuperChip:
             "bf16": 510.58, "fp16": 510.58, "int8": 1022.36,
         }
         assert components["n0-ddr5-0"].capacity_gb == 3072.0
-        assert components["n0-ssd"].capacity_gb == 245760.0
+        assert components["n0-ssd"].capacity_gb == 2048000.0
         assert "n0-mellanox-cx8-0" in components
         assert not any("nvswitch" in name for name in components)
         assert not any("nvme-pcie-switch" in name for name in components)
@@ -251,7 +251,7 @@ class TestH200Cluster:
         assert components["n0-ddr5-0"].capacity_gb == 1536.0
         for index in range(8):
             ssd = components[f"n0-ssd-{index}"]
-            assert ssd.capacity_gb == 30720.0
+            assert ssd.capacity_gb == 256000.0
             path = hw.find_fabric_path(
                 ssd, components[f"n0-hgx-pcie-switch-{index}"])
             assert len(path) == 1
@@ -299,7 +299,7 @@ class TestH200SuperChip:
         }
         assert components["n0-hbm3e-0"].capacity_gb == 1152.0
         assert components["n0-ddr5-0"].capacity_gb == 3072.0
-        assert components["n0-ssd"].capacity_gb == 245760.0
+        assert components["n0-ssd"].capacity_gb == 2048000.0
         assert "n0-mellanox-cx7-0" in components
         assert not any("nvswitch" in name for name in components)
 
@@ -430,7 +430,7 @@ class TestGB300Cluster:
             ssd = components[f"n0-ssd-{index}"]
             cpu = components[f"n0-nvidia-grace-{index // 2}"]
             fabric = hw.find_fabric(ssd, cpu)
-            assert ssd.capacity_gb == 30720.0
+            assert ssd.capacity_gb == 256000.0
             assert fabric.src_to_dst_bandwidth_gbs == 14.0
             assert fabric.dst_to_src_bandwidth_gbs == 7.0
 
@@ -448,7 +448,7 @@ class TestGB300SuperChip:
         }
         assert components["n0-hbm3e-0"].capacity_gb == 2304.0
         assert components["n0-dram-0"].capacity_gb == 1920.0
-        assert components["n0-ssd"].capacity_gb == 245760.0
+        assert components["n0-ssd"].capacity_gb == 2048000.0
         assert not any("nvswitch" in component.name
                        for component in hw.nodes)
 
@@ -547,7 +547,7 @@ class TestGH200Cluster:
             ssd = components[f"n0-ssd-{index}"]
             cpu = components[f"n0-nvidia-grace-{index}"]
             fabric = hw.find_fabric(ssd, cpu)
-            assert ssd.capacity_gb == 30720.0
+            assert ssd.capacity_gb == 256000.0
             assert fabric.src_to_dst_bandwidth_gbs == 14.0
             assert fabric.dst_to_src_bandwidth_gbs == 7.0
 
@@ -565,7 +565,7 @@ class TestGH200SuperChip:
         assert components["n0-nvidia-grace-0"].tflops == {"fp64": 14.2}
         assert components["n0-hbm3e-0"].capacity_gb == 576.0
         assert components["n0-dram-0"].capacity_gb == 1920.0
-        assert components["n0-ssd"].capacity_gb == 122880.0
+        assert components["n0-ssd"].capacity_gb == 1024000.0
         assert not any("nvswitch" in component.name
                        for component in hw.nodes)
 
@@ -666,7 +666,7 @@ class TestAscend950DTCluster:
             ssd = components[f"n0-ssd-{index}"]
             cpu = components[f"n0-intel-xeon-6767p-{index // 4}"]
             fabric = hw.find_fabric(ssd, cpu)
-            assert ssd.capacity_gb == 30720.0
+            assert ssd.capacity_gb == 256000.0
             assert fabric.src_to_dst_bandwidth_gbs == 14.0
             assert fabric.dst_to_src_bandwidth_gbs == 7.0
 
@@ -695,7 +695,7 @@ class TestAscend950DTSuperChip:
         }
         assert components["n0-hbm-0"].capacity_gb == 1152.0
         assert components["n0-ddr5-0"].capacity_gb == 3072.0
-        assert components["n0-ssd"].capacity_gb == 245760.0
+        assert components["n0-ssd"].capacity_gb == 2048000.0
         assert not any("ub-switch" in component.name
                        for component in hw.nodes)
 

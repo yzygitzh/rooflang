@@ -54,7 +54,7 @@ class GH200Cluster(HardwareGraph):
                            kind="hbm") for i in range(nvl_scope)]
             drams = [Memory(name=f"{p}dram-{i}", capacity_gb=480.0,
                             kind="dram") for i in range(n_cpus)]
-            ssds = [Memory(name=f"{p}ssd-{i}", capacity_gb=30720.0,
+            ssds = [Memory(name=f"{p}ssd-{i}", capacity_gb=256000.0,
                            kind="ssd") for i in range(nvl_scope)]
 
             for comp in gpus + [nvswitch] + cpus + nics:
@@ -149,7 +149,7 @@ class GH200SuperChip(HardwareGraph):
             name="n0-dram-0", capacity_gb=480.0 * n_cpus,
             kind="dram")
         ssd = Memory(
-            name="n0-ssd", capacity_gb=30720.0 * nvl_scope,
+            name="n0-ssd", capacity_gb=256000.0 * nvl_scope,
             kind="ssd")
 
         for comp in [gpu, cpu, nic, ib_switch]:

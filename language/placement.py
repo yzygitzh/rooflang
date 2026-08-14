@@ -106,6 +106,7 @@ class Placement:
             raise ValueError("Cannot infer comm devices without hardware")
 
         devices = []
+        seen = set()
         for tensor in (*kernel.inputs.values(), *kernel.outputs.values()):
             memory = self.get_tensor_memory(tensor)
             if memory is None:
@@ -113,7 +114,8 @@ class Placement:
                     f"Cannot infer device for {type(kernel).__name__}: "
                     "an input/output tensor has no memory placement")
             device = self._hardware.find_local_device(memory)
-            if device not in devices:
+            if device not in seen:
+                seen.add(device)
                 devices.append(device)
         if not devices:
             raise ValueError(

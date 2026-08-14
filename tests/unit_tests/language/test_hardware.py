@@ -175,6 +175,28 @@ class TestFindFabricPath:
         with pytest.raises(ValueError, match="No path"):
             hw.find_fabric_path(a, b)
 
+    def test_paths_are_cached_and_invalidated_by_topology_changes(self):
+        hw, g0, g1, _, _, _, _, _, _ = _two_gpu_graph()
+        hw._find_fabric_path.cache_clear()
+        hw._find_fabric_path_directed.cache_clear()
+
+        assert len(hw.find_fabric_path(g0, g1)) == 2
+        assert len(hw.find_fabric_path(g0, g1)) == 2
+        assert hw._find_fabric_path.cache_info().hits == 1
+        assert len(hw.find_fabric_path_directed(g0, g1)) == 2
+        assert len(hw.find_fabric_path_directed(g0, g1)) == 2
+        assert hw._find_fabric_path_directed.cache_info().hits == 1
+
+        hw.add_edge(FabricEdge(
+            name="direct", src=g0, dst=g1,
+            src_to_dst_bandwidth_gbs=100.0,
+            dst_to_src_bandwidth_gbs=100.0,
+            is_full_duplex=True,
+        ))
+
+        assert len(hw.find_fabric_path(g0, g1)) == 1
+        assert len(hw.find_fabric_path_directed(g0, g1)) == 1
+
 
 # ── find_aggregate_bandwidth tests ──────────────────────────────────
 

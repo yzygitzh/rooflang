@@ -350,6 +350,17 @@ class TestAlphaSeparation:
         assert ar_time == pytest.approx(6.0, rel=0.1)
 
 
+def test_collective_topology_info_is_cached_by_device_set():
+    hw, gpus, _ = _hw_multi_gpu(n_gpus=2)
+    simulator = Simulator(ComputeGraph(), Placement(), hw)
+
+    first = simulator._collective_fabric_info(gpus, False)
+    second = simulator._collective_fabric_info(list(reversed(gpus)), False)
+
+    assert first is second
+    assert len(simulator._collective_info_cache) == 1
+
+
 # ── DAG ordering ─────────────────────────────────────────────────────
 
 

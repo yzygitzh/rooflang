@@ -70,24 +70,32 @@ def _create_collective(collector: Kernel, distributor: Kernel) -> Kernel | None:
     raise ValueError(f"Unexpected pair: {type(collector)}, {type(distributor)}")
 
 
+def _single_data_neighbor(adjacency) -> Kernel | None:
+    """Return the sole neighbor connected by data, without edge wrappers."""
+    result = None
+    for neighbor, attributes in adjacency.items():
+        if not attributes["mapping"]:
+            continue
+        if result is not None:
+            return None
+        result = neighbor
+    return result
+
+
 def _fuse_pairs(graph: ComputeGraph) -> bool:
     """Fuse adjacent (Gather|Reduce) → (Scatter|Broadcast) pairs."""
     did_change = False
     while True:
         pairs = []
         for kernel in list(graph._dag.nodes):
-            out_edges = graph._out_edges(kernel)
             if not isinstance(kernel, (Gather, Reduce)):
                 continue
-            if len(out_edges) != 1:
+            successor = _single_data_neighbor(graph._dag.succ[kernel])
+            if successor is None:
                 continue
-            successor = out_edges[0].dst
             if not isinstance(successor, (Scatter, Broadcast)):
                 continue
-            in_edges_of_succ = graph._in_edges(successor)
-            if len(in_edges_of_succ) != 1:
-                continue
-            if in_edges_of_succ[0].src is not kernel:
+            if _single_data_neighbor(graph._dag.pred[successor]) is not kernel:
                 continue
             if kernel.world != successor.world:
                 continue
@@ -160,16 +168,24 @@ def _bypass_pair(
 
     collector_in_keys = list(collector.inputs.keys())
     distributor_out_keys = list(distributor.outputs.keys())
+    collector_rank = {
+        input_name: rank
+        for rank, input_name in enumerate(collector_in_keys)
+    }
+    destination_by_output = {
+        output_name: (edge.dst, input_name)
+        for edge in out_edges
+        for output_name, input_name in edge.mapping.items()
+    }
 
     for ie in in_edges:
         for src_out, coll_in in ie.mapping.items():
-            rank_idx = collector_in_keys.index(coll_in)
+            rank_idx = collector_rank[coll_in]
             dist_out = distributor_out_keys[rank_idx]
-            for oe in out_edges:
-                if dist_out in oe.mapping:
-                    graph.add_data_edge(ie.src, oe.dst,
-                                        {src_out: oe.mapping[dist_out]})
-                    break
+            destination = destination_by_output.get(dist_out)
+            if destination is not None:
+                dst, dst_input = destination
+                graph.add_data_edge(ie.src, dst, {src_out: dst_input})
 
     graph.remove_kernel(collector)
     graph.remove_kernel(distributor)
@@ -188,11 +204,11 @@ def _eliminate_dead(graph: ComputeGraph) -> bool:
         pending.discard(kernel)
         if not graph._dag.has_node(kernel):
             continue
-        in_edges = graph._in_edges(kernel)
-        out_edges = graph._out_edges(kernel)
-        if len(in_edges) != 1 or len(out_edges) != 1:
+        predecessor = _single_data_neighbor(graph._dag.pred[kernel])
+        successor = _single_data_neighbor(graph._dag.succ[kernel])
+        if predecessor is None or successor is None:
             continue
-        neighbors = (in_edges[0].src, out_edges[0].dst)
+        neighbors = (predecessor, successor)
         graph.remove_identity(kernel)
         did_change = True
         for neighbor in neighbors:

@@ -104,7 +104,8 @@ class RunningKernel:
     __slots__ = ("kernel", "device", "stream", "resource_cap",
                  "compute_time", "memory_time",
                  "network_alpha", "network_transfer_time",
-                 "link_data", "fabric_keys", "participants", "start_us",
+                 "link_data", "fabric_keys", "transfer_links",
+                 "fabric_only_collective", "participants", "start_us",
                  "cp", "mp", "tp", "alpha_remaining",
                  "seg_start", "dev_share", "net_share",
                  "local_elapsed_time", "network_elapsed_time")
@@ -121,6 +122,17 @@ class RunningKernel:
         self.network_transfer_time = xfer
         self.link_data = link_data
         self.fabric_keys = list(link_data.keys()) if link_data else []
+        self.transfer_links = tuple(
+            (key, bytes_val, bw)
+            for key, (bytes_val, bw) in link_data.items()
+            if bytes_val > 0
+        )
+        self.fabric_only_collective = (
+            isinstance(kernel, CommKernel)
+            and xfer > 0
+            and bool(link_data)
+            and not self.transfer_links
+        )
         self.participants = parts
         self.start_us = t0
         self.cp = self.mp = self.tp = 0.0
@@ -207,6 +219,8 @@ class Simulator:
         self._placement = placement
         self._hardware = hardware
         self._measurement_start = measurement_start
+        self._resolve_cache = {}
+        self._collective_info_cache = {}
 
     def run(self) -> SimulationResult:
         """Execute DES and return trace + total time."""
@@ -221,6 +235,10 @@ class Simulator:
         self._stream_active: Dict[Tuple[Compute, int], RunningKernel] = {}
         self._stream_pending: Dict[Tuple[Compute, int], List[Kernel]] = {}
         self._multi_stream_waiting: List[Tuple[float, Kernel]] = []
+        self._resolve_cache.clear()
+        self._collective_info_cache.clear()
+        self._remaining_predecessors = dict(self._graph._dag.in_degree())
+        self._ready_time = defaultdict(float)
 
         # ── Memory tracking init ────────────────────────────────────
         self._mem_usage: Dict[Memory, float] = defaultdict(float)
@@ -268,7 +286,7 @@ class Simulator:
 
         # ── Schedule root kernels ───────────────────────────────────
         for kernel in self._graph.topological_sort():
-            if not list(self._graph._dag.predecessors(kernel)):
+            if self._remaining_predecessors[kernel] == 0:
                 dev, stream, _, _ = self._resolve(kernel)
                 self._push(0.0, "start", kernel, dev, stream)
 
@@ -318,12 +336,15 @@ class Simulator:
                 for succ in self._graph._dag.successors(kernel):
                     if succ in self._completed:
                         continue
-                    preds = list(self._graph._dag.predecessors(succ))
-                    if all(p in self._completed for p in preds):
-                        t = max(self._kernel_end[p] for p in preds)
+                    self._remaining_predecessors[succ] -= 1
+                    self._ready_time[succ] = max(
+                        self._ready_time[succ], now)
+                    if self._remaining_predecessors[succ] == 0:
                         s_dev, s_strm, _, _ = self._resolve(succ)
                         sr = self._stream_end.get((s_dev, s_strm), 0.0)
-                        self._push(max(t, sr), "start", succ, s_dev, s_strm)
+                        self._push(
+                            max(self._ready_time[succ], sr), "start",
+                            succ, s_dev, s_strm)
 
         total = max(self._kernel_end.values()) if self._kernel_end else 0.0
         measurement_start_us = 0.0
@@ -510,22 +531,19 @@ class Simulator:
             if not p.link_data or p.network_transfer_time <= 0:
                 p.net_share = 1.0
                 continue
-            worst_time = 0.0
-            for key, (bytes_val, bw) in p.link_data.items():
-                if bytes_val <= 0:
-                    continue
-                n_users = max(1, len(self._on_fab.get(key, [])))
-                link_time = bytes_val / (bw * 1e3 / n_users)
-                worst_time = max(worst_time, link_time)
-            if worst_time > 0:
+            if p.transfer_links:
+                worst_time = max(
+                    bytes_val / (
+                        bw * 1e3
+                        / max(1, len(self._on_fab.get(key, [])))
+                    )
+                    for key, bytes_val, bw in p.transfer_links
+                )
                 p.net_share = p.network_transfer_time / worst_time
-            elif isinstance(p.kernel, CommKernel):
-                # Collectives model transfer time using an aggregate bandwidth,
-                # so their link_data entries identify occupied fabric links but
-                # intentionally carry no per-link byte counts.  Treat the whole
-                # payload phase as occupying every registered link; otherwise
-                # concurrent collectives (or remote reads/writes) see the links
-                # in _on_fab but never contend with them.
+            elif p.fabric_only_collective:
+                # Collectives identify occupied fabric links with zero byte
+                # entries; their aggregate transfer is slowed by the busiest
+                # occupied link.
                 max_users = max(
                     len(self._on_fab.get(key, [])) for key in p.fabric_keys
                 )
@@ -551,6 +569,9 @@ class Simulator:
     # ── Resolution helpers ──────────────────────────────────────────
 
     def _resolve(self, kernel: Kernel):
+        cached = self._resolve_cache.get(kernel)
+        if cached is not None:
+            return cached
         if isinstance(kernel, CommKernel):
             devices = self._infer_comm_devices(kernel)
             stream = 0
@@ -560,11 +581,15 @@ class Simulator:
                     stream = self._placement.get_kernel_device(
                         predecessor).stream
                     break
-            return devices[0], stream, 1.0, devices
+            result = (devices[0], stream, 1.0, tuple(devices))
+            self._resolve_cache[kernel] = result
+            return result
 
         if kernel._requires_placement or kernel in self._placement._mapping:
             a = self._placement.get_kernel_device(kernel)
-            return a.device, a.stream, a.resource_cap, []
+            result = (a.device, a.stream, a.resource_cap, ())
+            self._resolve_cache[kernel] = result
+            return result
         preds = list(self._graph._dag.predecessors(kernel))
         succs = list(self._graph._dag.successors(kernel))
 
@@ -591,11 +616,55 @@ class Simulator:
                 stream = self._placement.get_kernel_device(p).stream
                 break
 
-        return primary, stream, 1.0, devs
+        result = (primary, stream, 1.0, tuple(devs))
+        self._resolve_cache[kernel] = result
+        return result
 
     def _infer_comm_devices(self, kernel: CommKernel) -> List[Compute]:
         """Infer communication devices from the kernel's placed buffers."""
         return self._placement.infer_comm_devices(kernel)
+
+    def _collective_fabric_info(self, participants, point_to_point):
+        """Cache topology-only information shared by many collectives."""
+        devices = tuple(sorted(participants, key=lambda device: device.name))
+        cache_key = (devices, point_to_point)
+        cached = self._collective_info_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        link_bandwidth = {}
+        for i, d1 in enumerate(devices):
+            for d2 in devices[i + 1:]:
+                for edge, direction in \
+                        self._hardware.find_fabric_path_directed(d1, d2):
+                    if edge.is_full_duplex:
+                        for selected_direction in ('fwd', 'rev'):
+                            key = _fabric_key(edge, selected_direction)
+                            link_bandwidth.setdefault(
+                                key, _direction_bw(edge, selected_direction))
+                    else:
+                        key = _fabric_key(edge, direction)
+                        link_bandwidth.setdefault(
+                            key, _direction_bw(edge, direction))
+
+        pair_fabrics = [
+            self._hardware.find_fabric(d1, d2)
+            for i, d1 in enumerate(devices)
+            for d2 in devices[i + 1:]
+        ]
+        if point_to_point:
+            effective_bandwidth = min(
+                min(fabric.src_to_dst_bandwidth_gbs,
+                    fabric.dst_to_src_bandwidth_gbs)
+                for fabric in pair_fabrics
+            )
+        else:
+            effective_bandwidth = self._hardware.find_aggregate_bandwidth(
+                list(devices))
+        alpha = max(fabric.alpha_us for fabric in pair_fabrics)
+        result = (tuple(link_bandwidth.items()), effective_bandwidth, alpha)
+        self._collective_info_cache[cache_key] = result
+        return result
 
     def _base_times(self, kernel: Kernel, device: Compute,
                     participants: List[Compute]):
@@ -614,9 +683,7 @@ class Simulator:
         if kernel._requires_placement:
             local_mem = self._hardware.find_local_memory(device)
             for t in list(kernel.inputs.values()) + list(kernel.weights.values()):
-                mem = self._placement.get_tensor_memory(t) \
-                    if self._placement.get_tensor_memory(t) \
-                    else local_mem
+                mem = self._placement.get_tensor_memory(t) or local_mem
                 if mem is local_mem:
                     fab = self._hardware.find_fabric(device, mem)
                     bw = fab.dst_to_src_bandwidth_gbs * 1e3
@@ -637,9 +704,7 @@ class Simulator:
                         else:
                             link_data[key] = [t.size_bytes, bw_gbs]
             for t in kernel.outputs.values():
-                mem = self._placement.get_tensor_memory(t) \
-                    if self._placement.get_tensor_memory(t) \
-                    else local_mem
+                mem = self._placement.get_tensor_memory(t) or local_mem
                 if mem is local_mem:
                     fab = self._hardware.find_fabric(device, mem)
                     bw = fab.src_to_dst_bandwidth_gbs * 1e3
@@ -662,32 +727,10 @@ class Simulator:
         alpha = 0.0
         if isinstance(kernel, CommKernel) and len(participants) >= 2 \
            and kernel.transferred_bytes > 0:
-            for i, d1 in enumerate(participants):
-                for d2 in participants[i + 1:]:
-                    for edge, direction in \
-                            self._hardware.find_fabric_path_directed(d1, d2):
-                        if edge.is_full_duplex:
-                            for d in ('fwd', 'rev'):
-                                key = _fabric_key(edge, d)
-                                if key not in link_data:
-                                    link_data[key] = [0.0, _direction_bw(edge, d)]
-                        else:
-                            key = _fabric_key(edge, direction)
-                            if key not in link_data:
-                                link_data[key] = [0.0,
-                                                  _direction_bw(edge, direction)]
-            if isinstance(kernel, (AllToAll, Send, Recv)):
-                eff_bw = min(
-                    min(self._hardware.find_fabric(d1, d2).src_to_dst_bandwidth_gbs,
-                        self._hardware.find_fabric(d1, d2).dst_to_src_bandwidth_gbs)
-                    for i, d1 in enumerate(participants)
-                    for d2 in participants[i + 1:])
-            else:
-                eff_bw = self._hardware.find_aggregate_bandwidth(participants)
-            alpha = max(
-                self._hardware.find_fabric(d1, d2).alpha_us
-                for i, d1 in enumerate(participants)
-                for d2 in participants[i + 1:])
+            fabric_data, eff_bw, alpha = self._collective_fabric_info(
+                participants, isinstance(kernel, (AllToAll, Send, Recv)))
+            for key, bandwidth in fabric_data:
+                link_data.setdefault(key, [0.0, bandwidth])
             xfer = kernel.transferred_bytes / (eff_bw * 1e3)
         elif isinstance(kernel, CommKernel) and len(participants) == 1 \
                 and kernel.transferred_bytes > 0:

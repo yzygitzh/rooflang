@@ -153,10 +153,11 @@ class ComputeGraph:
         reconnect = {}
         k_ins = list(kernel.inputs)
         k_outs = list(kernel.outputs)
+        src_output_by_input = {}
+        for output_name, input_name in src_edge.mapping.items():
+            src_output_by_input.setdefault(input_name, output_name)
         for k_in, k_out in zip(k_ins, k_outs):
-            src_output = next(k for k, v in src_edge.mapping.items() if v == k_in)
-            dst_input = dst_edge.mapping[k_out]
-            reconnect[src_output] = dst_input
+            reconnect[src_output_by_input[k_in]] = dst_edge.mapping[k_out]
         self.add_data_edge(src_edge.src, dst_edge.dst, reconnect)
         self.remove_kernel(kernel)
 
@@ -492,7 +493,7 @@ class ComputeGraph:
     def _in_edges(self, kernel: Kernel) -> List[DataEdge]:
         self._check_in_graph(kernel)
         edges = []
-        for src, _, attr in self._dag.in_edges(kernel, data=True):
+        for src, attr in self._dag.pred[kernel].items():
             if attr["mapping"]:
                 edges.append(DataEdge(src=src, dst=kernel,
                                       mapping=attr["mapping"]))
@@ -501,7 +502,7 @@ class ComputeGraph:
     def _out_edges(self, kernel: Kernel) -> List[DataEdge]:
         self._check_in_graph(kernel)
         edges = []
-        for _, dst, attr in self._dag.out_edges(kernel, data=True):
+        for dst, attr in self._dag.succ[kernel].items():
             if attr["mapping"]:
                 edges.append(DataEdge(src=kernel, dst=dst,
                                       mapping=attr["mapping"]))
@@ -588,6 +589,7 @@ class HardwareGraph:
                 f"Duplicate hardware component name: '{component.name}'")
         self._names.add(component.name)
         self._graph.add_node(component)
+        self._clear_lookup_caches()
 
     def add_edge(self, edge: FabricEdge) -> None:
         if not self._graph.has_node(edge.src):
@@ -598,6 +600,7 @@ class HardwareGraph:
             self._graph.edges[edge.src, edge.dst]["fabrics"].append(edge)
         else:
             self._graph.add_edge(edge.src, edge.dst, fabrics=[edge])
+        self._clear_lookup_caches()
 
     @property
     def nodes(self) -> FrozenSet[HardwareComponent]:
@@ -658,8 +661,15 @@ class HardwareGraph:
         self, src: HardwareComponent, dst: HardwareComponent,
     ) -> List[FabricEdge]:
         """Return the list of actual FabricEdge objects on the shortest path."""
+        return list(self._find_fabric_path(src, dst))
+
+    @lru_cache(maxsize=None)
+    def _find_fabric_path(
+        self, src: HardwareComponent, dst: HardwareComponent,
+    ) -> Tuple[FabricEdge, ...]:
+        """Cache the immutable fabric path for one ordered endpoint pair."""
         if src is dst:
-            return []
+            return ()
         try:
             path = nx.shortest_path(self._graph, src, dst)
         except nx.NetworkXNoPath:
@@ -667,7 +677,7 @@ class HardwareGraph:
         hops: List[FabricEdge] = []
         for i in range(len(path) - 1):
             hops.append(self._best_fabric(path[i], path[i + 1]))
-        return hops
+        return tuple(hops)
 
     def find_fabric_path_directed(
         self, src: HardwareComponent, dst: HardwareComponent,
@@ -677,8 +687,15 @@ class HardwareGraph:
         direction is 'fwd' if data flows src→dst on that edge,
         'rev' if data flows dst→src.
         """
+        return list(self._find_fabric_path_directed(src, dst))
+
+    @lru_cache(maxsize=None)
+    def _find_fabric_path_directed(
+        self, src: HardwareComponent, dst: HardwareComponent,
+    ) -> Tuple[Tuple[FabricEdge, str], ...]:
+        """Cache an immutable directed path for one ordered endpoint pair."""
         if src is dst:
-            return []
+            return ()
         try:
             path = nx.shortest_path(self._graph, src, dst)
         except nx.NetworkXNoPath:
@@ -688,7 +705,15 @@ class HardwareGraph:
             edge = self._best_fabric(path[i], path[i + 1])
             direction = 'fwd' if edge.src is path[i] else 'rev'
             result.append((edge, direction))
-        return result
+        return tuple(result)
+
+    def _clear_lookup_caches(self) -> None:
+        """Invalidate topology-dependent lookups after graph mutation."""
+        self.find_fabric.cache_clear()
+        self._find_fabric_path.cache_clear()
+        self._find_fabric_path_directed.cache_clear()
+        self.find_local_memory.cache_clear()
+        self.find_local_device.cache_clear()
 
     @lru_cache(maxsize=None)
     def find_local_memory(self, device: Compute) -> Memory:

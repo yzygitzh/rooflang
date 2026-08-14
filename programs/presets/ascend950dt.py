@@ -7,10 +7,10 @@ from rooflang.language.hardware.component import Compute, Memory
 from rooflang.language.graph import FabricEdge, HardwareGraph
 
 
-def _validate_ub_scope(ub_scope: int) -> None:
-    if ub_scope < 8 or ub_scope > 64 or ub_scope % 8 != 0:
+def _validate_ub_scope(ub_scope: int, max_scope: int) -> None:
+    if ub_scope < 8 or ub_scope > max_scope or ub_scope % 8 != 0:
         raise ValueError(
-            "ub_scope must be divisible by 8 and between 8 and 64; "
+            f"ub_scope must be divisible by 8 and between 8 and {max_scope}; "
             f"got {ub_scope}")
 
 
@@ -22,8 +22,10 @@ class Ascend950DTCluster(HardwareGraph):
     and one SSD. All NPUs in the node share one logical UB switch.
     """
 
+    max_scope = 1024
+
     def __init__(self, ub_scope: int, n_nodes: int = 1):
-        _validate_ub_scope(ub_scope)
+        _validate_ub_scope(ub_scope, self.max_scope)
         super().__init__()
         self.ub_scope = ub_scope
 
@@ -119,8 +121,10 @@ class Ascend950DTCluster(HardwareGraph):
 class Ascend950DTSuperChip(HardwareGraph):
     """Aggregate one Ascend 950DT UB scope into logical components."""
 
+    max_scope = Ascend950DTCluster.max_scope
+
     def __init__(self, ub_scope: int):
-        _validate_ub_scope(ub_scope)
+        _validate_ub_scope(ub_scope, self.max_scope)
         super().__init__()
         self.ub_scope = ub_scope
 

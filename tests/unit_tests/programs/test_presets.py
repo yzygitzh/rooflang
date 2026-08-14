@@ -594,7 +594,7 @@ class TestGH200SuperChip:
 
 @pytest.mark.parametrize(
     "preset", [Ascend950DTCluster, Ascend950DTSuperChip])
-@pytest.mark.parametrize("ub_scope", [0, 7, 9, 65])
+@pytest.mark.parametrize("ub_scope", [0, 7, 9, 65, 1032])
 def test_ascend950dt_rejects_invalid_ub_scope(preset, ub_scope):
     with pytest.raises(ValueError, match="ub_scope"):
         preset(ub_scope=ub_scope)
@@ -602,7 +602,7 @@ def test_ascend950dt_rejects_invalid_ub_scope(preset, ub_scope):
 
 @pytest.mark.parametrize(
     "preset", [Ascend950DTCluster, Ascend950DTSuperChip])
-@pytest.mark.parametrize("ub_scope", [8, 64])
+@pytest.mark.parametrize("ub_scope", [8, 1024])
 def test_ascend950dt_accepts_ub_scope_boundaries(preset, ub_scope):
     assert preset(ub_scope=ub_scope).ub_scope == ub_scope
 

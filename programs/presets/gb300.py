@@ -7,10 +7,10 @@ from rooflang.language.hardware.component import Compute, Memory
 from rooflang.language.graph import FabricEdge, HardwareGraph
 
 
-def _validate_nvl_scope(nvl_scope: int) -> None:
-    if nvl_scope < 4 or nvl_scope > 72 or nvl_scope % 4 != 0:
+def _validate_nvl_scope(nvl_scope: int, max_scope: int) -> None:
+    if nvl_scope < 4 or nvl_scope > max_scope or nvl_scope % 4 != 0:
         raise ValueError(
-            "nvl_scope must be divisible by 4 and between 4 and 72; "
+            f"nvl_scope must be divisible by 4 and between 4 and {max_scope}; "
             f"got {nvl_scope}")
 
 
@@ -24,8 +24,10 @@ class GB300Cluster(HardwareGraph):
     All GPUs in the node share one logical fifth-generation NVSwitch fabric.
     """
 
+    max_scope = 72
+
     def __init__(self, nvl_scope: int, n_nodes: int = 1):
-        _validate_nvl_scope(nvl_scope)
+        _validate_nvl_scope(nvl_scope, self.max_scope)
         super().__init__()
         self.nvl_scope = nvl_scope
 
@@ -129,8 +131,10 @@ class GB300Cluster(HardwareGraph):
 class GB300SuperChip(HardwareGraph):
     """Aggregate one GB300 NVLink scope into single logical components."""
 
+    max_scope = GB300Cluster.max_scope
+
     def __init__(self, nvl_scope: int):
-        _validate_nvl_scope(nvl_scope)
+        _validate_nvl_scope(nvl_scope, self.max_scope)
         super().__init__()
         self.nvl_scope = nvl_scope
 

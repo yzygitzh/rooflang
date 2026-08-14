@@ -66,7 +66,7 @@ WORKLOADS = {
     "decode-1m": ("decode", 1048576),
 }
 HARDWARE_NAMES = ("h200", "gh200", "b300", "gb300", "ascend950dt")
-GPU_COUNTS = (8, 16, 32, 48, 64)
+GPU_COUNTS = (8, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512)
 DEFAULT_BATCH_MULTIPLIERS = (1, 2, 4, 8, 16, 32, 64)
 THROUGHPUT_METRICS = {
     "original": ("tokens_per_s_user", "tokens_per_s_gpu"),
@@ -209,6 +209,15 @@ def enumerate_cases(
                         )
 
 
+def _largest_node_scope(n_gpus: int, maximum: int, quantum: int = 1) -> int:
+    """Return the largest legal per-node scope dividing ``n_gpus``."""
+    for scope in range(min(n_gpus, maximum), quantum - 1, -1):
+        if scope % quantum == 0 and n_gpus % scope == 0:
+            return scope
+    raise ValueError(
+        f"GPU count {n_gpus} cannot be divided into scopes of {quantum}")
+
+
 def build_hardware(name: str, n_gpus: int):
     """Construct the requested cluster with exactly ``n_gpus`` accelerators."""
     if name == "h200":
@@ -220,11 +229,16 @@ def build_hardware(name: str, n_gpus: int):
             raise ValueError("B300 GPU count must be divisible by 8")
         return B300Cluster(n_nodes=n_gpus // 8)
     if name == "gh200":
-        return GH200Cluster(nvl_scope=n_gpus, n_nodes=1)
+        scope = _largest_node_scope(n_gpus, maximum=GH200Cluster.max_scope)
+        return GH200Cluster(nvl_scope=scope, n_nodes=n_gpus // scope)
     if name == "gb300":
-        return GB300Cluster(nvl_scope=n_gpus, n_nodes=1)
+        scope = _largest_node_scope(
+            n_gpus, maximum=GB300Cluster.max_scope, quantum=4)
+        return GB300Cluster(nvl_scope=scope, n_nodes=n_gpus // scope)
     if name == "ascend950dt":
-        return Ascend950DTCluster(ub_scope=n_gpus, n_nodes=1)
+        scope = _largest_node_scope(
+            n_gpus, maximum=Ascend950DTCluster.max_scope, quantum=8)
+        return Ascend950DTCluster(ub_scope=scope, n_nodes=n_gpus // scope)
     raise ValueError(f"Unknown hardware: {name}")
 
 

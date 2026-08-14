@@ -7,10 +7,10 @@ from rooflang.language.hardware.component import Compute, Memory
 from rooflang.language.graph import FabricEdge, HardwareGraph
 
 
-def _validate_nvl_scope(nvl_scope: int) -> None:
-    if nvl_scope < 1 or nvl_scope > 256:
+def _validate_nvl_scope(nvl_scope: int, max_scope: int) -> None:
+    if nvl_scope < 1 or nvl_scope > max_scope:
         raise ValueError(
-            f"nvl_scope must be between 1 and 256; got {nvl_scope}")
+            f"nvl_scope must be between 1 and {max_scope}; got {nvl_scope}")
 
 
 class GH200Cluster(HardwareGraph):
@@ -22,8 +22,10 @@ class GH200Cluster(HardwareGraph):
     over NVLink-C2C, while all GPUs share one logical NVLink Switch System.
     """
 
+    max_scope = 256
+
     def __init__(self, nvl_scope: int, n_nodes: int = 1):
-        _validate_nvl_scope(nvl_scope)
+        _validate_nvl_scope(nvl_scope, self.max_scope)
         super().__init__()
         self.nvl_scope = nvl_scope
 
@@ -119,8 +121,10 @@ class GH200Cluster(HardwareGraph):
 class GH200SuperChip(HardwareGraph):
     """Aggregate one GH200 NVLink scope into single logical components."""
 
+    max_scope = GH200Cluster.max_scope
+
     def __init__(self, nvl_scope: int):
-        _validate_nvl_scope(nvl_scope)
+        _validate_nvl_scope(nvl_scope, self.max_scope)
         super().__init__()
         self.nvl_scope = nvl_scope
 

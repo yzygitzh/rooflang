@@ -735,21 +735,51 @@ class HardwareGraph:
 
     @lru_cache(maxsize=None)
     def find_local_device(self, memory: Memory) -> Compute:
-        """Find the Compute node connected to memory with highest bandwidth."""
-        best_device: Optional[Compute] = None
-        best_bw = 0.0
-        for neighbor in self._graph.neighbors(memory):
-            if not isinstance(neighbor, Compute):
-                continue
-            for fab in self._graph.edges[memory, neighbor]["fabrics"]:
-                bw = (fab.src_to_dst_bandwidth_gbs if fab.src is neighbor
-                      else fab.dst_to_src_bandwidth_gbs)
-                if bw > best_bw:
-                    best_bw = bw
-                    best_device = neighbor
-        if best_device is None:
-            raise ValueError(f"No device attached to memory: {memory.name}")
-        return best_device
+        """Find the nearest execution endpoint that owns ``memory``.
+
+        Switches and NICs are fabric transit components, not devices on which
+        tensor kernels execute.  A memory may nevertheless be attached to a
+        switch directly (for example, an NVMe SSD below an HGX PCIe switch),
+        so walk outward through transit components until the nearest GPU/CPU
+        endpoint is reached.  Among equally near endpoints, prefer the path
+        with the highest device-to-memory bandwidth; an equally connected GPU
+        wins the final tie because per-GPU SSDs share a PCIe switch with both
+        their GPU and a socket CPU.
+        """
+        transit_kinds = {"switch", "nic"}
+        visited = {memory}
+        frontier = [memory]
+
+        while frontier:
+            endpoints = []
+            next_frontier = []
+            for component in frontier:
+                for neighbor in self._graph.neighbors(component):
+                    if neighbor in visited:
+                        continue
+                    visited.add(neighbor)
+                    if not isinstance(neighbor, Compute):
+                        continue
+                    if neighbor.kind in transit_kinds:
+                        next_frontier.append(neighbor)
+                    else:
+                        endpoints.append(neighbor)
+
+            if endpoints:
+                def endpoint_score(device):
+                    fabric = self.find_fabric(device, memory)
+                    bandwidth = (
+                        fabric.src_to_dst_bandwidth_gbs
+                        if fabric.src is device
+                        else fabric.dst_to_src_bandwidth_gbs
+                    )
+                    return bandwidth, device.kind == "gpu"
+
+                return max(endpoints, key=endpoint_score)
+            frontier = next_frontier
+
+        raise ValueError(
+            f"No device attached to memory: {memory.name}")
 
     def find_aggregate_bandwidth(self, devices: List[Compute]) -> float:
         """Aggregate bandwidth for ring/tree collectives among devices.

@@ -181,3 +181,73 @@ class TestFindLocalDevice:
             is_full_duplex=False,
         ))
         assert hw.find_local_device(memory) is fast
+
+    def test_walks_through_switch_to_execution_endpoint(self):
+        ssd = Memory(name="ssd", capacity_gb=1.0, kind="ssd")
+        switch = Compute(name="pcie-switch", kind="switch")
+        nic = Compute(name="nic", kind="nic")
+        gpu = Compute(name="gpu", kind="gpu")
+        cpu = Compute(name="cpu", kind="cpu")
+        hw = HardwareGraph()
+        for component in (ssd, switch, nic, gpu, cpu):
+            hw.add_node(component)
+        hw.add_edge(FabricEdge(
+            name="nvme", src=ssd, dst=switch,
+            src_to_dst_bandwidth_gbs=14.0,
+            dst_to_src_bandwidth_gbs=7.0,
+            is_full_duplex=True,
+        ))
+        for endpoint in (nic, gpu, cpu):
+            hw.add_edge(FabricEdge(
+                name="pcie", src=endpoint, dst=switch,
+                src_to_dst_bandwidth_gbs=64.0,
+                dst_to_src_bandwidth_gbs=64.0,
+                is_full_duplex=True,
+            ))
+
+        assert hw.find_local_device(ssd) is gpu
+
+    def test_direct_endpoint_wins_over_one_behind_switch(self):
+        ssd = Memory(name="ssd", capacity_gb=1.0, kind="ssd")
+        cpu = Compute(name="cpu", kind="cpu")
+        switch = Compute(name="pcie-switch", kind="switch")
+        gpu = Compute(name="gpu", kind="gpu")
+        hw = HardwareGraph()
+        for component in (ssd, cpu, switch, gpu):
+            hw.add_node(component)
+        hw.add_edge(FabricEdge(
+            name="pcie", src=ssd, dst=cpu,
+            src_to_dst_bandwidth_gbs=14.0,
+            dst_to_src_bandwidth_gbs=7.0,
+            is_full_duplex=True,
+        ))
+        hw.add_edge(FabricEdge(
+            name="pcie", src=ssd, dst=switch,
+            src_to_dst_bandwidth_gbs=14.0,
+            dst_to_src_bandwidth_gbs=7.0,
+            is_full_duplex=True,
+        ))
+        hw.add_edge(FabricEdge(
+            name="pcie", src=switch, dst=gpu,
+            src_to_dst_bandwidth_gbs=64.0,
+            dst_to_src_bandwidth_gbs=64.0,
+            is_full_duplex=True,
+        ))
+
+        assert hw.find_local_device(ssd) is cpu
+
+    def test_transit_component_is_not_a_device(self):
+        memory = Memory(name="ssd", capacity_gb=1.0, kind="ssd")
+        switch = Compute(name="pcie-switch", kind="switch")
+        hw = HardwareGraph()
+        hw.add_node(memory)
+        hw.add_node(switch)
+        hw.add_edge(FabricEdge(
+            name="pcie", src=memory, dst=switch,
+            src_to_dst_bandwidth_gbs=14.0,
+            dst_to_src_bandwidth_gbs=7.0,
+            is_full_duplex=True,
+        ))
+
+        with pytest.raises(ValueError, match="No device"):
+            hw.find_local_device(memory)

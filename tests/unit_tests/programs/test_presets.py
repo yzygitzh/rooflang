@@ -258,6 +258,14 @@ class TestH200Cluster:
             assert path[0].src_to_dst_bandwidth_gbs == 14.0
             assert path[0].dst_to_src_bandwidth_gbs == 7.0
 
+    def test_per_gpu_ssd_resolves_to_gpu_not_pcie_switch(self):
+        hw = H200Cluster(n_nodes=1)
+        components = {component.name: component for component in hw.nodes}
+
+        for index in range(8):
+            assert hw.find_local_device(components[f"n0-ssd-{index}"]) \
+                is components[f"n0-nvidia-h200-sxm-{index}"]
+
 
 @pytest.mark.parametrize(
     ("preset", "gpu_model", "nic_model"),

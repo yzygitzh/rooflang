@@ -613,7 +613,7 @@ def _shared_axis_limits(
     user_metric: str,
     gpu_metric: str,
 ) -> tuple[tuple[float, float], tuple[float, float]]:
-    """Return common positive log-scale limits for one figure's subplots."""
+    """Return shared log limits with every subplot rooted at (1, 1)."""
     points = [
         point
         for n_gpus in gpu_counts
@@ -625,12 +625,30 @@ def _shared_axis_limits(
         values = [point[metric] for point in points if point[metric] > 0]
         if not values:
             return 1.0, 2.0
-        lower, upper = min(values), max(values)
-        if lower == upper:
-            return lower / 2, upper * 2
-        return lower / 1.05, upper * 1.05
+        upper = max(values)
+        padded_upper = upper * (2 if min(values) == upper else 1.05)
+        return 1.0, max(2.0, padded_upper)
 
     return padded_limits(user_metric), padded_limits(gpu_metric)
+
+
+def _plain_tick_label(value: float, _position=None) -> str:
+    """Format log ticks as plain numbers with binary K/M/G/T suffixes."""
+    if value <= 0:
+        return ""
+    for scale, suffix in (
+        (1024 ** 4, "T"),
+        (1024 ** 3, "G"),
+        (1024 ** 2, "M"),
+        (1024, "K"),
+    ):
+        if value >= scale:
+            scaled = value / scale
+            number = f"{scaled:.3f}".rstrip("0").rstrip(".")
+            return f"{number}{suffix}"
+    if value >= 1:
+        return f"{value:,.0f}"
+    return f"{value:.6f}".rstrip("0").rstrip(".")
 
 
 def write_outputs(
@@ -662,6 +680,7 @@ def write_outputs(
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import FuncFormatter
 
     workloads = [
         workload for workload in WORKLOADS
@@ -715,8 +734,15 @@ def write_outputs(
                 axis.set_title(f"{n_gpus} GPUs")
                 axis.set_xscale("log", base=2)
                 axis.set_yscale("log", base=2)
+                axis.xaxis.set_major_formatter(
+                    FuncFormatter(_plain_tick_label))
+                axis.yaxis.set_major_formatter(
+                    FuncFormatter(_plain_tick_label))
                 axis.set_xlim(x_limits)
                 axis.set_ylim(y_limits)
+                axis.tick_params(
+                    axis="both", which="both",
+                    labelbottom=True, labelleft=True)
                 axis.set_xlabel(f"tokens/s/user ({timing}, log2)")
                 axis.set_ylabel(f"tokens/s/GPU ({timing}, log2)")
                 axis.grid(True, which="both", alpha=0.25)

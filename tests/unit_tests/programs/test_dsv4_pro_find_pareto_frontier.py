@@ -564,8 +564,8 @@ def test_shared_axis_limits_cover_all_subplots_with_same_scale():
         frontiers, "decode-8k", [8, 16], ["h200", "gb300"],
         "tokens_per_s_user", "tokens_per_s_gpu",
     )
-    assert x_limits == pytest.approx((10.0 / 1.05, 105.0))
-    assert y_limits == pytest.approx((20.0 / 1.05, 210.0))
+    assert x_limits == pytest.approx((1.0, 105.0))
+    assert y_limits == pytest.approx((1.0, 210.0))
 
 
 def test_shared_axis_limits_are_valid_for_empty_and_single_point_log_axes():
@@ -582,7 +582,24 @@ def test_shared_axis_limits_are_valid_for_empty_and_single_point_log_axes():
     assert finder._shared_axis_limits(
         frontiers, "decode-8k", [8], ["h200"],
         "tokens_per_s_user", "tokens_per_s_gpu",
-    ) == ((8.0, 32.0), (16.0, 64.0))
+    ) == ((1.0, 32.0), (1.0, 64.0))
+
+
+@pytest.mark.parametrize(("value", "label"), [
+    (1024.0, "1K"),
+    (2048.0, "2K"),
+    (1024.0 * 1024, "1M"),
+    (1.5 * 1024 * 1024, "1.5M"),
+    (1024.0 ** 3, "1G"),
+    (1.5 * 1024 ** 3, "1.5G"),
+    (1024.0 ** 4, "1T"),
+    (1.5 * 1024 ** 4, "1.5T"),
+    (1.0, "1"),
+    (0.5, "0.5"),
+    (0.0, ""),
+])
+def test_plain_tick_label_uses_decimal_numbers(value, label):
+    assert finder._plain_tick_label(value) == label
 
 
 def test_write_outputs_honors_filtered_workloads(tmp_path):
@@ -644,6 +661,52 @@ def test_write_outputs_point_labels_are_opt_in(tmp_path, monkeypatch):
 
     write_outputs(tmp_path, [record], point_labels=True)
     assert labels == ["one"] * len(finder.THROUGHPUT_METRICS)
+
+
+def test_write_outputs_shows_plain_ticks_on_every_subplot(
+        tmp_path, monkeypatch):
+    import matplotlib.pyplot as plt
+
+    figures = []
+    original_subplots = plt.subplots
+
+    def capture_subplots(*args, **kwargs):
+        figure, axes = original_subplots(*args, **kwargs)
+        figures.append((figure, axes))
+        return figure, axes
+
+    monkeypatch.setattr(plt, "subplots", capture_subplots)
+    records = []
+    for n_gpus in (8, 16, 32):
+        value = float(n_gpus * 128)
+        records.append({
+            "case_id": str(n_gpus), "status": "ok",
+            "workload": "decode-8k", "hardware": "h200",
+            "n_gpus": n_gpus, "batch_size": n_gpus,
+            "cp": 1, "dp": n_gpus, "ep": n_gpus,
+            "pp": 1, "pp_partition": [61],
+            "tokens_per_s_user": value,
+            "tokens_per_s_gpu": value * 2,
+            "tokens_per_s_user_elapsed": value,
+            "tokens_per_s_gpu_elapsed": value * 2,
+            "tokens_per_s_user_overlapped": value,
+            "tokens_per_s_gpu_overlapped": value * 2,
+            "memory_feasible_elapsed": True,
+            "memory_feasible_overlapped": True,
+        })
+
+    write_outputs(tmp_path, records)
+
+    assert len(figures) == len(finder.THROUGHPUT_METRICS)
+    for figure, axes in figures:
+        figure.canvas.draw()
+        for axis in list(axes.flat)[:3]:
+            xlabels = axis.get_xticklabels()
+            ylabels = axis.get_yticklabels()
+            assert xlabels and all(label.get_visible() for label in xlabels)
+            assert ylabels and all(label.get_visible() for label in ylabels)
+            assert all("$" not in label.get_text()
+                       for label in (*xlabels, *ylabels))
 
 
 def test_write_outputs_handles_empty_frontiers_and_extra_axes(tmp_path):

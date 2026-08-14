@@ -641,8 +641,8 @@ def write_outputs(
         hardware for hardware in HARDWARE_NAMES
         if any(record.get("hardware") == hardware for record in records)
     ]
-    columns = min(3, len(gpu_counts))
-    rows = math.ceil(len(gpu_counts) / columns)
+    rows = 1 if len(gpu_counts) <= 2 else 2
+    columns = math.ceil(len(gpu_counts) / rows)
     for timing, (user_metric, gpu_metric) in THROUGHPUT_METRICS.items():
         frontiers = frontiers_by_timing[timing]
         suffix = "" if timing == "original" else f"_{timing}"

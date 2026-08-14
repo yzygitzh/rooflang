@@ -18,9 +18,11 @@ longer one.
 
 The simulator executes and accounts for one batch.  Memory feasibility is
 then evaluated separately for each frontier: original uses one KV copy,
-elapsed uses ``PP`` concurrent copies, and overlapped uses ``2 * PP`` copies.
-Only the tagged KV-cache footprint is replicated; weights and activations keep
-their simulated peak usage.
+decode elapsed uses ``PP`` concurrent copies, and decode overlapped uses
+``2 * PP`` copies. Prefill does not retain KV state for pipeline concurrency,
+so its elapsed and overlapped projections use one and two copies respectively.
+Only the tagged KV-cache footprint is replicated; weights and activations
+keep their simulated peak usage.
 
 Each simulation is an independent process.  Results are appended to JSONL as
 they finish, so an interrupted search can resume without repeating completed
@@ -286,6 +288,13 @@ def _project_memory(result, concurrent_batches: int) -> dict[Memory, float]:
     return projected
 
 
+def _concurrent_kv_batches(stage: str, pp_degree: int) -> tuple[int, int]:
+    """Return elapsed/overlapped KV copies for the selected stage."""
+    if stage == "prefill":
+        return 1, 2
+    return pp_degree, pp_degree * 2
+
+
 def _memory_feasible(memory_usage) -> bool:
     return all(
         size_bytes <= memory.capacity_gb * 1e9
@@ -477,11 +486,13 @@ def run_case(case: Case) -> dict:
         })
         kv_cache_memory = _kv_cache_memory(result)
         pp_degree = len(case.pp_partition)
-        elapsed_memory = _project_memory(result, pp_degree)
-        overlapped_memory = _project_memory(result, pp_degree * 2)
+        elapsed_batches, overlapped_batches = _concurrent_kv_batches(
+            stage, pp_degree)
+        elapsed_memory = _project_memory(result, elapsed_batches)
+        overlapped_memory = _project_memory(result, overlapped_batches)
         record.update({
-            "concurrent_batches_elapsed": pp_degree,
-            "concurrent_batches_overlapped": pp_degree * 2,
+            "concurrent_batches_elapsed": elapsed_batches,
+            "concurrent_batches_overlapped": overlapped_batches,
             "kv_cache_hbm_gb": _max_memory_gb(kv_cache_memory, "hbm"),
             "kv_cache_ssd_gb": _max_memory_gb(kv_cache_memory, "ssd"),
             "memory_feasible_elapsed": _memory_feasible(elapsed_memory),

@@ -211,6 +211,18 @@ def test_project_memory_replicates_only_kv_cache():
     assert not _memory_feasible(_project_memory(result, 4))
 
 
+@pytest.mark.parametrize(
+    ("stage", "pp_degree", "expected"),
+    [
+        ("prefill", 4, (1, 2)),
+        ("decode", 4, (4, 8)),
+    ],
+)
+def test_concurrent_kv_batches_excludes_prefill_pipeline_copies(
+        stage, pp_degree, expected):
+    assert finder._concurrent_kv_batches(stage, pp_degree) == expected
+
+
 def test_pareto_frontier_removes_dominated_and_duplicate_points():
     records = [
         {"case_id": "a", "status": "ok",

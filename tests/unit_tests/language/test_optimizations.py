@@ -812,6 +812,23 @@ def test_context_split_nop_keeps_dummy_output_shape():
                for tensor in nxt["done"].inputs.values())
 
 
+def test_batch_split_supports_terminal_nop_sink_without_gather():
+    tensor = Tensor("bf16", (8, 16, 64))
+    source = Nop(outputs={"y": Tensor(tensor.dtype, tensor.shape)})
+    sink = Nop(inputs={"x": Tensor(tensor.dtype, tensor.shape)})
+    graph = ComputeGraph()
+    graph.add_kernel(source)
+    graph.add_kernel(sink)
+    graph.add_data_edge(source, sink, {"y": "x"})
+
+    _, copies, next_comms = graph.split_kernel(batch_split, sink, N)
+
+    assert not next_comms
+    assert sink not in graph.kernels
+    assert all(not copy.outputs and not graph._out_edges(copy)
+               for copy in copies)
+
+
 def test_context_split_decode_attention_broadcasts_q_and_shards_kv():
     kernel = SparseAttn(8, 8, 1, 1, 8, 12, 64, "bf16", kv_factor=1)
     kernel.inputs = {

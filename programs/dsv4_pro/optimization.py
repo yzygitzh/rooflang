@@ -32,7 +32,7 @@ _DECODE_REPLICATED_FIELDS = (
 )
 
 _DECODE_DP_ONLY_FIELDS = (
-    "bridge", "attn_norm", "attn_fan", "wkv", "kv_norm",
+    "bridge", "attn_norm", "attn_fan", "wkv", "kv_norm", "kv_sink",
 )
 
 _DECODE_SHARDED_FIELDS = (

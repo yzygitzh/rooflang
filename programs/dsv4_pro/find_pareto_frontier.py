@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
 from rooflang.language.hardware.component import Compute, Memory
-from rooflang.language.kernels.forward import Sampling
+from rooflang.language.kernels.forward import Nop, Sampling
 from rooflang.programs.dsv4_pro.config import (
     COMPRESS_RATIOS, N_EXPERTS, N_LAYERS, WINDOW,
 )
@@ -294,10 +294,17 @@ def _memory_feasible(memory_usage) -> bool:
 
 
 def _output_path_kernels(graph) -> tuple[set, set]:
-    """Return Sampling kernels and their inclusive dependency ancestors."""
+    """Return stage-completion kernels and their dependency ancestors.
+
+    Sampling produces the user-visible token.  A terminal, outputless Nop is
+    an explicit dependency sink: DSV4 Pro uses one per layer to require that
+    the newly computed decode KV has completed even though the simplified
+    one-step model omits the cache-append data path.
+    """
     outputs = {
         kernel for kernel in graph.kernels
         if isinstance(kernel, Sampling)
+        or (isinstance(kernel, Nop) and kernel.inputs and not kernel.outputs)
     }
     ancestors = set(outputs)
     stack = list(outputs)

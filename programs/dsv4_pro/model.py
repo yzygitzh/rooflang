@@ -97,6 +97,7 @@ class LayerMeta:
     kv_cache_fan: Kernel = None
     kv_persist_fan: Kernel = None
     kv_persist_barrier: Kernel = None
+    kv_sink: Kernel = None
 
 def _tag_weights(kernel, layer_id, name):
     """Tag kernel's weight Tensors with a weight_id for simulator dedup."""
@@ -203,7 +204,7 @@ def _build_layers(g, B, S, context_len, prev_out):
         g.add_data_edge(bridge, attn_norm, {"y": "x"})
         L.attn_norm = attn_norm
 
-        # Fan-out after norm: Q path + KV path
+        # Fan-out after norm: Q path + newly computed KV path.
         attn_fan = Spawn(world=2)
         attn_fan.inputs = {"x": Tensor("bf16", (B, S, D))}
         attn_fan.outputs = {"y": Tensor("bf16", (B, S, D)),
@@ -228,7 +229,9 @@ def _build_layers(g, B, S, context_len, prev_out):
         g.add_data_edge(q_norm, wq_b, {"y": "x"})
         L.wq_b = wq_b
 
-        # KV path (branch from attn fan-out)
+        # KV projection and normalization are computed in both stages. Decode
+        # intentionally omits the append/update data path, but retains this
+        # work and terminates it at a zero-cost dependency sink below.
         wkv = _make_gemm(B, S, KV_DIM, D, "fp8")
         g.add_kernel(wkv)
         g.add_data_edge(attn_fan, wkv, {"y2": "x"})
@@ -263,6 +266,13 @@ def _build_layers(g, B, S, context_len, prev_out):
                 g.add_data_edge(comp, comp_norm, {"y": "x"})
                 L.comp_norm = comp_norm
         else:
+            kv_sink = Nop()
+            kv_sink.inputs = {
+                "kv": Tensor("bf16", (B, S, KV_DIM))}
+            g.add_kernel(kv_sink)
+            g.add_data_edge(kv_norm, kv_sink, {"y": "kv"})
+            L.kv_sink = kv_sink
+
             compressed_len = context_len // ratio
             window_len = min(WINDOW, context_len)
 

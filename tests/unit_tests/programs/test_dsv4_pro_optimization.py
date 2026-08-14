@@ -207,6 +207,13 @@ def test_declare_decode_uses_read_only_persistent_kv(monkeypatch):
     for layer_id, layer in enumerate(layers):
         assert layer.kv_persist_barrier is barrier
         assert layer.kv_win_slice is None
+        assert layer.attn_fan is not None
+        assert layer.wkv is not None
+        assert layer.kv_norm is not None
+        assert isinstance(layer.kv_sink, Nop)
+        assert not layer.kv_sink.outputs
+        assert any(edge.src is layer.kv_norm
+                   for edge in graph._in_edges(layer.kv_sink))
         assert layer.sa.S_kv == kv_reads[layer_id].outputs["y"].shape[1]
         assert any(edge.src is layer.kv_cache_fan and edge.dst is barrier
                    for edge in graph._in_edges(barrier))
@@ -416,14 +423,27 @@ def test_cp4_dp2_ep8_pp2_decode(monkeypatch):
                 "-", 1)[0]
             for kernel in attention
         } == {f"n{layer_id}"}
-        assert sorted(
-            int(placement.get_kernel_device(kernel).device.name.rsplit(
-                "-", 1)[1])
-            for kernel in copies["dp"]["wkv"]
-        ) == [0, 4]
+        for name in (
+                "bridge", "attn_norm", "attn_fan", "wkv", "kv_norm",
+                "kv_sink"):
+            assert len(copies["dp"][name]) == 2
+            assert sorted(
+                int(placement.get_kernel_device(kernel).device.name.rsplit(
+                    "-", 1)[1])
+                for kernel in copies["dp"][name]
+            ) == [0, 4]
+        kv_norm_copies = set(copies["dp"]["kv_norm"])
+        for sink in copies["dp"]["kv_sink"]:
+            assert not graph._out_edges(sink)
+            predecessor = graph._in_edges(sink)[0].src
+            assert predecessor in kv_norm_copies
+            assert placement.get_kernel_device(predecessor).device \
+                is placement.get_kernel_device(sink).device
 
-    barriers = [kernel for kernel in graph.kernels
-                if isinstance(kernel, Nop)]
+    barriers = [
+        kernel for kernel in graph.kernels
+        if isinstance(kernel, Nop) and "decode_output" in kernel.inputs
+    ]
     assert len(barriers) == 8
     assert all(isinstance(barrier, Nop) for barrier in barriers)
     assert all(barrier not in placement.placed_kernels

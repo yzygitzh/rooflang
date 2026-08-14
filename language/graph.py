@@ -211,7 +211,8 @@ class ComputeGraph:
           - kernels: List[Kernel] of length n — the split copies.
           - next_comms: Dict[str, Kernel] — one comm kernel per output port.
             Each has n inputs ("i0".."i{n-1}") and 1 output ("y").
-            Keyed by the original kernel's output port name.
+            Keyed by the original kernel's output port name. May be empty for
+            a terminal sink kernel with no output ports.
 
         Returns (prev_comms, kernels, next_comms) — all already in the graph.
         """
@@ -222,8 +223,9 @@ class ComputeGraph:
                 f"split_class returned {len(copies)} kernels, expected {n}")
         if not prev_comms:
             raise ValueError("split_class must return non-empty prev_comms")
-        if not next_comms:
-            raise ValueError("split_class must return non-empty next_comms")
+        if not next_comms and kernel.outputs:
+            raise ValueError(
+                "split_class must return next_comms for kernel outputs")
 
         in_edges = self._in_edges(kernel)
         out_edges = self._out_edges(kernel)

@@ -8,6 +8,7 @@ import pytest
 from rooflang.language.graph import ComputeGraph
 from rooflang.language.hardware.component import Compute, Memory
 from rooflang.language.kernels.forward import Nop, Sampling
+from rooflang.language.tensor import Tensor
 from rooflang.programs.dsv4_pro import find_pareto_frontier as finder
 from rooflang.programs.dsv4_pro.find_pareto_frontier import (
     Case,
@@ -382,6 +383,8 @@ def test_gpu_activity_attributes_contention_to_its_resource(
 def test_output_path_excludes_kv_persistence_barrier():
     graph = ComputeGraph()
     producer, sampling, barrier = Nop(), Sampling(1, 1), Nop()
+    barrier.inputs = {"stage_output": Tensor("int32", (1,))}
+    barrier.outputs = {"done": Tensor("int32", (1,))}
     for kernel in (producer, sampling, barrier):
         graph.add_kernel(kernel)
     graph.add_control_edge(producer, sampling)
@@ -391,6 +394,25 @@ def test_output_path_excludes_kv_persistence_barrier():
 
     assert outputs == {sampling}
     assert output_path == {producer, sampling}
+
+
+def test_output_path_includes_terminal_kv_sink():
+    graph = ComputeGraph()
+    token_producer = Nop()
+    sampling = Sampling(1, 1)
+    kv_producer = Nop(outputs={"kv": Tensor("bf16", (1, 1, 64))})
+    kv_sink = Nop(inputs={"kv": Tensor("bf16", (1, 1, 64))})
+    for kernel in (token_producer, sampling, kv_producer, kv_sink):
+        graph.add_kernel(kernel)
+    graph.add_control_edge(token_producer, sampling)
+    graph.add_data_edge(kv_producer, kv_sink, {"kv": "kv"})
+
+    outputs, output_path = _output_path_kernels(graph)
+
+    assert outputs == {sampling, kv_sink}
+    assert output_path == {
+        token_producer, sampling, kv_producer, kv_sink,
+    }
 
 
 def _case(stage="prefill"):

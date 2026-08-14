@@ -606,19 +606,24 @@ def _shared_axis_limits(
     user_metric: str,
     gpu_metric: str,
 ) -> tuple[tuple[float, float], tuple[float, float]]:
-    """Return common zero-based limits for every subplot in one figure."""
+    """Return common positive log-scale limits for one figure's subplots."""
     points = [
         point
         for n_gpus in gpu_counts
         for hardware in hardware_names
         for point in frontiers.get((workload, hardware, n_gpus), [])
     ]
-    max_user = max((point[user_metric] for point in points), default=0.0)
-    max_gpu = max((point[gpu_metric] for point in points), default=0.0)
-    return (
-        (0.0, max_user * 1.05 if max_user else 1.0),
-        (0.0, max_gpu * 1.05 if max_gpu else 1.0),
-    )
+
+    def padded_limits(metric: str) -> tuple[float, float]:
+        values = [point[metric] for point in points if point[metric] > 0]
+        if not values:
+            return 1.0, 2.0
+        lower, upper = min(values), max(values)
+        if lower == upper:
+            return lower / 2, upper * 2
+        return lower / 1.05, upper * 1.05
+
+    return padded_limits(user_metric), padded_limits(gpu_metric)
 
 
 def write_outputs(
@@ -701,10 +706,12 @@ def write_outputs(
                                 alpha=0.85,
                             )
                 axis.set_title(f"{n_gpus} GPUs")
+                axis.set_xscale("log", base=2)
+                axis.set_yscale("log", base=2)
                 axis.set_xlim(x_limits)
                 axis.set_ylim(y_limits)
-                axis.set_xlabel(f"tokens/s/user ({timing})")
-                axis.set_ylabel(f"tokens/s/GPU ({timing})")
+                axis.set_xlabel(f"tokens/s/user ({timing}, log2)")
+                axis.set_ylabel(f"tokens/s/GPU ({timing}, log2)")
                 axis.grid(True, which="both", alpha=0.25)
             for axis in flat_axes[len(gpu_counts):]:
                 axis.axis("off")

@@ -539,6 +539,48 @@ def test_grouped_frontiers_skips_failures():
     assert list(grouped_frontiers(records)) == [("prefill-8k", "b300", 8)]
 
 
+def test_combined_plot_frontiers_merge_feasible_timing_projections():
+    record = {
+        "case_id": "one", "status": "ok", "workload": "decode-8k",
+        "hardware": "b300", "n_gpus": 8,
+        "tokens_per_s_user": 10.0, "tokens_per_s_gpu": 10.0,
+        "tokens_per_s_user_elapsed": 8.0,
+        "tokens_per_s_gpu_elapsed": 20.0,
+        "tokens_per_s_user_overlapped": 20.0,
+        "tokens_per_s_gpu_overlapped": 8.0,
+        "memory_feasible_elapsed": True,
+        "memory_feasible_overlapped": True,
+    }
+
+    frontier = finder._combined_plot_frontiers([record])[
+        ("decode-8k", "b300", 8)]
+
+    assert [point["_plot_timing"] for point in frontier] == [
+        "elapsed", "original", "overlapped"]
+    assert [point[finder._PLOT_USER_METRIC] for point in frontier] == [
+        8.0, 10.0, 20.0]
+
+
+def test_combined_plot_frontiers_exclude_infeasible_projection():
+    record = {
+        "case_id": "one", "status": "ok", "workload": "decode-8k",
+        "hardware": "b300", "n_gpus": 8,
+        "tokens_per_s_user": 10.0, "tokens_per_s_gpu": 10.0,
+        "tokens_per_s_user_elapsed": 8.0,
+        "tokens_per_s_gpu_elapsed": 20.0,
+        "tokens_per_s_user_overlapped": 20.0,
+        "tokens_per_s_gpu_overlapped": 8.0,
+        "memory_feasible_elapsed": False,
+        "memory_feasible_overlapped": True,
+    }
+
+    frontier = finder._combined_plot_frontiers([record])[
+        ("decode-8k", "b300", 8)]
+
+    assert [point["_plot_timing"] for point in frontier] == [
+        "original", "overlapped"]
+
+
 def test_read_jsonl_handles_missing_blank_valid_and_invalid(tmp_path):
     path = tmp_path / "records.jsonl"
     assert _read_jsonl(path) == []
@@ -644,8 +686,8 @@ def test_write_outputs_honors_filtered_workloads(tmp_path):
     assert (tmp_path / "pareto_frontier_elapsed.csv").is_file()
     assert (tmp_path / "pareto_frontier_overlapped.csv").is_file()
     assert (tmp_path / "pareto_decode-8k.png").is_file()
-    assert (tmp_path / "pareto_decode-8k_elapsed.png").is_file()
-    assert (tmp_path / "pareto_decode-8k_overlapped.png").is_file()
+    assert not (tmp_path / "pareto_decode-8k_elapsed.png").exists()
+    assert not (tmp_path / "pareto_decode-8k_overlapped.png").exists()
     assert not (tmp_path / "pareto_prefill-8k.png").exists()
 
 
@@ -672,7 +714,7 @@ def test_write_outputs_point_labels_are_opt_in(tmp_path, monkeypatch):
     assert not labels
 
     write_outputs(tmp_path, [record], point_labels=True)
-    assert labels == ["one"] * len(finder.THROUGHPUT_METRICS)
+    assert labels == ["one"]
 
 
 def test_write_outputs_shows_plain_ticks_on_every_subplot(
@@ -709,7 +751,7 @@ def test_write_outputs_shows_plain_ticks_on_every_subplot(
 
     write_outputs(tmp_path, records)
 
-    assert len(figures) == len(finder.THROUGHPUT_METRICS)
+    assert len(figures) == 1
     for figure, axes in figures:
         figure.canvas.draw()
         for axis in list(axes.flat)[:3]:

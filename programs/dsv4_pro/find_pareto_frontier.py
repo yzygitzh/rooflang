@@ -27,6 +27,10 @@ keep their simulated peak usage.
 Each simulation is an independent process.  Results are appended to JSONL as
 they finish, so an interrupted search can resume without repeating completed
 cases.
+
+CSV files retain separate original, elapsed, and ideal-overlap frontiers.  A
+plot combines the feasible points from all three timing/memory projections and
+finds one frontier over the combined candidates.
 """
 
 from __future__ import annotations
@@ -82,6 +86,8 @@ MEMORY_FEASIBILITY_FIELDS = {
     "elapsed": "memory_feasible_elapsed",
     "overlapped": "memory_feasible_overlapped",
 }
+_PLOT_USER_METRIC = "_plot_tokens_per_s_user"
+_PLOT_GPU_METRIC = "_plot_tokens_per_s_gpu"
 
 
 @dataclass(frozen=True)
@@ -581,6 +587,33 @@ def grouped_frontiers(
     }
 
 
+def _combined_plot_frontiers(
+    records: Sequence[dict],
+) -> dict[tuple, list[dict]]:
+    """Merge all feasible timing/memory projections before Pareto filtering."""
+    groups = {}
+    for timing, (user_metric, gpu_metric) in THROUGHPUT_METRICS.items():
+        memory_feasible_field = MEMORY_FEASIBILITY_FIELDS[timing]
+        for record in records:
+            if record.get("status") != "ok":
+                continue
+            if (memory_feasible_field is not None
+                    and not record.get(memory_feasible_field, False)):
+                continue
+            point = dict(record)
+            point[_PLOT_USER_METRIC] = record[user_metric]
+            point[_PLOT_GPU_METRIC] = record[gpu_metric]
+            point["_plot_timing"] = timing
+            key = (
+                record["workload"], record["hardware"], record["n_gpus"])
+            groups.setdefault(key, []).append(point)
+    return {
+        key: pareto_frontier(
+            group, _PLOT_USER_METRIC, _PLOT_GPU_METRIC)
+        for key, group in groups.items()
+    }
+
+
 def _read_jsonl(path: Path) -> list[dict]:
     if not path.exists():
         return []
@@ -668,15 +701,13 @@ def write_outputs(
     records: Sequence[dict],
     point_labels: bool = False,
 ) -> None:
-    """Write all points plus original, elapsed, and overlapped frontiers."""
+    """Write timing-specific CSVs and combined-projection frontier plots."""
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_csv(output_dir / "all_points.csv", records)
-    frontiers_by_timing = {}
     for timing, (user_metric, gpu_metric) in THROUGHPUT_METRICS.items():
         frontiers = grouped_frontiers(
             records, user_metric, gpu_metric,
             MEMORY_FEASIBILITY_FIELDS[timing])
-        frontiers_by_timing[timing] = frontiers
         frontier_records = [
             point for group in frontiers.values() for point in group
         ]
@@ -685,6 +716,11 @@ def write_outputs(
             output_dir / f"pareto_frontier{suffix}.csv",
             frontier_records,
         )
+
+    for workload in WORKLOADS:
+        for timing in ("elapsed", "overlapped"):
+            (output_dir / f"pareto_{workload}_{timing}.png").unlink(
+                missing_ok=True)
 
     if not records:
         return
@@ -708,71 +744,67 @@ def write_outputs(
     ]
     rows = 1 if len(gpu_counts) <= 2 else 2
     columns = math.ceil(len(gpu_counts) / rows)
-    for timing, (user_metric, gpu_metric) in THROUGHPUT_METRICS.items():
-        frontiers = frontiers_by_timing[timing]
-        suffix = "" if timing == "original" else f"_{timing}"
-        for workload in workloads:
-            x_limits, y_limits = _shared_axis_limits(
-                frontiers, workload, gpu_counts, hardware_names,
-                user_metric, gpu_metric)
-            figure, axes = plt.subplots(
-                rows, columns, figsize=(6 * columns, 5 * rows), squeeze=False,
-                sharex=True, sharey=True)
-            flat_axes = list(axes.flat)
-            for axis, n_gpus in zip(flat_axes, gpu_counts):
-                for hardware in hardware_names:
-                    points = frontiers.get((workload, hardware, n_gpus), [])
-                    if not points:
-                        continue
-                    user_values = [point[user_metric] for point in points]
-                    gpu_values = [point[gpu_metric] for point in points]
-                    axis.plot(
-                        user_values,
-                        gpu_values,
-                        marker="o",
-                        label=hardware,
-                    )
-                    if point_labels:
-                        for point, user_value, gpu_value in zip(
-                                points, user_values, gpu_values):
-                            axis.annotate(
-                                _point_label(point),
-                                (user_value, gpu_value),
-                                xytext=(3, 3),
-                                textcoords="offset points",
-                                fontsize=6,
-                                alpha=0.85,
-                            )
-                axis.set_title(f"{n_gpus} GPUs")
-                axis.set_xscale("log", base=2)
-                axis.set_yscale("log", base=2)
-                axis.xaxis.set_major_formatter(
-                    FuncFormatter(_plain_tick_label))
-                axis.yaxis.set_major_formatter(
-                    FuncFormatter(_plain_tick_label))
-                axis.set_xlim(x_limits)
-                axis.set_ylim(y_limits)
-                axis.tick_params(
-                    axis="both", which="both",
-                    labelbottom=True, labelleft=True)
-                axis.set_xlabel(f"tokens/s/user ({timing}, log2)")
-                axis.set_ylabel(f"tokens/s/GPU ({timing}, log2)")
-                axis.grid(True, which="both", alpha=0.25)
-            for axis in flat_axes[len(gpu_counts):]:
-                axis.axis("off")
-            handles, labels = [], []
-            for axis in flat_axes[:len(gpu_counts)]:
-                handles, labels = axis.get_legend_handles_labels()
-                if handles:
-                    break
+    frontiers = _combined_plot_frontiers(records)
+    for workload in workloads:
+        x_limits, y_limits = _shared_axis_limits(
+            frontiers, workload, gpu_counts, hardware_names,
+            _PLOT_USER_METRIC, _PLOT_GPU_METRIC)
+        figure, axes = plt.subplots(
+            rows, columns, figsize=(6 * columns, 5 * rows), squeeze=False,
+            sharex=True, sharey=True)
+        flat_axes = list(axes.flat)
+        for axis, n_gpus in zip(flat_axes, gpu_counts):
+            for hardware in hardware_names:
+                points = frontiers.get((workload, hardware, n_gpus), [])
+                if not points:
+                    continue
+                user_values = [
+                    point[_PLOT_USER_METRIC] for point in points]
+                gpu_values = [
+                    point[_PLOT_GPU_METRIC] for point in points]
+                axis.plot(
+                    user_values,
+                    gpu_values,
+                    marker="o",
+                    label=hardware,
+                )
+                if point_labels:
+                    for point, user_value, gpu_value in zip(
+                            points, user_values, gpu_values):
+                        axis.annotate(
+                            _point_label(point),
+                            (user_value, gpu_value),
+                            xytext=(3, 3),
+                            textcoords="offset points",
+                            fontsize=6,
+                            alpha=0.85,
+                        )
+            axis.set_title(f"{n_gpus} GPUs")
+            axis.set_xscale("log", base=2)
+            axis.set_yscale("log", base=2)
+            axis.xaxis.set_major_formatter(FuncFormatter(_plain_tick_label))
+            axis.yaxis.set_major_formatter(FuncFormatter(_plain_tick_label))
+            axis.set_xlim(x_limits)
+            axis.set_ylim(y_limits)
+            axis.tick_params(
+                axis="both", which="both", labelbottom=True, labelleft=True)
+            axis.set_xlabel("tokens/s/user (combined, log2)")
+            axis.set_ylabel("tokens/s/GPU (combined, log2)")
+            axis.grid(True, which="both", alpha=0.25)
+        for axis in flat_axes[len(gpu_counts):]:
+            axis.axis("off")
+        handles, labels = [], []
+        for axis in flat_axes[:len(gpu_counts)]:
+            handles, labels = axis.get_legend_handles_labels()
             if handles:
-                figure.legend(handles, labels, loc="lower right")
-            figure.suptitle(
-                f"DSV4 Pro Pareto Frontier ({timing}): {workload}")
-            figure.tight_layout(rect=(0, 0.04, 1, 0.96))
-            figure.savefig(
-                output_dir / f"pareto_{workload}{suffix}.png", dpi=160)
-            plt.close(figure)
+                break
+        if handles:
+            figure.legend(handles, labels, loc="lower right")
+        figure.suptitle(
+            f"DSV4 Pro Pareto Frontier (combined): {workload}")
+        figure.tight_layout(rect=(0, 0.04, 1, 0.96))
+        figure.savefig(output_dir / f"pareto_{workload}.png", dpi=160)
+        plt.close(figure)
 
 
 def _run_parallel(

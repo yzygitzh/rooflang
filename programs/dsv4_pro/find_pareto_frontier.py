@@ -68,6 +68,10 @@ from rooflang.runtime.simulator import OOMError, Simulator
 WORKLOADS = {
     "prefill-8k": ("prefill", 8192),
     "decode-8k": ("decode", 8192),
+    "prefill-64k": ("prefill", 65536),
+    "decode-64k": ("decode", 65536),
+    "prefill-256k": ("prefill", 262144),
+    "decode-256k": ("decode", 262144),
     "prefill-1m": ("prefill", 1048576),
     "decode-1m": ("decode", 1048576),
 }

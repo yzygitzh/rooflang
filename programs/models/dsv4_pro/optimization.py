@@ -14,7 +14,7 @@ from rooflang.language.optimization.split import (
 )
 from rooflang.language.placement import Placement
 
-from rooflang.programs.dsv4_pro.config import (
+from rooflang.programs.models.dsv4_pro.config import (
     COMPRESS_RATIOS, N_EXPERTS, TOPK, WINDOW,
 )
 

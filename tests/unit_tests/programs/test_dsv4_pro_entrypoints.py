@@ -4,19 +4,27 @@ from types import SimpleNamespace
 
 import pytest
 
-import rooflang.programs.dsv4_pro as dsv4_pro
+import rooflang.programs.models.dsv4_pro as dsv4_pro
 from rooflang.language.graph import ComputeGraph
 from rooflang.language.hardware.component import Compute
 from rooflang.language.kernels.forward import Nop
 from rooflang.language.kernels.identity import Spawn
-from rooflang.programs.dsv4_pro import main as main_module
-from rooflang.programs.dsv4_pro import simulation, visualization
+from rooflang.programs.experiments import main as main_module
+from rooflang.programs.experiments import simulation, visualization
+from rooflang.programs.models import MODEL_NAMES, load_model
 
 
 def test_package_lazy_visualization_attribute():
     assert dsv4_pro.visualize_layer is visualization.visualize_layer
     with pytest.raises(AttributeError, match="has no attribute 'missing'"):
         dsv4_pro.__getattr__("missing")
+
+
+def test_model_loader_exposes_registered_models():
+    assert MODEL_NAMES == ("dsv4_pro",)
+    assert load_model("dsv4_pro") is dsv4_pro
+    with pytest.raises(ValueError, match="Unknown model"):
+        load_model("missing")
 
 
 def test_simulate_runs_and_exports(monkeypatch):
@@ -133,22 +141,24 @@ def test_main_covers_cluster_prefill_decode_and_superchip(monkeypatch,
             declared.kv, declared.output,
         )
 
-    monkeypatch.setattr(main_module, "declare_model", declare_model)
     calls = []
-    monkeypatch.setattr(
-        main_module, "optimize_model_cluster_prefill",
-        lambda *args, **kwargs: calls.append(("prefill", args, kwargs))
+    selected_models = []
+    fake_model = SimpleNamespace(
+        N_LAYERS=61,
+        declare_model=declare_model,
+        optimize_model_cluster_prefill=lambda *args, **kwargs:
+        calls.append(("prefill", args, kwargs))
         or ("prefill_graph", "prefill_placement"),
-    )
-    monkeypatch.setattr(
-        main_module, "optimize_model_cluster_decode",
-        lambda *args, **kwargs: calls.append(("decode", args, kwargs))
+        optimize_model_cluster_decode=lambda *args, **kwargs:
+        calls.append(("decode", args, kwargs))
         or ("decode_graph", "decode_placement"),
+        optimize_model_superchip=lambda *args:
+        calls.append(("superchip", args, {}))
+        or ("super_graph", "super_placement"),
     )
     monkeypatch.setattr(
-        main_module, "optimize_model_superchip",
-        lambda *args: calls.append(("superchip", args, {}))
-        or ("super_graph", "super_placement"),
+        main_module, "load_model",
+        lambda name: selected_models.append(name) or fake_model,
     )
     visualizations = []
     monkeypatch.setattr(
@@ -189,6 +199,7 @@ def test_main_covers_cluster_prefill_decode_and_superchip(monkeypatch,
     assert "batch_size" not in declarations[1]
     assert declarations[1]["decode"] is True
     assert [call[0] for call in calls] == ["prefill", "decode", "superchip"]
+    assert selected_models == ["dsv4_pro"] * 3
     assert visualizations == [
         (("graph", "layer"), {"extra_seeds": {"emb", "read", "kv"}})
     ]
@@ -205,14 +216,13 @@ def test_main_visualization_without_a_layer_is_a_noop(monkeypatch):
     monkeypatch.setattr(main_module, "HARDWARE_MAP", {
         "Cluster": lambda: cluster,
     })
-    monkeypatch.setattr(
-        main_module, "declare_model",
-        lambda **kwargs: ("graph", [], None, None, [], "output"),
-    )
-    monkeypatch.setattr(
-        main_module, "optimize_model_cluster_prefill",
-        lambda *args, **kwargs: ("graph", "placement"),
-    )
+    monkeypatch.setattr(main_module, "load_model", lambda name: SimpleNamespace(
+        N_LAYERS=61,
+        declare_model=lambda **kwargs:
+        ("graph", [], None, None, [], "output"),
+        optimize_model_cluster_prefill=lambda *args, **kwargs:
+        ("graph", "placement"),
+    ))
     monkeypatch.setattr(
         main_module, "simulate",
         lambda *args, **kwargs: SimpleNamespace(

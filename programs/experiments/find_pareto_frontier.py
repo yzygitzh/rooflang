@@ -49,14 +49,7 @@ from typing import Iterable, Iterator, Sequence
 
 from rooflang.language.hardware.component import Compute, Memory
 from rooflang.language.kernels.forward import Nop, Sampling
-from rooflang.programs.dsv4_pro.config import (
-    COMPRESS_RATIOS, N_EXPERTS, N_LAYERS, WINDOW,
-)
-from rooflang.programs.dsv4_pro.model import declare_model
-from rooflang.programs.dsv4_pro.optimization import (
-    optimize_model_cluster_decode,
-    optimize_model_cluster_prefill,
-)
+from rooflang.programs.models import MODEL_NAMES, load_model
 from rooflang.programs.presets.ascend950dt import Ascend950DTCluster
 from rooflang.programs.presets.b300 import B300Cluster
 from rooflang.programs.presets.gb300 import GB300Cluster
@@ -64,6 +57,26 @@ from rooflang.programs.presets.gh200 import GH200Cluster
 from rooflang.programs.presets.h200 import H200Cluster
 from rooflang.runtime.simulator import OOMError, Simulator
 
+
+_MODEL_NAME = None
+
+
+def _select_model(name):
+    """Load the model API used by this process."""
+    global _MODEL_NAME
+    global COMPRESS_RATIOS, N_EXPERTS, N_LAYERS, WINDOW
+    global declare_model
+    global optimize_model_cluster_decode, optimize_model_cluster_prefill
+
+    model = load_model(name)
+    _MODEL_NAME = name
+    COMPRESS_RATIOS = model.COMPRESS_RATIOS
+    N_EXPERTS = model.N_EXPERTS
+    N_LAYERS = model.N_LAYERS
+    WINDOW = model.WINDOW
+    declare_model = model.declare_model
+    optimize_model_cluster_decode = model.optimize_model_cluster_decode
+    optimize_model_cluster_prefill = model.optimize_model_cluster_prefill
 
 WORKLOADS = {
     "prefill-8k": ("prefill", 8192),
@@ -823,6 +836,7 @@ def _run_parallel(
     context = multiprocessing.get_context("spawn")
     with raw_path.open("a", encoding="utf-8") as output, ProcessPoolExecutor(
         max_workers=workers, mp_context=context,
+        initializer=_select_model, initargs=(_MODEL_NAME,),
     ) as executor:
         futures = {}
 
@@ -867,6 +881,10 @@ def _run_parallel(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--model", choices=MODEL_NAMES, default="dsv4_pro",
+        help="Model implementation (default: dsv4_pro)",
+    )
     parser.add_argument(
         "--output-dir", type=Path, default=Path("dsv4_pro_pareto"),
         help="Result directory (default: dsv4_pro_pareto)",
@@ -928,6 +946,7 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    _select_model(args.model)
     if args.workers <= 0:
         raise ValueError("--workers must be positive")
     if args.batch_multipliers is not None and any(

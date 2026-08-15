@@ -1,19 +1,12 @@
-"""DeepSeek V4 Pro inference — Main entry point."""
+"""Model inference simulation entry point."""
 
 import argparse
 
 from rooflang.language.hardware.component import Compute
+from rooflang.programs.models import MODEL_NAMES, load_model
 from rooflang.programs.presets.b300 import B300Cluster, B300SuperChip
 from rooflang.programs.presets.h200 import H200Cluster, H200SuperChip
-
-from rooflang.programs.dsv4_pro.config import N_LAYERS
-from rooflang.programs.dsv4_pro.model import declare_model
-from rooflang.programs.dsv4_pro.optimization import (
-    optimize_model_cluster_decode,
-    optimize_model_cluster_prefill,
-    optimize_model_superchip,
-)
-from rooflang.programs.dsv4_pro.simulation import simulate
+from rooflang.programs.experiments.simulation import simulate
 
 
 HARDWARE_MAP = {
@@ -25,7 +18,9 @@ HARDWARE_MAP = {
 
 
 def main():
-    parser = argparse.ArgumentParser(description="DSV4 Pro inference simulation")
+    parser = argparse.ArgumentParser(description="Model inference simulation")
+    parser.add_argument("--model", choices=MODEL_NAMES, default="dsv4_pro",
+                        help="Model implementation (default: dsv4_pro)")
     parser.add_argument("--hardware", required=True,
                         choices=list(HARDWARE_MAP.keys()),
                         help="Hardware configuration")
@@ -41,7 +36,7 @@ def main():
     parser.add_argument("--ep", type=int, default=8,
                         help="Expert-parallel degree (default: 8)")
     parser.add_argument(
-        "--pp-partition", type=int, nargs="+", default=[N_LAYERS],
+        "--pp-partition", type=int, nargs="+",
         help="Layer counts assigned to successive pipeline stages")
     parser.add_argument(
         "--measurement_start", choices=("read_input", "none"),
@@ -52,6 +47,7 @@ def main():
                         help="Export layer graph visualization")
     args = parser.parse_args()
 
+    model = load_model(args.model)
     is_prefill = args.stage == "prefill"
     hw = HARDWARE_MAP[args.hardware]()
 
@@ -62,11 +58,11 @@ def main():
     if args.batch_size is not None:
         decl_kwargs["batch_size"] = args.batch_size
     g, layers, emb, read_input, kv_cache_reads, output_head = \
-        declare_model(**decl_kwargs)
+        model.declare_model(**decl_kwargs)
 
     # B. Visualization
     if args.visualization:
-        from rooflang.programs.dsv4_pro.visualization import visualize_layer
+        from rooflang.programs.experiments.visualization import visualize_layer
 
         viz_layer = None
         seeds = {emb, read_input}
@@ -80,27 +76,27 @@ def main():
 
     # C. Optimization
     if isinstance(hw, (B300SuperChip, H200SuperChip)):
-        g, p = optimize_model_superchip(g, hw)
+        g, p = model.optimize_model_superchip(g, hw)
     else:
         n_gpus = sum(
             isinstance(component, Compute) and component.kind == "gpu"
             for component in hw.nodes)
         optimize_kwargs = dict(
             cp=args.cp, dp=args.dp, ep=args.ep,
-            pp_partition=args.pp_partition,
+            pp_partition=args.pp_partition or [model.N_LAYERS],
             n_gpus=n_gpus)
         if is_prefill:
-            g, p = optimize_model_cluster_prefill(
+            g, p = model.optimize_model_cluster_prefill(
                 g, layers, hw, emb, read_input, output_head,
                 **optimize_kwargs)
         else:
-            g, p = optimize_model_cluster_decode(
+            g, p = model.optimize_model_cluster_decode(
                 g, layers, hw, emb, read_input, kv_cache_reads,
                 output_head, seq_prefill=decl_kwargs["seq_prefill"],
                 **optimize_kwargs)
 
     # D. Simulation
-    trace_name = f"dsv4_pro_{args.stage}_{args.hardware}.json"
+    trace_name = f"{args.model}_{args.stage}_{args.hardware}.json"
     measurement_start = (
         read_input if args.measurement_start == "read_input" else None)
     result = simulate(

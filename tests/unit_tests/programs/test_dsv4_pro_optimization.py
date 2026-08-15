@@ -11,9 +11,9 @@ from rooflang.language.kernels.comm import Broadcast, ReduceScatter
 from rooflang.language.kernels.forward import Nop, ReadInput, Slice, SparseAttn
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.tensor import Tensor
-from rooflang.programs.dsv4_pro import optimization
-from rooflang.programs.dsv4_pro import model
-from rooflang.programs.dsv4_pro.optimization import (
+from rooflang.programs.models.dsv4_pro import optimization
+from rooflang.programs.models.dsv4_pro import model
+from rooflang.programs.models.dsv4_pro.optimization import (
     optimize_model_cluster_decode,
     optimize_model_cluster_prefill,
 )

@@ -9,8 +9,8 @@ from rooflang.language.graph import ComputeGraph
 from rooflang.language.hardware.component import Compute, Memory
 from rooflang.language.kernels.forward import Nop, Sampling
 from rooflang.language.tensor import Tensor
-from rooflang.programs.dsv4_pro import find_pareto_frontier as finder
-from rooflang.programs.dsv4_pro.find_pareto_frontier import (
+from rooflang.programs.experiments import find_pareto_frontier as finder
+from rooflang.programs.experiments.find_pareto_frontier import (
     Case,
     ParallelConfig,
     _gpu_timing_metrics,
@@ -34,9 +34,15 @@ from rooflang.programs.dsv4_pro.find_pareto_frontier import (
 from rooflang.runtime.simulator import OOMError
 
 
+@pytest.fixture(autouse=True)
+def select_dsv4_pro_model():
+    finder._select_model("dsv4_pro")
+
+
 def test_default_worker_count_is_eight():
     args = _parser().parse_args([])
 
+    assert args.model == "dsv4_pro"
     assert args.workers == 8
     assert not args.point_labels
     assert _parser().parse_args(["--point-labels"]).point_labels

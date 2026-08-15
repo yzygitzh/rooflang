@@ -17,7 +17,7 @@ from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.tensor import Tensor
 from rooflang.language.utils import gemm_scale_bytes
 
-from rooflang.programs.dsv4_pro.config import (
+from rooflang.programs.models.dsv4_pro.config import (
     BATCH, COMPRESS_RATIOS, D, H, HD, INDEX_TOPK, KV_DIM,
     MOE_INTER, N_EXPERTS, N_LAYERS, O_GROUPS, O_LORA,
     Q_LORA, S_PREFILL, TOPK, V, WINDOW,

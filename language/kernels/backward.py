@@ -290,7 +290,8 @@ class RoPE(Kernel):
 class Attn(Kernel):
     """Flash-Attention v2 backward (recompute S from saved LSE).
 
-    flops = 10·B·H·S_q·S_kv·Hd (×0.5 if causal and S_q==S_kv).
+    flops = 10·B·H·S_q·S_kv·Hd (×0.5 for a triangular causal
+    matrix).
     bytes (per-tensor read-once / write-once; strict lower bound):
         input_bytes  = (2·B·H·S_q·Hd + 2·B·H_kv·S_kv·Hd) · sizeof(dtype)
         output_bytes = (B·H·S_q·Hd + 2·B·H_kv·S_kv·Hd) · sizeof(dtype)
@@ -298,16 +299,19 @@ class Attn(Kernel):
 
     def __init__(self, B: int, H: int, H_kv: int,
                  S_q: int, S_kv: int, Hd: int,
-                 dtype: str = "bf16", causal: bool = False):
+                 dtype: str = "bf16", causal: bool = False,
+                 triangular: bool | None = None):
         self.B, self.H, self.H_kv = B, H, H_kv
         self.S_q, self.S_kv, self.Hd = S_q, S_kv, Hd
         self.dtype_, self.causal = dtype, causal
+        self.triangular = (causal and S_q == S_kv
+                           if triangular is None else triangular)
         super().__init__()
 
     @property
     def flops(self) -> float:
         f = 10.0 * self.B * self.H * self.S_q * self.S_kv * self.Hd
-        if self.causal and self.S_q == self.S_kv:
+        if self.triangular:
             f *= 0.5
         return f
 
@@ -329,31 +333,95 @@ class Attn(Kernel):
 
 
 class SparseAttn(Kernel):
-    """Sparse-attention backward (FA-v2 structure with k_sel keys).
+    """Sparse-attention backward with an optional fused indexer backward.
 
-    flops = 10·B·H·S_q·k_sel·Hd.
+    flops = 10·B·H·S_q·effective_k_sel·Hd.  During causal prefill,
+    only the context-dependent ``causal_k_sel`` portion receives the 0.5
+    triangular factor.  The indexer backward recomputes its score matrix
+    instead of materializing it: score recompute + dQ + dK costs 6 FLOPs per
+    index-head dot-product element, while the ReLU, head-weight, and reduction
+    backward costs 5 scalar FLOPs.  Both receive the causal factor during
+    prefill.
     bytes (per-tensor read-once / write-once):
-        input_bytes  = (2·B·H·S_q·Hd + 2·B·H_kv·S_q·k_sel·Hd) · sizeof(dtype)
-        output_bytes = (B·H·S_q·Hd + 2·B·H_kv·S_q·k_sel·Hd) · sizeof(dtype)
+        input_bytes  = (2·B·H·S_q·Hd
+                        + kv_factor·B·H_kv·S_q·effective_k_sel·Hd)
+                       · sizeof(dtype)
+        output_bytes = (B·H·S_q·Hd
+                        + kv_factor·B·H_kv·S_q·effective_k_sel·Hd)
+                       · sizeof(dtype)
+    Indexer bytes additionally read quantized index Q/KV, head weights, and
+    the upstream reduced-score gradient, then write dQ, dKV, and dWeights at
+    the activation dtype.
     """
 
     def __init__(self, B: int, H: int, H_kv: int,
                  S_q: int, k_sel: int, Hd: int,
-                 dtype: str = "bf16"):
+                 dtype: str = "bf16", kv_factor: int = 2,
+                 indexer_s_kv: int = 0, indexer_h: int = 0,
+                 indexer_hd: int = 0, indexer_dtype: str = "fp4",
+                 *, causal: bool = False, causal_k_sel: int = 0):
         self.B, self.H, self.H_kv = B, H, H_kv
         self.S_q, self.k_sel, self.Hd = S_q, k_sel, Hd
         self.dtype_ = dtype
+        self.kv_factor = kv_factor
+        self.indexer_s_kv = indexer_s_kv
+        self.indexer_h = indexer_h
+        self.indexer_hd = indexer_hd
+        self.indexer_dtype = indexer_dtype
+        self.causal = causal
+        self.causal_k_sel = causal_k_sel
         super().__init__()
 
     @property
+    def effective_k_sel(self) -> float:
+        if self.causal:
+            return self.k_sel - 0.5 * self.causal_k_sel
+        return self.k_sel
+
+    @property
     def flops(self) -> float:
-        return 10.0 * self.B * self.H * self.S_q * self.k_sel * self.Hd
+        main_attention = (10.0 * self.B * self.H * self.S_q
+                          * self.effective_k_sel * self.Hd)
+        return main_attention + self.indexer_flops
+
+    @property
+    def indexer_flops(self) -> float:
+        factor = 0.5 if self.causal else 1.0
+        score_backward = (6.0 * self.B * self.S_q * self.indexer_h
+                          * self.indexer_s_kv * self.indexer_hd)
+        reduce_backward = (5.0 * self.B * self.S_q * self.indexer_h
+                           * self.indexer_s_kv)
+        return (score_backward + reduce_backward) * factor
+
+    @property
+    def indexer_input_bytes(self) -> float:
+        index_values = (
+            self.B * self.S_q * self.indexer_h * self.indexer_hd
+            + self.B * self.indexer_s_kv * self.indexer_hd
+        ) * dtype_bytes(self.indexer_dtype)
+        weights_and_grad = (
+            self.B * self.S_q * self.indexer_h
+            + self.B * self.S_q * self.indexer_s_kv
+        ) * dtype_bytes(self.dtype_)
+        return index_values + weights_and_grad
+
+    @property
+    def indexer_output_bytes(self) -> float:
+        return (
+            self.B * self.S_q * self.indexer_h * self.indexer_hd
+            + self.B * self.indexer_s_kv * self.indexer_hd
+            + self.B * self.S_q * self.indexer_h
+        ) * dtype_bytes(self.dtype_)
 
     @property
     def input_bytes(self) -> float:
         b = dtype_bytes(self.dtype_)
-        return (2 * self.B * self.H * self.S_q * self.Hd
-                + 2 * self.B * self.H_kv * self.S_q * self.k_sel * self.Hd) * b
+        main_attention = (
+            2 * self.B * self.H * self.S_q * self.Hd
+            + self.kv_factor * self.B * self.H_kv * self.S_q
+            * self.effective_k_sel * self.Hd
+        ) * b
+        return main_attention + self.indexer_input_bytes
 
     @property
     def weight_bytes(self) -> float:
@@ -362,8 +430,12 @@ class SparseAttn(Kernel):
     @property
     def output_bytes(self) -> float:
         b = dtype_bytes(self.dtype_)
-        return (self.B * self.H * self.S_q * self.Hd
-                + 2 * self.B * self.H_kv * self.S_q * self.k_sel * self.Hd) * b
+        main_attention = (
+            self.B * self.H * self.S_q * self.Hd
+            + self.kv_factor * self.B * self.H_kv * self.S_q
+            * self.effective_k_sel * self.Hd
+        ) * b
+        return main_attention + self.indexer_output_bytes
 
 
 class TokenDispatch(Kernel):

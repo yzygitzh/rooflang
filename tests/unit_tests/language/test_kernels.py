@@ -408,6 +408,16 @@ class TestBwdAttn(TestKernelBase):
                           causal=True)
         assert k.flops == self.expected_flops * 0.5
 
+    def test_flops_causal_asymmetric_not_halved(self):
+        k = backward.Attn(B=2, H=8, H_kv=8, S_q=128, S_kv=256, Hd=64,
+                          causal=True)
+        assert k.flops == 10.0 * 2 * 8 * 128 * 256 * 64
+
+    def test_explicit_triangular_factor_survives_asymmetric_shard(self):
+        k = backward.Attn(B=2, H=8, H_kv=8, S_q=128, S_kv=256, Hd=64,
+                          causal=True, triangular=True)
+        assert k.flops == 10.0 * 2 * 8 * 128 * 256 * 64 * 0.5
+
 
 class TestBwdSparseAttn(TestKernelBase):
     __test__ = True
@@ -416,6 +426,63 @@ class TestBwdSparseAttn(TestKernelBase):
     expected_input_bytes = (2 * 2 * 8 * 256 * 64 + 2 * 2 * 8 * 256 * 64 * 64) * 2.0
     expected_weight_bytes = 0.0
     expected_output_bytes = (2 * 8 * 256 * 64 + 2 * 2 * 8 * 256 * 64 * 64) * 2.0
+
+    def test_causal_only_halves_context_dependent_sparse_work(self):
+        k = backward.SparseAttn(
+            B=2, H=8, H_kv=1, S_q=256, k_sel=64, Hd=64,
+            kv_factor=1, causal=True, causal_k_sel=32)
+        effective_k_sel = 48
+        assert k.effective_k_sel == effective_k_sel
+        assert k.flops == 10.0 * 2 * 8 * 256 * effective_k_sel * 64
+        assert k.input_bytes == (
+            2 * 2 * 8 * 256 * 64
+            + 1 * 2 * 1 * 256 * effective_k_sel * 64) * 2.0
+        assert k.output_bytes == (
+            2 * 8 * 256 * 64
+            + 1 * 2 * 1 * 256 * effective_k_sel * 64) * 2.0
+
+    def test_causal_fixed_topk_is_not_halved(self):
+        k = backward.SparseAttn(
+            B=2, H=8, H_kv=1, S_q=256, k_sel=64, Hd=64,
+            kv_factor=1, causal=True)
+        assert k.effective_k_sel == 64
+        assert k.flops == 10.0 * 2 * 8 * 256 * 64 * 64
+
+    def test_fused_indexer_backward_flops_and_bytes(self):
+        k = backward.SparseAttn(
+            B=2, H=8, H_kv=1, S_q=4, k_sel=6, Hd=8,
+            kv_factor=1, indexer_s_kv=10, indexer_h=3, indexer_hd=4,
+            indexer_dtype="fp4", causal=True, causal_k_sel=2)
+
+        main_flops = 10.0 * 2 * 8 * 4 * 5 * 8
+        score_backward = 6.0 * 2 * 4 * 3 * 10 * 4 * 0.5
+        reduce_backward = 5.0 * 2 * 4 * 3 * 10 * 0.5
+        assert k.indexer_flops == score_backward + reduce_backward
+        assert k.flops == main_flops + score_backward + reduce_backward
+
+        indexer_input_bytes = (
+            (2 * 4 * 3 * 4 + 2 * 10 * 4) * 0.5
+            + (2 * 4 * 3 + 2 * 4 * 10) * 2.0
+        )
+        indexer_output_bytes = (
+            2 * 4 * 3 * 4 + 2 * 10 * 4 + 2 * 4 * 3
+        ) * 2.0
+        assert k.indexer_input_bytes == indexer_input_bytes
+        assert k.indexer_output_bytes == indexer_output_bytes
+        assert k.input_bytes == (
+            (2 * 2 * 8 * 4 * 8 + 1 * 2 * 1 * 4 * 5 * 8) * 2.0
+            + indexer_input_bytes)
+        assert k.output_bytes == (
+            (2 * 8 * 4 * 8 + 1 * 2 * 1 * 4 * 5 * 8) * 2.0
+            + indexer_output_bytes)
+
+    def test_decode_indexer_backward_is_not_causal_halved(self):
+        kwargs = dict(
+            B=2, H=8, H_kv=1, S_q=1, k_sel=6, Hd=8,
+            indexer_s_kv=10, indexer_h=3, indexer_hd=4)
+        prefill = backward.SparseAttn(**kwargs, causal=True)
+        decode = backward.SparseAttn(**kwargs, causal=False)
+        assert decode.indexer_flops == 2 * prefill.indexer_flops
 
 
 class TestBwdElementwiseOpAdd(TestKernelBase):

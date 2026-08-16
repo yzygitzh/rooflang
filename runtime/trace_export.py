@@ -29,6 +29,20 @@ def _trace_shape(tensor) -> list:
     ]
 
 
+def _compute_profile(kernel, device):
+    """Return trace dtype label and effective peak for one kernel."""
+    flops_by_dtype = kernel.flops_by_dtype
+    if flops_by_dtype is None:
+        dtype = Simulator._infer_dtype(kernel)
+        return dtype, device.tflops.get(dtype, 0.0), {dtype: kernel.flops}
+
+    dtype = "+".join(flops_by_dtype)
+    compute_time_us = Simulator.compute_time_us(kernel, device)
+    effective_peak = (kernel.flops / (compute_time_us * 1e6)
+                      if compute_time_us > 0 else 0.0)
+    return dtype, effective_peak, flops_by_dtype
+
+
 def export_trace(result: SimulationResult, path: str) -> None:
     """Write simulation trace as Google Trace Event Format JSON."""
     events: List[Dict[str, Any]] = []
@@ -45,8 +59,8 @@ def export_trace(result: SimulationResult, path: str) -> None:
         dur_us = entry.end_us - entry.start_us
         dur_s = dur_us / 1e6 if dur_us > 0 else 0.0
         kernel = entry.kernel
-        dtype = Simulator._infer_dtype(kernel)
-        peak_tflops = entry.device.tflops.get(dtype, 0.0)
+        dtype, peak_tflops, flops_by_dtype = _compute_profile(
+            kernel, entry.device)
         peak_flops = peak_tflops * 1e12
         mfu = kernel.flops / (peak_flops * dur_s) if peak_flops > 0 and dur_s > 0 else 0.0
         top_dtype = _peak_dtype(entry.device)
@@ -72,6 +86,7 @@ def export_trace(result: SimulationResult, path: str) -> None:
                 "dtype": dtype,
                 "peak_tflops": peak_tflops,
                 "flops": kernel.flops,
+                "flops_by_dtype": flops_by_dtype,
                 "input_bytes": kernel.input_bytes,
                 "weight_bytes": kernel.loaded_weight_bytes,
                 "resident_weight_bytes": kernel.weight_bytes,
@@ -116,8 +131,8 @@ def export_trace(result: SimulationResult, path: str) -> None:
                                       "busy_s": 0.0, "top_tflops": 0.0}
             device_top_dtype[dev_name] = _peak_dtype(entry.device)
         kernel = entry.kernel
-        dtype = Simulator._infer_dtype(kernel)
-        peak = entry.device.tflops.get(dtype, 0.0) * 1e12
+        _, effective_peak, _ = _compute_profile(kernel, entry.device)
+        peak = effective_peak * 1e12
         dur_s = (entry.end_us - entry.start_us) / 1e6
         device_stats[dev_name]["flops"] += kernel.flops
         device_stats[dev_name]["peak_dur"] += peak * dur_s

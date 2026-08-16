@@ -247,7 +247,13 @@ class TestSparseAttn(TestKernelBase):
         attention_flops = 4 * 2 * 8 * 1 * 12 * 64
         indexer_flops = 2 * 2 * 1 * 4 * 25 * 8 + 3 * 2 * 1 * 4 * 25
 
+        assert kernel.attention_flops == attention_flops
+        assert kernel.indexer_flops == indexer_flops
         assert kernel.flops == attention_flops + indexer_flops
+        assert kernel.flops_by_dtype == {
+            "bf16": attention_flops,
+            "fp4": indexer_flops,
+        }
         assert kernel.input_read_fraction("q") == 1
         assert kernel.input_read_fraction("kv") == Fraction(3, 25)
         assert kernel.input_read_fraction("index_kv") == 1
@@ -290,6 +296,7 @@ class TestSparseAttn(TestKernelBase):
         assert kernel.q_dtype == "bf16"
         assert kernel.kv_dtype == "fp8"
         assert kernel.out_dtype == "bf16"
+        assert kernel.flops_by_dtype == {"fp8": kernel.flops}
         assert kernel.input_tensor_bytes == 3 * 8 * 2.0 + 5 * 4 * 1.0
         assert kernel.input_bytes == 3 * 8 * 2.0 + 5 * 4 * 1.0
         assert kernel.output_bytes == 3 * 8 * 2.0
@@ -462,6 +469,7 @@ class TestBwdSparseAttn(TestKernelBase):
         assert k.q_dtype == "bf16"
         assert k.kv_dtype == "fp8"
         assert k.out_dtype == "bf16"
+        assert k.flops_by_dtype == {"fp8": k.flops}
         assert k.input_bytes == (
             q_elements * 2.0 + q_elements * 2.0 + kv_elements * 1.0)
         assert k.output_bytes == (
@@ -485,6 +493,10 @@ class TestBwdSparseAttn(TestKernelBase):
             + 2 * 10 * 4 * 1.0
             + 2 * 4 * 3 * 2.0
         )
+        assert k.flops_by_dtype == {
+            "fp8": k.attention_flops,
+            "fp4": k.indexer_flops,
+        }
 
     def test_causal_only_halves_context_dependent_sparse_work(self):
         k = backward.SparseAttn(

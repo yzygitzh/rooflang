@@ -46,6 +46,17 @@ class Kernel:
     def flops(self) -> float:
         return 0.0
 
+    @property
+    def flops_by_dtype(self) -> Dict[str, float] | None:
+        """Optional FLOP breakdown for kernels using multiple dtypes.
+
+        A kernel with a single compute dtype leaves this unset and lets the
+        simulator infer that dtype as before.  Mixed-precision fused kernels
+        return a mapping whose FLOPs execute serially at the corresponding
+        device peaks.
+        """
+        return None
+
     def input_read_fraction(self, port: str) -> float:
         """Return the fraction of one input tensor read by this invocation."""
         return 1.0
@@ -85,6 +96,8 @@ class Kernel:
             "weight_bytes":      self.weight_bytes,
             "output_bytes":      self.output_bytes,
         }
+        if self.flops_by_dtype is not None:
+            d["flops_by_dtype"] = self.flops_by_dtype
         if self.input_tensor_bytes != self.input_bytes:
             d["input_tensor_bytes"] = self.input_tensor_bytes
         if self.weight_read_fraction != 1:

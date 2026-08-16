@@ -388,6 +388,8 @@ class SparseAttn(Kernel):
     ``dtype`` selects the device TFLOPS used for compute time.  Q, main KV,
     and output storage may independently use ``q_dtype``, ``kv_dtype``, and
     ``out_dtype``; each defaults to ``dtype`` for backward compatibility.
+    Fused indexer FLOPs use ``indexer_compute_dtype``, which defaults to the
+    index-cache storage ``indexer_dtype``.
     """
 
     def __init__(self, B: int, H: int, H_kv: int,
@@ -395,6 +397,7 @@ class SparseAttn(Kernel):
                  dtype: str = "bf16", kv_factor: int = 2,
                  indexer_s_kv: int = 0, indexer_h: int = 0,
                  indexer_hd: int = 0, indexer_dtype: str = "fp4",
+                 indexer_compute_dtype: str | None = None,
                  *, q_dtype: str | None = None,
                  kv_dtype: str | None = None,
                  out_dtype: str | None = None,
@@ -410,25 +413,39 @@ class SparseAttn(Kernel):
         self.indexer_h = indexer_h
         self.indexer_hd = indexer_hd
         self.indexer_dtype = indexer_dtype
+        self.indexer_compute_dtype = indexer_compute_dtype or indexer_dtype
         self.causal = causal
         self.causal_k_sel = causal_k_sel
         super().__init__()
 
     @property
-    def flops(self) -> float:
+    def attention_flops(self) -> float:
         effective_k_sel = self.k_sel
-        indexer_factor = 1.0
         if self.causal:
             effective_k_sel -= 0.5 * self.causal_k_sel
-            indexer_factor = 0.5
-        attention = (4.0 * self.B * self.H * self.S_q
-                     * effective_k_sel * self.Hd)
+        return (4.0 * self.B * self.H * self.S_q
+                * effective_k_sel * self.Hd)
+
+    @property
+    def indexer_flops(self) -> float:
+        factor = 0.5 if self.causal else 1.0
         indexer_score = (2.0 * self.B * self.S_q * self.indexer_h
-                         * self.indexer_s_kv * self.indexer_hd
-                         * indexer_factor)
+                         * self.indexer_s_kv * self.indexer_hd)
         indexer_reduce = (3.0 * self.B * self.S_q * self.indexer_h
-                          * self.indexer_s_kv * indexer_factor)
-        return attention + indexer_score + indexer_reduce
+                          * self.indexer_s_kv)
+        return (indexer_score + indexer_reduce) * factor
+
+    @property
+    def flops(self) -> float:
+        return self.attention_flops + self.indexer_flops
+
+    @property
+    def flops_by_dtype(self) -> dict[str, float]:
+        result = {self.dtype_: self.attention_flops}
+        result[self.indexer_compute_dtype] = (
+            result.get(self.indexer_compute_dtype, 0.0)
+            + self.indexer_flops)
+        return {dtype: flops for dtype, flops in result.items() if flops > 0}
 
     def input_read_fraction(self, port: str) -> float:
         if port == "kv":

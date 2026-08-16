@@ -24,6 +24,20 @@ class SyntheticKernel(Kernel):
         return self._flops_val
 
 
+class MixedDtypeKernel(Kernel):
+    def __init__(self, flops_by_dtype, **kwargs):
+        super().__init__(**kwargs)
+        self._flops_by_dtype = flops_by_dtype
+
+    @property
+    def flops(self):
+        return sum(self._flops_by_dtype.values())
+
+    @property
+    def flops_by_dtype(self):
+        return self._flops_by_dtype
+
+
 def _hw():
     gpu = Compute(name="gpu0", tflops={"bf16": 1.0})
     hbm = Memory(name="hbm", capacity_gb=80.0)
@@ -38,6 +52,34 @@ def _hw():
 
 
 class TestExportTrace:
+    def test_mixed_dtype_event_reports_effective_compute_peak(
+            self, tmp_path):
+        hw, gpu, hbm = _hw()
+        gpu.tflops = {"fp8": 2.0, "fp4": 4.0}
+        kernel = MixedDtypeKernel(
+            {"fp8": 2e6, "fp4": 4e6},
+            inputs={"x": Tensor("bf16", (1,))},
+        )
+        graph = ComputeGraph()
+        graph.add_kernel(kernel)
+        placement = Placement(hardware=hw)
+        placement.set_kernel_device(kernel, gpu)
+        result = Simulator(graph, placement, hw).run()
+
+        output = str(tmp_path / "mixed.json")
+        export_trace(result, output)
+
+        with open(output) as file:
+            data = json.load(file)
+        event = next(e for e in data["traceEvents"] if e["ph"] == "X")
+        assert event["args"]["dtype"] == "fp8+fp4"
+        assert event["args"]["flops_by_dtype"] == {
+            "fp8": 2e6,
+            "fp4": 4e6,
+        }
+        assert event["args"]["peak_tflops"] == pytest.approx(3.0)
+        assert event["args"]["mfu"] == pytest.approx(1.0)
+
     def test_export_creates_valid_json(self, tmp_path):
         hw, gpu, hbm = _hw()
         t = Tensor("bf16", (4,))

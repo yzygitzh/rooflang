@@ -668,13 +668,7 @@ class Simulator:
 
     def _base_times(self, kernel: Kernel, device: Compute,
                     participants: List[Compute]):
-        dtype = self._infer_dtype(kernel)
-        peak = device.tflops.get(dtype, 0.0) * 1e6
-        if kernel.flops > 0 and peak == 0:
-            raise ValueError(
-                f"Device '{device.name}' has no compute for dtype '{dtype}' "
-                f"but kernel has {kernel.flops} flops")
-        ct = kernel.flops / peak if peak > 0 else 0.0
+        ct = self.compute_time_us(kernel, device)
 
         mt = 0.0
         xfer = 0.0
@@ -760,6 +754,24 @@ class Simulator:
                        default=0.0)
 
         return ct, mt, alpha, xfer, link_data
+
+    @staticmethod
+    def compute_time_us(kernel: Kernel, device: Compute) -> float:
+        """Return ideal compute time, summing mixed-dtype FLOP segments."""
+        flops_by_dtype = kernel.flops_by_dtype
+        if flops_by_dtype is None:
+            flops_by_dtype = {Simulator._infer_dtype(kernel): kernel.flops}
+
+        compute_time = 0.0
+        for dtype, flops in flops_by_dtype.items():
+            peak = device.tflops.get(dtype, 0.0) * 1e6
+            if flops > 0 and peak == 0:
+                raise ValueError(
+                    f"Device '{device.name}' has no compute for dtype "
+                    f"'{dtype}' but kernel has {flops} flops")
+            if peak > 0:
+                compute_time += flops / peak
+        return compute_time
 
     @staticmethod
     def _infer_dtype(kernel: Kernel) -> str:

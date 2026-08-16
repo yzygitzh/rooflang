@@ -294,6 +294,7 @@ def _build_layers(g, B, S, context_len, prev_out):
             indexer_s_kv=compressed_len if has_indexer else 0,
             indexer_h=INDEX_H if has_indexer else 0,
             indexer_hd=INDEX_HD if has_indexer else 0,
+            indexer_compute_dtype="fp4",
             q_dtype="bf16", kv_dtype="fp8", out_dtype="bf16",
             causal=is_prefill,
             causal_k_sel=(compressed_len

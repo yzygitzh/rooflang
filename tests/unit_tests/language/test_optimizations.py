@@ -777,6 +777,9 @@ def test_context_split_preserves_causal_flop_factor(attn_cls):
     assert all(copy.causal for copy in copies)
     if attn_cls is SparseAttn:
         assert all(copy.causal_k_sel == 4 for copy in copies)
+        assert all(copy.indexer_compute_dtype == "fp4" for copy in copies)
+        assert sum(copy.flops_by_dtype["fp4"] for copy in copies) \
+            == kernel.flops_by_dtype["fp4"]
     assert sum(copy.flops for copy in copies) == kernel.flops
 
 
@@ -874,6 +877,9 @@ def test_context_split_decode_attention_broadcasts_q_and_shards_kv():
     assert all(copy.S_kv == 3 for copy in copies)
     assert all(copy.k_sel == 2 for copy in copies)
     assert all(copy.indexer_s_kv == 4 for copy in copies)
+    assert all(copy.indexer_compute_dtype == "fp4" for copy in copies)
+    assert sum(copy.flops_by_dtype["fp4"] for copy in copies) \
+        == kernel.flops_by_dtype["fp4"]
     assert all(copy.inputs["index_kv"].shape == (8, 4, 8)
                for copy in copies)
     assert sum(copy.flops for copy in copies) == kernel.flops

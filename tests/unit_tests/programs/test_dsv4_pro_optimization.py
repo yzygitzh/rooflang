@@ -255,6 +255,8 @@ def test_ratio4_prefill_fuses_indexer_and_persists_fp4_cache(monkeypatch):
     assert layer.index_cache_slice.outputs["y"].dtype == "fp4"
     assert layer.index_cache_slice.outputs["y"].shape == (8, 2048, 128)
     assert layer.index_cache_fan.outputs["y2"].shape == (8, 2048, 128)
+    assert layer.sa.indexer_compute_dtype == "fp4"
+    assert set(layer.sa.flops_by_dtype) == {"fp8", "fp4"}
     assert layer.sa.inputs["index_kv"].shape == (8, 2048, 128)
     assert layer.sa.indexer_s_kv == 2048
     assert layer.sa.input_bytes == layer.sa.input_tensor_bytes
@@ -302,6 +304,8 @@ def test_ratio4_decode_shards_and_preloads_fp4_index_cache(monkeypatch):
     assert kv_reads[2].inputs["kv"].dtype == "fp8"
     assert layer.index_cache_read.inputs["index_kv"].dtype == "fp4"
     assert layer.index_cache_read.inputs["index_kv"].shape == (8, 2048, 128)
+    assert layer.sa.indexer_compute_dtype == "fp4"
+    assert set(layer.sa.flops_by_dtype) == {"fp8", "fp4"}
     assert layer.sa.input_read_fraction("kv") == Fraction(9, 17)
     assert layer.sa.input_bytes < layer.sa.input_tensor_bytes
     assert "kv2_index" in layer.kv_persist_barrier.inputs

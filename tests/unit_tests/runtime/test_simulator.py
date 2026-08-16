@@ -31,9 +31,29 @@ class SyntheticKernel(Kernel):
         return self._flops_val
 
 
-def _hw(read_bw=1.0, write_bw=1.0, tflops=1.0):
+class MixedDtypeKernel(Kernel):
+    """Kernel with serial compute segments at different dtype peaks."""
+
+    def __init__(self, flops_by_dtype, **kwargs):
+        super().__init__(**kwargs)
+        self._flops_by_dtype = flops_by_dtype
+
+    @property
+    def flops(self):
+        return sum(self._flops_by_dtype.values())
+
+    @property
+    def flops_by_dtype(self):
+        return self._flops_by_dtype
+
+
+def _hw(read_bw=1.0, write_bw=1.0, tflops=1.0,
+        tflops_by_dtype=None):
     """Single GPU + HBM. Bandwidths in GB/s, compute in TFLOPS bf16."""
-    gpu = Compute(name="gpu0", tflops={"bf16": tflops})
+    gpu = Compute(
+        name="gpu0",
+        tflops=tflops_by_dtype or {"bf16": tflops},
+    )
     hbm = Memory(name="hbm", capacity_gb=80.0)
     hw = HardwareGraph()
     hw.add_node(gpu)
@@ -60,6 +80,27 @@ def _place_comm_tensors(placement, kernel, memories):
 
 
 class TestSingleKernel:
+    def test_mixed_dtype_compute_segments_are_summed(self):
+        hw, gpu, hbm = _hw(
+            read_bw=1000.0,
+            write_bw=1000.0,
+            tflops_by_dtype={"fp8": 2.0, "fp4": 4.0},
+        )
+        kernel = MixedDtypeKernel(
+            {"fp8": 2e6, "fp4": 4e6},
+            inputs={"x": Tensor("bf16", (1,))},
+        )
+        graph = ComputeGraph()
+        graph.add_kernel(kernel)
+        placement = Placement(hardware=hw)
+        placement.set_kernel_device(kernel, gpu)
+
+        result = _sim(graph, placement, hw)
+
+        # 2e6 / 2 TFLOPS = 1 us; 4e6 / 4 TFLOPS = 1 us.
+        assert result.total_time_us == pytest.approx(2.0)
+        assert result.trace[0].compute_time_us == pytest.approx(2.0)
+
     def test_compute_bound(self):
         hw, gpu, hbm = _hw(read_bw=1000.0, write_bw=1000.0, tflops=1.0)
         # peak = 1e6 FLOPS/us; flops = 2e6 → ct = 2 us

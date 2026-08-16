@@ -116,6 +116,27 @@ class TestSingleKernel:
         assert result.trace[0].memory_time_us == pytest.approx(0.5)
         assert result.peak_memory[hbm] == 2000.0
 
+    def test_fractional_input_read_keeps_full_resident_capacity(self):
+        class FractionalInputKernel(SyntheticKernel):
+            def input_read_fraction(self, port):
+                return Fraction(1, 4) if port == "x" else 1
+
+        hw, gpu, hbm = _hw(read_bw=1.0, write_bw=1.0, tflops=1.0)
+        tensor = Tensor("bf16", (1000,))
+        kernel = FractionalInputKernel(inputs={"x": tensor})
+        graph = ComputeGraph()
+        graph.add_kernel(kernel)
+        placement = Placement(hardware=hw)
+        placement.set_kernel_device(kernel, gpu)
+
+        graph.validate()
+        result = _sim(graph, placement, hw)
+
+        assert kernel.input_tensor_bytes == 2000.0
+        assert kernel.input_bytes == 500.0
+        assert result.trace[0].memory_time_us == pytest.approx(0.5)
+        assert result.peak_memory[hbm] == 2000.0
+
 
 # ── Stream serialization ─────────────────────────────────────────────
 

@@ -365,13 +365,16 @@ class StridedGemm(Kernel):
 
 
 class SparseAttn(Kernel):
-    """Sparse attention: each query attends to k_sel selected K/V tokens.
+    """Sparse attention with an optional fused sparse indexer.
 
-    flops = 4·B·H·S_q·k_sel·Hd.
-    bytes (flash-tiled, KV cache read once from HBM):
-        input_bytes  = (B·H·S_q·Hd + kv_factor·B·H_kv·S_kv·Hd) · sizeof(dtype)
-        weight_bytes = 0
-        output_bytes = B·H·S_q·Hd · sizeof(dtype)
+    Attention FLOPS are 4·B·H·S_q·k_sel·Hd.  When indexer_s_kv is nonzero,
+    the dominant FP4 index scoring and reduction work is added to the same
+    roofline unit.  The FP4 index cache remains an explicit input tensor, but
+    Top-K indices are internal transient data.
+
+    The full main KV tensor remains resident, while ideal cross-query reuse
+    reads at most min(S_kv, S_q·k_sel) positions.  input_read_fraction exposes
+    that sparse access to the simulator on the individual ``kv`` port.
 
     kv_factor=2 for standard MHA (separate K/V caches);
     kv_factor=1 for MLA (shared latent read once from HBM).
@@ -379,22 +382,58 @@ class SparseAttn(Kernel):
 
     def __init__(self, B: int, H: int, H_kv: int,
                  S_q: int, k_sel: int, S_kv: int, Hd: int,
-                 dtype: str = "bf16", kv_factor: int = 2):
+                 dtype: str = "bf16", kv_factor: int = 2,
+                 indexer_s_kv: int = 0, indexer_h: int = 0,
+                 indexer_hd: int = 0, indexer_dtype: str = "fp4"):
         self.B, self.H, self.H_kv = B, H, H_kv
         self.S_q, self.k_sel, self.S_kv, self.Hd = S_q, k_sel, S_kv, Hd
         self.dtype_ = dtype
         self.kv_factor = kv_factor
+        self.indexer_s_kv = indexer_s_kv
+        self.indexer_h = indexer_h
+        self.indexer_hd = indexer_hd
+        self.indexer_dtype = indexer_dtype
         super().__init__()
 
     @property
     def flops(self) -> float:
-        return 4.0 * self.B * self.H * self.S_q * self.k_sel * self.Hd
+        attention = 4.0 * self.B * self.H * self.S_q * self.k_sel * self.Hd
+        indexer_score = (2.0 * self.B * self.S_q * self.indexer_h
+                         * self.indexer_s_kv * self.indexer_hd)
+        indexer_reduce = (3.0 * self.B * self.S_q * self.indexer_h
+                          * self.indexer_s_kv)
+        return attention + indexer_score + indexer_reduce
+
+    def input_read_fraction(self, port: str) -> float:
+        if port == "kv":
+            return min(
+                Fraction(1, 1),
+                Fraction(self.S_q * self.k_sel, self.S_kv),
+            )
+        return 1.0
+
+    @property
+    def input_tensor_bytes(self) -> float:
+        b = dtype_bytes(self.dtype_)
+        return (
+            (self.B * self.H * self.S_q * self.Hd
+             + self.kv_factor * self.B * self.H_kv
+             * self.S_kv * self.Hd) * b
+            + self.B * self.indexer_s_kv * self.indexer_hd
+            * dtype_bytes(self.indexer_dtype)
+        )
 
     @property
     def input_bytes(self) -> float:
         b = dtype_bytes(self.dtype_)
-        return (self.B * self.H * self.S_q * self.Hd
-                + self.kv_factor * self.B * self.H_kv * self.S_kv * self.Hd) * b
+        main_kv_reads = min(self.S_kv, self.S_q * self.k_sel)
+        return (
+            (self.B * self.H * self.S_q * self.Hd
+             + self.kv_factor * self.B * self.H_kv
+             * main_kv_reads * self.Hd) * b
+            + self.B * self.indexer_s_kv * self.indexer_hd
+            * dtype_bytes(self.indexer_dtype)
+        )
 
     @property
     def weight_bytes(self) -> float:

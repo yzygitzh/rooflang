@@ -20,7 +20,9 @@ class Kernel:
 
     Byte properties (input_bytes, weight_bytes, output_bytes, transferred_bytes)
     are computed from the inputs/weights/outputs dicts by default. Subclasses
-    can override these properties for custom accounting.
+    can override these properties for custom accounting.  input_tensor_bytes
+    describes the full logical input tensors, while input_bytes reflects the
+    bytes actually read after per-port reuse or sparse access.
     """
 
     _requires_placement = True
@@ -44,9 +46,20 @@ class Kernel:
     def flops(self) -> float:
         return 0.0
 
+    def input_read_fraction(self, port: str) -> float:
+        """Return the fraction of one input tensor read by this invocation."""
+        return 1.0
+
+    @property
+    def input_tensor_bytes(self) -> float:
+        return sum(t.size_bytes for t in self.inputs.values())
+
     @property
     def input_bytes(self) -> float:
-        return sum(t.size_bytes for t in self.inputs.values())
+        return sum(
+            t.size_bytes * self.input_read_fraction(port)
+            for port, t in self.inputs.items()
+        )
 
     @property
     def weight_bytes(self) -> float:
@@ -72,6 +85,8 @@ class Kernel:
             "weight_bytes":      self.weight_bytes,
             "output_bytes":      self.output_bytes,
         }
+        if self.input_tensor_bytes != self.input_bytes:
+            d["input_tensor_bytes"] = self.input_tensor_bytes
         if self.weight_read_fraction != 1:
             d["loaded_weight_bytes"] = self.loaded_weight_bytes
             d["weight_read_fraction"] = float(self.weight_read_fraction)

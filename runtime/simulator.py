@@ -683,7 +683,8 @@ class Simulator:
         if kernel._requires_placement:
             local_mem = self._hardware.find_local_memory(device)
             read_tensors = [
-                (tensor, 1) for tensor in kernel.inputs.values()
+                (tensor, kernel.input_read_fraction(port))
+                for port, tensor in kernel.inputs.items()
             ] + [
                 (tensor, kernel.weight_read_fraction)
                 for tensor in kernel.weights.values()

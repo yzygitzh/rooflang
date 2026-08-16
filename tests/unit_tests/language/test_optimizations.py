@@ -830,18 +830,26 @@ def test_batch_split_supports_terminal_nop_sink_without_gather():
 
 
 def test_context_split_decode_attention_broadcasts_q_and_shards_kv():
-    kernel = SparseAttn(8, 8, 1, 1, 8, 12, 64, "bf16", kv_factor=1)
+    kernel = SparseAttn(
+        8, 8, 1, 1, 8, 12, 64, "bf16", kv_factor=1,
+        indexer_s_kv=16, indexer_h=4, indexer_hd=8)
     kernel.inputs = {
         "q": Tensor("bf16", (8, 1, 8 * 64)),
         "kv": Tensor("bf16", (8, 12, 64)),
+        "index_kv": Tensor("fp4", (8, 16, 8)),
     }
     kernel.outputs = {"y": Tensor("bf16", (8, 1, 8 * 64))}
     prev, copies, nxt = context_split_decode(kernel, N)
 
     assert isinstance(prev["q"], Broadcast)
     assert isinstance(prev["kv"], Scatter)
+    assert isinstance(prev["index_kv"], Scatter)
     assert all(copy.S_kv == 3 for copy in copies)
     assert all(copy.k_sel == 2 for copy in copies)
+    assert all(copy.indexer_s_kv == 4 for copy in copies)
+    assert all(copy.inputs["index_kv"].shape == (8, 4, 8)
+               for copy in copies)
+    assert sum(copy.flops for copy in copies) == kernel.flops
     assert isinstance(nxt["y"], Reduce)
 
 

@@ -4,6 +4,7 @@ from fractions import Fraction
 
 import pytest
 
+from rooflang.language.graph import ComputeGraph
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.kernels.forward import (
     ElementwiseOp, Embedding, Gemm, Nop, ReadInput, RMSNorm, LayerNorm, RoPE,
@@ -227,6 +228,52 @@ class TestSparseAttn(TestKernelBase):
     expected_input_bytes = (2 * 8 * 256 * 64 + 2 * 2 * 8 * 64 * 64) * 2.0
     expected_weight_bytes = 0.0
     expected_output_bytes = 2 * 8 * 256 * 64 * 2.0
+
+    def test_fused_indexer_and_sparse_kv_read(self):
+        kernel = SparseAttn(
+            B=2, H=8, H_kv=1, S_q=1, k_sel=12, S_kv=100, Hd=64,
+            kv_factor=1, indexer_s_kv=25, indexer_h=4, indexer_hd=8)
+        kernel.inputs = {
+            "q": Tensor("bf16", (2, 1, 8 * 64)),
+            "kv": Tensor("bf16", (2, 100, 64)),
+            "index_kv": Tensor("fp4", (2, 25, 8)),
+        }
+        kernel.outputs = {"y": Tensor("bf16", (2, 1, 8 * 64))}
+
+        q_bytes = 2 * 1 * 8 * 64 * 2
+        full_kv_bytes = 2 * 100 * 64 * 2
+        selected_kv_bytes = 2 * 12 * 64 * 2
+        index_bytes = 2 * 25 * 8 * 0.5
+        attention_flops = 4 * 2 * 8 * 1 * 12 * 64
+        indexer_flops = 2 * 2 * 1 * 4 * 25 * 8 + 3 * 2 * 1 * 4 * 25
+
+        assert kernel.flops == attention_flops + indexer_flops
+        assert kernel.input_read_fraction("q") == 1
+        assert kernel.input_read_fraction("kv") == Fraction(3, 25)
+        assert kernel.input_read_fraction("index_kv") == 1
+        assert kernel.input_tensor_bytes == \
+            q_bytes + full_kv_bytes + index_bytes
+        assert kernel.input_bytes == \
+            q_bytes + selected_kv_bytes + index_bytes
+
+        graph = ComputeGraph()
+        graph.add_kernel(kernel)
+        graph.validate()
+
+    def test_input_tensor_shape_is_checked_independently_of_sparse_read(self):
+        kernel = SparseAttn(
+            B=1, H=1, H_kv=1, S_q=1, k_sel=2, S_kv=8, Hd=4,
+            kv_factor=1)
+        kernel.inputs = {
+            "q": Tensor("bf16", (1, 1, 4)),
+            "kv": Tensor("bf16", (1, 7, 4)),
+        }
+        kernel.outputs = {"y": Tensor("bf16", (1, 1, 4))}
+        graph = ComputeGraph()
+        graph.add_kernel(kernel)
+
+        with pytest.raises(ValueError, match="input_tensor_bytes"):
+            graph.validate()
 
 
 class TestElementwiseOpAdd(TestKernelBase):

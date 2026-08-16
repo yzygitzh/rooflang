@@ -111,17 +111,29 @@ def _context_split_attn_decode(kernel, n):
         "q": _make_broadcast(q_tensor, n),
         "kv": _make_scatter(kv_tensor, n, dim=1),
     }
+    index_tensor = kernel.inputs.get("index_kv")
+    if index_tensor is not None:
+        prev_comms["index_kv"] = _make_scatter(
+            index_tensor, n, dim=1)
     copies = []
     for _ in range(n):
         copy = SparseAttn(
             kernel.B, kernel.H, kernel.H_kv, kernel.S_q,
             kernel.k_sel // n, local_kv, kernel.Hd, kernel.dtype_,
-            kernel.kv_factor)
+            kernel.kv_factor,
+            indexer_s_kv=kernel.indexer_s_kv // n,
+            indexer_h=kernel.indexer_h,
+            indexer_hd=kernel.indexer_hd,
+            indexer_dtype=kernel.indexer_dtype)
         copy.inputs = {
             "q": Tensor(q_tensor.dtype, q_tensor.shape),
             "kv": Tensor(
                 kv_tensor.dtype, _shard_shape(kv_tensor.shape, n, dim=1)),
         }
+        if index_tensor is not None:
+            copy.inputs["index_kv"] = Tensor(
+                index_tensor.dtype,
+                _shard_shape(index_tensor.shape, n, dim=1))
         copy.outputs = {
             "y": Tensor(out_tensor.dtype, out_tensor.shape)}
         copies.append(copy)
@@ -301,14 +313,25 @@ def head_split(kernel, n):
         "q": _make_scatter(q_tensor, n, dim=-1),
         "kv": _make_broadcast(kv_tensor, n),
     }
+    index_tensor = kernel.inputs.get("index_kv")
+    if index_tensor is not None:
+        prev_comms["index_kv"] = _make_broadcast(index_tensor, n)
 
     copies = []
     for _ in range(n):
         c = SparseAttn(kernel.B, shard_h, kernel.H_kv, kernel.S_q,
                        kernel.k_sel, kernel.S_kv, kernel.Hd, kernel.dtype_,
-                       kernel.kv_factor)
+                       kernel.kv_factor,
+                       indexer_s_kv=kernel.indexer_s_kv,
+                       indexer_h=(kernel.indexer_h // n
+                                  if kernel.indexer_h else 0),
+                       indexer_hd=kernel.indexer_hd,
+                       indexer_dtype=kernel.indexer_dtype)
         c.inputs = {"q": Tensor(kernel.dtype_, shard_q_shape),
                     "kv": Tensor(kernel.dtype_, kv_tensor.shape)}
+        if index_tensor is not None:
+            c.inputs["index_kv"] = Tensor(
+                index_tensor.dtype, index_tensor.shape)
         c.outputs = {"y": Tensor(kernel.dtype_, shard_q_shape)}
         copies.append(c)
 
@@ -386,6 +409,9 @@ def _context_split_attn_prefill(kernel, n):
         "q": _make_scatter(q_tensor, n, dim=1),
         "kv": _make_broadcast(kv_tensor, n),
     }
+    index_tensor = kernel.inputs.get("index_kv")
+    if index_tensor is not None:
+        prev_comms["index_kv"] = _make_broadcast(index_tensor, n)
 
     copies = []
     for _ in range(n):
@@ -393,7 +419,11 @@ def _context_split_attn_prefill(kernel, n):
             c = SparseAttn(
                 kernel.B, kernel.H, kernel.H_kv, kernel.S_q // n,
                 kernel.k_sel, kernel.S_kv, kernel.Hd, kernel.dtype_,
-                kernel.kv_factor)
+                kernel.kv_factor,
+                indexer_s_kv=kernel.indexer_s_kv,
+                indexer_h=kernel.indexer_h,
+                indexer_hd=kernel.indexer_hd,
+                indexer_dtype=kernel.indexer_dtype)
         else:
             c = Attn(
                 kernel.B, kernel.H, kernel.H_kv, kernel.S_q // n,
@@ -402,6 +432,9 @@ def _context_split_attn_prefill(kernel, n):
             "q": Tensor(q_tensor.dtype, q_shard),
             "kv": Tensor(kv_tensor.dtype, kv_tensor.shape),
         }
+        if index_tensor is not None:
+            c.inputs["index_kv"] = Tensor(
+                index_tensor.dtype, index_tensor.shape)
         c.outputs = {"y": Tensor(out_tensor.dtype, out_shard)}
         copies.append(c)
 
@@ -536,7 +569,11 @@ def _make_batch_copy(kernel, n):
     elif isinstance(kernel, SparseAttn):
         c = SparseAttn(kernel.B // n, kernel.H, kernel.H_kv, kernel.S_q,
                        kernel.k_sel, kernel.S_kv, kernel.Hd, kernel.dtype_,
-                       kernel.kv_factor)
+                       kernel.kv_factor,
+                       indexer_s_kv=kernel.indexer_s_kv,
+                       indexer_h=kernel.indexer_h,
+                       indexer_hd=kernel.indexer_hd,
+                       indexer_dtype=kernel.indexer_dtype)
     elif isinstance(kernel, Spawn):
         c = Spawn(world=kernel.world)
     elif isinstance(kernel, Concat):

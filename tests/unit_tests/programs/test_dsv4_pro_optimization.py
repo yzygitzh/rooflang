@@ -219,6 +219,96 @@ def test_declare_decode_uses_read_only_persistent_kv(monkeypatch):
                    for edge in graph._in_edges(barrier))
 
 
+def test_ratio4_prefill_fuses_indexer_and_persists_fp4_cache(monkeypatch):
+    monkeypatch.setattr(model, "N_LAYERS", 3)
+    monkeypatch.setattr(model, "N_EXPERTS", 8)
+    monkeypatch.setattr(optimization, "N_EXPERTS", 8)
+
+    graph, layers, emb, read_input, _, output_head = model.declare_model(
+        batch_size=8, seq_prefill=8192)
+    layer = layers[2]
+    barrier = layer.kv_persist_barrier
+
+    assert isinstance(layer.index_cache_slice, Slice)
+    assert layer.index_cache_slice.outputs["y"].dtype == "fp4"
+    assert layer.index_cache_slice.outputs["y"].shape == (8, 2048, 128)
+    assert layer.index_cache_fan.outputs["y2"].shape == (8, 2048, 128)
+    assert layer.sa.inputs["index_kv"].shape == (8, 2048, 128)
+    assert layer.sa.indexer_s_kv == 2048
+    assert layer.sa.input_bytes == layer.sa.input_tensor_bytes
+    assert "kv2_index" in barrier.inputs
+
+    graph, placement = optimize_model_cluster_prefill(
+        graph, layers, B300Cluster(n_nodes=1), emb, read_input, output_head,
+        cp=2, dp=4, ep=8, pp_partition=[3], n_gpus=8)
+
+    attention = layer._sa_cp_dp_copies
+    assert len(attention) == 8
+    assert all(copy.inputs["index_kv"].shape == (2, 2048, 128)
+               and copy.indexer_s_kv == 2048
+               for copy in attention)
+    barriers = layer._kv_persist_barrier_cp_dp_copies
+    assert all(barrier.inputs["kv2_index"].shape == (2, 1024, 128)
+               for barrier in barriers)
+    assert sum(
+        footprint.size_bytes
+        for footprint in placement.memory_footprints
+        if footprint.role == "kv_cache"
+        and footprint.memory.kind == "hbm"
+    ) == sum(
+        tensor.size_bytes
+        for barrier in barriers
+        for name, tensor in barrier.inputs.items()
+        if name.startswith("kv")
+    )
+
+
+def test_ratio4_decode_shards_and_preloads_fp4_index_cache(monkeypatch):
+    monkeypatch.setattr(model, "N_LAYERS", 3)
+    monkeypatch.setattr(model, "N_EXPERTS", 8)
+    monkeypatch.setattr(optimization, "N_EXPERTS", 8)
+
+    graph, layers, emb, read_input, kv_reads, output_head = \
+        model.declare_model(batch_size=8, seq_prefill=8192, decode=True)
+    layer = layers[2]
+
+    assert len(kv_reads) == 3
+    assert layer.index_cache_read.inputs["index_kv"].dtype == "fp4"
+    assert layer.index_cache_read.inputs["index_kv"].shape == (8, 2048, 128)
+    assert layer.sa.input_read_fraction("kv") == Fraction(9, 17)
+    assert layer.sa.input_bytes < layer.sa.input_tensor_bytes
+    assert "kv2_index" in layer.kv_persist_barrier.inputs
+
+    graph, placement = optimize_model_cluster_decode(
+        graph, layers, B300Cluster(n_nodes=1), emb, read_input, kv_reads,
+        output_head, seq_prefill=8192, cp=2, dp=4, ep=8,
+        pp_partition=[3], n_gpus=8)
+
+    attention = layer._decode_copies["cp_dp"]["sa"]
+    assert len(attention) == 8
+    assert all(copy.S_kv == 1088 and copy.k_sel == 576
+               and copy.indexer_s_kv == 1024
+               and copy.inputs["index_kv"].shape == (2, 1024, 128)
+               and copy.input_read_fraction("kv") == Fraction(9, 17)
+               for copy in attention)
+    index_preloads = [
+        kernel for kernel in graph.kernels
+        if isinstance(kernel, ReadInput) and "index_kv" in kernel.inputs
+    ]
+    assert len(index_preloads) == 8
+    assert all(
+        placement.get_tensor_memory(kernel.inputs["index_kv"]).kind == "ssd"
+        for kernel in index_preloads
+    )
+    barriers = [
+        kernel for kernel in graph.kernels
+        if isinstance(kernel, Nop) and "kv2_index" in kernel.inputs
+    ]
+    assert len(barriers) == 8
+    assert all(barrier.inputs["kv2_index"].shape == (2, 1024, 128)
+               for barrier in barriers)
+
+
 def test_cp4_dp2_ep8_pp2_prefill(monkeypatch):
     """Primary two-node configuration on a reduced two-layer model."""
     monkeypatch.setattr(model, "N_LAYERS", 2)

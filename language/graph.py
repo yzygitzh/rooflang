@@ -471,12 +471,22 @@ class ComputeGraph:
             if not kernel._requires_placement:
                 continue
             tensor_in = sum(t.size_bytes for t in kernel.inputs.values())
+            tensor_read = sum(
+                t.size_bytes * kernel.input_read_fraction(name)
+                for name, t in kernel.inputs.items()
+            )
             tensor_w = sum(t.size_bytes for t in kernel.weights.values())
             tensor_out = sum(t.size_bytes for t in kernel.outputs.values())
-            if kernel.inputs and kernel.input_bytes != tensor_in:
+            if kernel.inputs and kernel.input_tensor_bytes != tensor_in:
+                raise ValueError(
+                    f"{type(kernel).__name__}: input_tensor_bytes property "
+                    f"({kernel.input_tensor_bytes}) != tensor sum "
+                    f"({tensor_in})")
+            if kernel.inputs and kernel.input_bytes != tensor_read:
                 raise ValueError(
                     f"{type(kernel).__name__}: input_bytes property "
-                    f"({kernel.input_bytes}) != tensor sum ({tensor_in})")
+                    f"({kernel.input_bytes}) != fraction-adjusted tensor "
+                    f"sum ({tensor_read})")
             if kernel.weights and kernel.weight_bytes != tensor_w:
                 raise ValueError(
                     f"{type(kernel).__name__}: weight_bytes property "

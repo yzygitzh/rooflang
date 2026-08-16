@@ -22,9 +22,10 @@ from rooflang.programs.models.dsv4_pro.config import (
 _PREFILL_PARALLEL_FIELDS = (
     "bridge", "attn_norm", "attn_fan", "comp", "comp_norm",
     "wq_a", "q_norm", "wq_b", "wkv", "kv_norm", "kv_concat",
-    "kv_persist_fan", "sa", "kv_win_slice", "wo_a", "wo_b",
-    "attn_add", "ffn_bridge", "ffn_norm", "ffn_fan", "gate",
-    "dispatch", "combine", "sw_up", "sw_down", "moe_add", "ffn_add",
+    "kv_persist_fan", "index_cache_slice", "index_cache_fan", "sa",
+    "kv_win_slice", "wo_a", "wo_b", "attn_add", "ffn_bridge", "ffn_norm",
+    "ffn_fan", "gate", "dispatch", "combine", "sw_up", "sw_down",
+    "moe_add", "ffn_add",
 )
 
 _DECODE_REPLICATED_FIELDS = (
@@ -176,6 +177,11 @@ def _record_kv_cache_footprints(
                 tensor.size_bytes,
                 "kv_cache",
             )
+
+
+def _kv_layer_id(input_name):
+    """Extract the layer id from kvN and kvN_index barrier ports."""
+    return int(input_name[2:].split("_", 1)[0])
 
 
 def _validate_args(
@@ -460,7 +466,7 @@ def optimize_model_cluster_prefill(
     for rank, barrier in enumerate(barrier_copies):
         for input_name, tensor in barrier.inputs.items():
             if input_name.startswith("kv"):
-                layer_id = int(input_name[2:])
+                layer_id = _kv_layer_id(input_name)
                 devices = stage_gpus[layer_stages[layer_id]]
             else:
                 devices = final_devices
@@ -522,12 +528,15 @@ def optimize_model_cluster_decode(
     copies_by_layer = []
     for layer in layers:
         dp_fields = {}
-        for name in (
+        field_names = [
             *_DECODE_DP_ONLY_FIELDS,
             *_DECODE_REPLICATED_FIELDS,
             *_DECODE_SHARDED_FIELDS,
             "sa", "kv_cache_fan",
-        ):
+        ]
+        if layer.index_cache_fan is not None:
+            field_names.append("index_cache_fan")
+        for name in field_names:
             _, copies, _ = g.split_kernel(
                 batch_split, getattr(layer, name), dp)
             dp_fields[name] = copies
@@ -541,10 +550,15 @@ def optimize_model_cluster_decode(
         dp_fields_by_layer.append(dp_fields)
         copies_by_layer.append(layer_copies)
 
-    kv_read_dp_copies = []
-    for kv_read in kv_cache_reads:
-        _, copies, _ = g.split_kernel(batch_split, kv_read, dp)
-        kv_read_dp_copies.append(copies)
+    kv_read_dp_groups = []
+    for layer_id, (layer, kv_read) in enumerate(
+            zip(layers, kv_cache_reads)):
+        reads = [kv_read]
+        if layer.index_cache_read is not None:
+            reads.append(layer.index_cache_read)
+        for cache_read in reads:
+            _, copies, _ = g.split_kernel(batch_split, cache_read, dp)
+            kv_read_dp_groups.append((layer_id, copies))
 
     barrier = layers[0].kv_persist_barrier
     _, barrier_dp_copies, _ = g.split_kernel(batch_split, barrier, dp)
@@ -554,32 +568,40 @@ def optimize_model_cluster_decode(
 
     # Apply CP separately inside every DP subgraph. Each attention split now
     # creates its own Q Broadcast and output Reduce for that DP group.
-    kv_read_cp_dp_copies = []
-    for dp_copies in kv_read_dp_copies:
+    kv_read_cp_dp_groups = []
+    for layer_id, dp_copies in kv_read_dp_groups:
         cp_dp_copies = []
         for copy in dp_copies:
             _, copies, _ = g.split_kernel(context_split_decode, copy, cp)
             cp_dp_copies.extend(copies)
-        kv_read_cp_dp_copies.append(cp_dp_copies)
+        kv_read_cp_dp_groups.append((layer_id, cp_dp_copies))
 
     barrier_copies = []
     for copy in barrier_dp_copies:
         _, copies, _ = g.split_kernel(kv_persistence_split, copy, cp)
         barrier_copies.extend(copies)
 
-    cp_field_names = (
-        *_DECODE_REPLICATED_FIELDS,
-        *_DECODE_SHARDED_FIELDS,
-        "sa", "kv_cache_fan",
-    )
-    for dp_fields, layer_copies in zip(
-            dp_fields_by_layer, copies_by_layer):
+    for layer, dp_fields, layer_copies in zip(
+            layers, dp_fields_by_layer, copies_by_layer):
+        cp_field_names = [
+            *_DECODE_REPLICATED_FIELDS,
+            *_DECODE_SHARDED_FIELDS,
+            "sa", "kv_cache_fan",
+        ]
+        if layer.index_cache_fan is not None:
+            cp_field_names.append("index_cache_fan")
         cp_fields = {name: [] for name in cp_field_names}
         for dp_rank in range(dp):
             _, copies, _ = g.split_kernel(
                 context_split_decode,
                 dp_fields["kv_cache_fan"][dp_rank], cp)
             cp_fields["kv_cache_fan"].extend(copies)
+
+            if layer.index_cache_fan is not None:
+                _, copies, _ = g.split_kernel(
+                    context_split_decode,
+                    dp_fields["index_cache_fan"][dp_rank], cp)
+                cp_fields["index_cache_fan"].extend(copies)
 
             sa_prev, copies, _ = g.split_kernel(
                 context_split_decode, dp_fields["sa"][dp_rank], cp)
@@ -603,7 +625,7 @@ def optimize_model_cluster_decode(
     # Treat KV loading as a preload phase. The token reader marks the start of
     # the measured decode step and cannot run until every DP×CP KV shard has
     # been materialized in its destination HBM.
-    for copies in kv_read_cp_dp_copies:
+    for _, copies in kv_read_cp_dp_groups:
         for kv_read in copies:
             g.add_control_edge(kv_read, read_input)
 
@@ -613,13 +635,14 @@ def optimize_model_cluster_decode(
     # its destination HBM during the preload phase.  The later comm-memory
     # propagation carries this SSD placement through split-generated root
     # Scatter kernels, so the unsplit external inputs do not consume DRAM.
-    for layer_id, copies in enumerate(kv_read_cp_dp_copies):
+    for layer_id, copies in kv_read_cp_dp_groups:
         devices = stage_gpus[layer_stages[layer_id]]
         for rank, kernel in enumerate(copies):
             device = devices[rank]
             placement.set_kernel_device(kernel, device)
+            source_tensor = next(iter(kernel.inputs.values()))
             placement.set_tensor_memory(
-                kernel.inputs["kv"],
+                source_tensor,
                 _nearby_memory(device, gpus_by_node, ssds))
 
     first_devices = stage_gpus[0]
@@ -674,7 +697,7 @@ def optimize_model_cluster_decode(
     for rank, barrier_copy in enumerate(barrier_copies):
         for input_name, tensor in barrier_copy.inputs.items():
             if input_name.startswith("kv"):
-                layer_id = int(input_name[2:])
+                layer_id = _kv_layer_id(input_name)
                 devices = stage_gpus[layer_stages[layer_id]]
             else:
                 devices = final_devices
@@ -688,7 +711,8 @@ def optimize_model_cluster_decode(
     g.validate()
     placement.validate(g)
     _record_kv_cache_footprints(
-        g, placement, barrier_copies, kv_read_cp_dp_copies)
+        g, placement, barrier_copies,
+        [copies for _, copies in kv_read_cp_dp_groups])
     return g, placement
 
 

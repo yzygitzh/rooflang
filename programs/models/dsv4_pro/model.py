@@ -18,7 +18,7 @@ from rooflang.language.tensor import Tensor
 from rooflang.language.utils import gemm_scale_bytes
 
 from rooflang.programs.models.dsv4_pro.config import (
-    BATCH, COMPRESS_RATIOS, D, H, HD, INDEX_TOPK, KV_DIM,
+    BATCH, COMPRESS_RATIOS, D, H, HD, INDEX_H, INDEX_HD, INDEX_TOPK, KV_DIM,
     MOE_INTER, N_EXPERTS, N_LAYERS, O_GROUPS, O_LORA,
     Q_LORA, S_PREFILL, TOPK, V, WINDOW,
 )
@@ -98,6 +98,10 @@ class LayerMeta:
     kv_persist_fan: Kernel = None
     kv_persist_barrier: Kernel = None
     kv_sink: Kernel = None
+    index_cache_slice: Kernel = None
+    index_cache_fan: Kernel = None
+    index_cache_read: Kernel = None
+
 
 def _tag_weights(kernel, layer_id, name):
     """Tag kernel's weight Tensors with a weight_id for simulator dedup."""
@@ -183,6 +187,7 @@ def _build_layers(g, B, S, context_len, prev_out):
 
     for layer_id in range(N_LAYERS):
         ratio = COMPRESS_RATIOS[layer_id]
+        has_indexer = ratio == 4
         L = LayerMeta()
 
         # ── Input fan-out (residual + attention + optional compressor) ──
@@ -283,9 +288,17 @@ def _build_layers(g, B, S, context_len, prev_out):
         elif ratio == 4:
             k_sel += INDEX_TOPK
 
-        sa = SparseAttn(B, H, 1, S, k_sel, S_kv, HD, "bf16", kv_factor=1)
+        sa = SparseAttn(
+            B, H, 1, S, k_sel, S_kv, HD, "bf16", kv_factor=1,
+            indexer_s_kv=compressed_len if has_indexer else 0,
+            indexer_h=INDEX_H if has_indexer else 0,
+            indexer_hd=INDEX_HD if has_indexer else 0,
+        )
         sa.inputs = {"q": Tensor("bf16", (B, S, H * HD)),
                      "kv": Tensor("bf16", (B, S_kv, KV_DIM))}
+        if has_indexer:
+            sa.inputs["index_kv"] = Tensor(
+                "fp4", (B, compressed_len, INDEX_HD))
         sa.outputs = {"y": Tensor("bf16", (B, S, H * HD))}
         g.add_kernel(sa)
         g.add_data_edge(wq_b, sa, {"y": "q"})
@@ -311,17 +324,45 @@ def _build_layers(g, B, S, context_len, prev_out):
             g.add_data_edge(kv_win_slice, kv_concat, {"y": "a"})
             g.add_data_edge(comp_norm, kv_concat, {"y": "b"})
 
-            kv_persist_fan = Spawn(world=2)
+            kv_persist_fan = Spawn(world=3 if has_indexer else 2)
             kv_persist_fan.inputs = {
                 "x": Tensor("bf16", (B, S_kv, KV_DIM))}
             kv_persist_fan.outputs = {
                 "y": Tensor("bf16", (B, S_kv, KV_DIM)),
                 "y2": Tensor("bf16", (B, S_kv, KV_DIM)),
             }
+            if has_indexer:
+                kv_persist_fan.outputs["y3"] = Tensor(
+                    "bf16", (B, S_kv, KV_DIM))
             g.add_kernel(kv_persist_fan)
             g.add_data_edge(kv_concat, kv_persist_fan, {"y": "x"})
             g.add_data_edge(kv_persist_fan, sa, {"y": "kv"})
             L.kv_persist_fan = kv_persist_fan
+
+            if has_indexer:
+                index_cache_slice = Slice()
+                index_cache_slice.inputs = {
+                    "x": Tensor("bf16", (B, S_kv, KV_DIM))}
+                index_cache_slice.outputs = {
+                    "y": Tensor("fp4", (B, compressed_len, INDEX_HD))}
+                g.add_kernel(index_cache_slice)
+                g.add_data_edge(
+                    kv_persist_fan, index_cache_slice, {"y3": "x"})
+
+                index_cache_fan = Spawn(world=2)
+                index_cache_fan.inputs = {
+                    "x": Tensor("fp4", (B, compressed_len, INDEX_HD))}
+                index_cache_fan.outputs = {
+                    "y": Tensor("fp4", (B, compressed_len, INDEX_HD)),
+                    "y2": Tensor("fp4", (B, compressed_len, INDEX_HD)),
+                }
+                g.add_kernel(index_cache_fan)
+                g.add_data_edge(
+                    index_cache_slice, index_cache_fan, {"y": "x"})
+                g.add_data_edge(
+                    index_cache_fan, sa, {"y": "index_kv"})
+                L.index_cache_slice = index_cache_slice
+                L.index_cache_fan = index_cache_fan
 
             L.kv_win_slice = kv_win_slice
             L.kv_concat = kv_concat
@@ -500,6 +541,28 @@ def _build_decode_kv_cache_read(g, B, context_len, layers):
         layer.kv_cache_fan = cache_fan
         layer.kv_persist_fan = cache_fan
         kv_cache_reads.append(kv_read)
+
+        if ratio == 4:
+            index_len = context_len // ratio
+            index_read = ReadInput(B * index_len * INDEX_HD, "fp4")
+            index_read.inputs = {
+                "index_kv": Tensor("fp4", (B, index_len, INDEX_HD))}
+            index_read.outputs = {
+                "y": Tensor("fp4", (B, index_len, INDEX_HD))}
+            g.add_kernel(index_read)
+
+            index_fan = Spawn(world=2)
+            index_fan.inputs = {
+                "x": Tensor("fp4", (B, index_len, INDEX_HD))}
+            index_fan.outputs = {
+                "y": Tensor("fp4", (B, index_len, INDEX_HD)),
+                "y2": Tensor("fp4", (B, index_len, INDEX_HD)),
+            }
+            g.add_kernel(index_fan)
+            g.add_data_edge(index_read, index_fan, {"y": "x"})
+            g.add_data_edge(index_fan, layer.sa, {"y": "index_kv"})
+            layer.index_cache_read = index_read
+            layer.index_cache_fan = index_fan
     return kv_cache_reads
 
 
@@ -508,13 +571,15 @@ def _build_kv_persistence_barrier(
 ):
     """Keep every compact KV cache alive until the stage output is ready."""
     barrier = Nop()
-    barrier.inputs = {
-        f"kv{layer_id}": Tensor(
-            layer.kv_persist_fan.outputs["y2"].dtype,
-            layer.kv_persist_fan.outputs["y2"].shape,
-        )
-        for layer_id, layer in enumerate(layers)
-    }
+    barrier.inputs = {}
+    for layer_id, layer in enumerate(layers):
+        main_cache = layer.kv_persist_fan.outputs["y2"]
+        barrier.inputs[f"kv{layer_id}"] = Tensor(
+            main_cache.dtype, main_cache.shape)
+        if layer.index_cache_fan is not None:
+            index_cache = layer.index_cache_fan.outputs["y2"]
+            barrier.inputs[f"kv{layer_id}_index"] = Tensor(
+                index_cache.dtype, index_cache.shape)
     barrier.inputs[output_name] = Tensor(
         output_src.outputs["y"].dtype, output_src.outputs["y"].shape)
     barrier.outputs = {"done": Tensor("int32", (1,))}
@@ -523,6 +588,10 @@ def _build_kv_persistence_barrier(
     for layer_id, layer in enumerate(layers):
         g.add_data_edge(
             layer.kv_persist_fan, barrier, {"y2": f"kv{layer_id}"})
+        if layer.index_cache_fan is not None:
+            g.add_data_edge(
+                layer.index_cache_fan, barrier,
+                {"y2": f"kv{layer_id}_index"})
         layer.kv_persist_barrier = barrier
     g.add_data_edge(output_src, barrier, {"y": output_name})
     return barrier

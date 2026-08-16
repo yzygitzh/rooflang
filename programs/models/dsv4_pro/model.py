@@ -293,6 +293,9 @@ def _build_layers(g, B, S, context_len, prev_out):
             indexer_s_kv=compressed_len if has_indexer else 0,
             indexer_h=INDEX_H if has_indexer else 0,
             indexer_hd=INDEX_HD if has_indexer else 0,
+            causal=is_prefill,
+            causal_k_sel=(compressed_len
+                          if is_prefill and ratio == 128 else 0),
         )
         sa.inputs = {"q": Tensor("bf16", (B, S, H * HD)),
                      "kv": Tensor("bf16", (B, S_kv, KV_DIM))}

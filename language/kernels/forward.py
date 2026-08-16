@@ -287,7 +287,7 @@ class RoPE(Kernel):
 class Attn(Kernel):
     """Flash-style multi-head attention forward (no S² in HBM).
 
-    flops = 4·B·H·S_q·S_kv·Hd  (×0.5 if causal and S_q==S_kv).
+    flops = 4·B·H·S_q·S_kv·Hd (×0.5 for a triangular causal matrix).
     bytes (flash-tiled — K/V reused in SMEM):
         input_bytes  = (B·H·S_q·Hd + 2·B·H_kv·S_kv·Hd) · sizeof(dtype)
         weight_bytes = 0
@@ -296,16 +296,19 @@ class Attn(Kernel):
 
     def __init__(self, B: int, H: int, H_kv: int,
                  S_q: int, S_kv: int, Hd: int,
-                 dtype: str = "bf16", causal: bool = False):
+                 dtype: str = "bf16", causal: bool = False,
+                 triangular: bool | None = None):
         self.B, self.H, self.H_kv = B, H, H_kv
         self.S_q, self.S_kv, self.Hd = S_q, S_kv, Hd
         self.dtype_, self.causal = dtype, causal
+        self.triangular = (causal and S_q == S_kv
+                           if triangular is None else triangular)
         super().__init__()
 
     @property
     def flops(self) -> float:
         f = 4.0 * self.B * self.H * self.S_q * self.S_kv * self.Hd
-        if self.causal and self.S_q == self.S_kv:
+        if self.triangular:
             f *= 0.5
         return f
 
@@ -367,10 +370,13 @@ class StridedGemm(Kernel):
 class SparseAttn(Kernel):
     """Sparse attention with an optional fused sparse indexer.
 
-    Attention FLOPS are 4·B·H·S_q·k_sel·Hd.  When indexer_s_kv is nonzero,
-    the dominant FP4 index scoring and reduction work is added to the same
-    roofline unit.  The FP4 index cache remains an explicit input tensor, but
-    Top-K indices are internal transient data.
+    Attention FLOPS are 4·B·H·S_q·k_sel·Hd.  During causal prefill, only
+    the context-dependent ``causal_k_sel`` portion receives the 0.5 triangular
+    factor; fixed window/Top-K work remains unchanged.  When indexer_s_kv is
+    nonzero, the dominant FP4 index scoring and reduction work is added to the
+    same roofline unit and receives the causal factor as a whole.  The FP4
+    index cache remains an explicit input tensor, but Top-K indices are
+    internal transient data.
 
     The full main KV tensor remains resident, while ideal cross-query reuse
     reads at most min(S_kv, S_q·k_sel) positions.  input_read_fraction exposes
@@ -384,7 +390,8 @@ class SparseAttn(Kernel):
                  S_q: int, k_sel: int, S_kv: int, Hd: int,
                  dtype: str = "bf16", kv_factor: int = 2,
                  indexer_s_kv: int = 0, indexer_h: int = 0,
-                 indexer_hd: int = 0, indexer_dtype: str = "fp4"):
+                 indexer_hd: int = 0, indexer_dtype: str = "fp4",
+                 *, causal: bool = False, causal_k_sel: int = 0):
         self.B, self.H, self.H_kv = B, H, H_kv
         self.S_q, self.k_sel, self.S_kv, self.Hd = S_q, k_sel, S_kv, Hd
         self.dtype_ = dtype
@@ -393,15 +400,24 @@ class SparseAttn(Kernel):
         self.indexer_h = indexer_h
         self.indexer_hd = indexer_hd
         self.indexer_dtype = indexer_dtype
+        self.causal = causal
+        self.causal_k_sel = causal_k_sel
         super().__init__()
 
     @property
     def flops(self) -> float:
-        attention = 4.0 * self.B * self.H * self.S_q * self.k_sel * self.Hd
+        effective_k_sel = self.k_sel
+        indexer_factor = 1.0
+        if self.causal:
+            effective_k_sel -= 0.5 * self.causal_k_sel
+            indexer_factor = 0.5
+        attention = (4.0 * self.B * self.H * self.S_q
+                     * effective_k_sel * self.Hd)
         indexer_score = (2.0 * self.B * self.S_q * self.indexer_h
-                         * self.indexer_s_kv * self.indexer_hd)
+                         * self.indexer_s_kv * self.indexer_hd
+                         * indexer_factor)
         indexer_reduce = (3.0 * self.B * self.S_q * self.indexer_h
-                          * self.indexer_s_kv)
+                          * self.indexer_s_kv * indexer_factor)
         return attention + indexer_score + indexer_reduce
 
     def input_read_fraction(self, port: str) -> float:

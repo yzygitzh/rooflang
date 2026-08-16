@@ -753,6 +753,33 @@ def test_context_split_attention_uses_full_logical_kv(attn_cls):
             tensor.size_bytes for tensor in copy.inputs.values())
 
 
+@pytest.mark.parametrize("attn_cls", [Attn, SparseAttn])
+def test_context_split_preserves_causal_flop_factor(attn_cls):
+    kwargs = dict(B=1, H=8, H_kv=1, S_q=16, S_kv=16, Hd=64,
+                  dtype="bf16", causal=True)
+    if attn_cls is SparseAttn:
+        kwargs.update(
+            S_kv=12, k_sel=8, kv_factor=1,
+            indexer_s_kv=8, indexer_h=4, indexer_hd=8,
+            causal_k_sel=4)
+    kernel = attn_cls(**kwargs)
+    kv_width = 64 if attn_cls is SparseAttn else 2 * 64
+    kernel.inputs = {
+        "q": Tensor("bf16", (1, 16, 8 * 64)),
+        "kv": Tensor("bf16", (1, kwargs["S_kv"], kv_width)),
+    }
+    if attn_cls is SparseAttn:
+        kernel.inputs["index_kv"] = Tensor("fp4", (1, 8, 8))
+    kernel.outputs = {"y": Tensor("bf16", (1, 16, 8 * 64))}
+
+    _, copies, _ = context_split_prefill(kernel, N)
+
+    assert all(copy.causal for copy in copies)
+    if attn_cls is SparseAttn:
+        assert all(copy.causal_k_sel == 4 for copy in copies)
+    assert sum(copy.flops for copy in copies) == kernel.flops
+
+
 def test_context_split_dispatch_and_combine_port_axes():
     dispatch = TokenDispatch(32, 64, 8, 2)
     dispatch.inputs = {

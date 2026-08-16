@@ -275,6 +275,16 @@ class TestSparseAttn(TestKernelBase):
         with pytest.raises(ValueError, match="input_tensor_bytes"):
             graph.validate()
 
+    def test_causal_only_halves_context_dependent_sparse_work(self):
+        kernel = SparseAttn(
+            B=1, H=1, H_kv=1, S_q=8, k_sel=4, S_kv=6, Hd=1,
+            kv_factor=1, indexer_s_kv=4, indexer_h=1, indexer_hd=1,
+            causal=True, causal_k_sel=2)
+        attention_flops = 4.0 * 1 * 1 * 8 * (4 - 0.5 * 2) * 1
+        indexer_flops = (2.0 * 1 * 8 * 1 * 4 * 1
+                         + 3.0 * 1 * 8 * 1 * 4) * 0.5
+        assert kernel.flops == attention_flops + indexer_flops
+
 
 class TestElementwiseOpAdd(TestKernelBase):
     __test__ = True

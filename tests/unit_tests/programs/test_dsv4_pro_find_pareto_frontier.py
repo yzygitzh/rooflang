@@ -116,7 +116,7 @@ def test_case_enumeration_applies_batch_multipliers_and_limit():
     assert all(case.pp_partition == (61,) for case in cases)
 
 
-def test_default_batch_range_reaches_64_batches_per_gpu():
+def test_default_batch_range_reaches_128_batches_per_gpu():
     cases = list(enumerate_cases(
         workloads=["decode-8k"],
         hardware_names=["gb300"],
@@ -129,7 +129,7 @@ def test_default_batch_range_reaches_64_batches_per_gpu():
         maxima[config] = max(maxima.get(config, 0), case.batch_size)
 
     assert maxima
-    assert set(maxima.values()) == {8 * 64}
+    assert set(maxima.values()) == {8 * 128}
 
 
 def test_default_batch_range_includes_non_power_of_two_cap():
@@ -141,8 +141,10 @@ def test_default_batch_range_includes_non_power_of_two_cap():
         pp_degrees=[3],
     ))
 
-    assert max(case.batch_size for case in cases) == 48 * 64
-    assert any(case.batch_size == 48 * 64 for case in cases)
+    batches = {case.batch_size for case in cases}
+    assert max(batches) == 48 * 128
+    assert 4096 in batches
+    assert 48 * 128 in batches
 
 
 def test_parallel_config_enumeration_rejects_expert_and_compression_cases(
@@ -366,13 +368,13 @@ def test_gpu_activity_includes_bubbles_until_each_gpus_final_kernel():
         },
         duration_us=120.0)
 
-    assert metrics["total_gpu_elapsed_ms"] == 0.2
-    assert metrics["tokens_per_s_user_elapsed"] == 10 / 0.0001
-    assert metrics["tokens_per_s_user_overlapped"] == 10 / 0.000065
-    assert metrics["tokens_per_s_gpu_elapsed"] == 100 / 0.0002
-    assert metrics["compute_ratio"] == 110 / 200
-    assert metrics["communication_ratio"] == 70 / 200
-    assert metrics["tokens_per_s_gpu_overlapped"] == 100 / 0.00013
+    assert metrics["total_gpu_elapsed_ms"] == 0.24
+    assert metrics["tokens_per_s_user_elapsed"] == 10 / 0.00012
+    assert metrics["tokens_per_s_user_overlapped"] == 10 / 0.00008
+    assert metrics["tokens_per_s_gpu_elapsed"] == 100 / 0.00024
+    assert metrics["compute_ratio"] == 110 / 240
+    assert metrics["communication_ratio"] == 70 / 240
+    assert metrics["tokens_per_s_gpu_overlapped"] == 100 / 0.00016
     assert metrics["gpu_completion_fraction"] == 200 / (2 * 120)
 
 
@@ -410,6 +412,38 @@ def test_gpu_activity_attributes_contention_to_its_resource(
     assert metrics["compute_ratio"] == compute_ratio
     assert metrics["communication_ratio"] == communication_ratio
     assert metrics["tokens_per_s_gpu_overlapped"] == 1 / 0.00008
+
+
+def test_gpu_activity_uses_slowest_pipeline_stage():
+    gpus = [Compute(name=f"gpu{i}", kind="gpu") for i in range(6)]
+    kernels = [Nop() for _ in gpus]
+    durations = [200.0, 200.0, 200.0, 100.0, 100.0, 100.0]
+    start = 0.0
+    trace = []
+    for gpu, kernel, duration in zip(gpus, kernels, durations):
+        trace.append(SimpleNamespace(
+            kernel=kernel, device=gpu, start_us=start,
+            end_us=start + duration,
+            compute_time_us=duration, memory_time_us=0.0,
+            network_time_us=0.0, local_elapsed_time_us=duration,
+            network_elapsed_time_us=0.0,
+        ))
+        start += duration
+    result = SimpleNamespace(measurement_start_us=0.0, trace=trace)
+
+    metrics = _gpu_timing_metrics(
+        result, total_tokens=120, tokens_per_user=1, n_gpus=6,
+        included_kernels=set(kernels), duration_us=start,
+        stage_devices=tuple((gpu,) for gpu in gpus),
+    )
+
+    assert metrics["total_gpu_elapsed_ms"] == 1.2
+    assert metrics["tokens_per_s_user_elapsed"] == 1 / 0.0002
+    assert metrics["tokens_per_s_gpu_elapsed"] == 120 / 0.0012
+    assert metrics["tokens_per_s_gpu_overlapped"] == 120 / 0.0012
+    assert metrics["compute_ratio"] == 0.75
+    assert metrics["communication_ratio"] == 0.0
+    assert metrics["gpu_completion_fraction"] == 1 / 6
 
 
 def test_output_path_excludes_kv_persistence_barrier():
@@ -458,7 +492,10 @@ def test_run_case_success_for_prefill_and_decode(monkeypatch):
     sampling = Sampling(1, 1)
     graph = SimpleNamespace(kernels={sampling})
     declared = (graph, ["layer"], "emb", "read", ["kv"], "head")
-    monkeypatch.setattr(finder, "build_hardware", lambda *args: "hardware")
+    hardware = SimpleNamespace(nodes=[
+        Compute(name=f"gpu{i}", kind="gpu") for i in range(8)
+    ])
+    monkeypatch.setattr(finder, "build_hardware", lambda *args: hardware)
     monkeypatch.setattr(finder, "declare_model", lambda **kwargs: declared)
     optimizer_calls = []
     monkeypatch.setattr(

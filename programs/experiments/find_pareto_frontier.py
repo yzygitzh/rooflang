@@ -6,15 +6,18 @@ The two maximized Pareto metrics are:
 * tokens/s/user: one user's token throughput (S / TTFT for prefill and
   1 / TPOT for one-step decode).
 
-Each successful point also records tokens/s/user and tokens/s/GPU variants
-using each GPU's elapsed time from its first measured kernel through its final
-kernel. This includes internal dependency and resource-contention bubbles, but
-excludes leading and trailing idle time. Compute time is each kernel's
+Each successful point also records pipeline-steady-state tokens/s/user and
+tokens/s/GPU variants.  A GPU's active span runs from its first measured
+kernel through its final kernel, excluding leading and trailing idle time.
+Each pipeline stage runs from its earliest GPU start through its latest GPU
+completion, and the pipeline cycle is set by the slowest stage.  Compute time
+is each kernel's
 elapsed local compute/memory path after resource contention; communication
-time is only the elapsed network path exposed beyond that local path.
-Ideal-overlap variants additionally assume that, on each GPU, the shorter of
-total compute and exposed communication time can be completely hidden by the
-longer one.
+time is only the elapsed network path exposed beyond that local path.  The
+ratios use the full GPU pool over one slowest-stage cycle, so PP imbalance is
+reported as bubble.  Ideal-overlap variants additionally hide, independently
+on each GPU, the shorter of total compute and exposed communication time
+before selecting the slowest stage.
 
 The simulator executes and accounts for one batch.  Memory feasibility is
 then evaluated separately for each frontier: original uses one KV copy,
@@ -90,7 +93,7 @@ WORKLOADS = {
 }
 HARDWARE_NAMES = ("h200", "gh200", "b300", "gb300", "ascend950dt")
 GPU_COUNTS = (8, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512)
-MAX_BATCH_SIZE_PER_GPU = 64
+MAX_BATCH_SIZE_PER_GPU = 128
 THROUGHPUT_METRICS = {
     "original": ("tokens_per_s_user", "tokens_per_s_gpu"),
     "elapsed": (
@@ -351,13 +354,19 @@ def _output_path_kernels(graph) -> tuple[set, set]:
 
 def _gpu_timing_totals_us(
     result, n_gpus: int, included_kernels: set,
-) -> tuple[float, float, float, float]:
-    """Return elapsed and roofline-decomposed GPU-times.
+    stage_devices: Sequence[Sequence[Compute]] | None = None,
+) -> tuple[float, float, float, float, float]:
+    """Return bottleneck-stage and roofline-decomposed GPU-times.
 
     The simulator records the elapsed local compute/memory path and network
     path separately after resource contention.  Their overlap belongs to the
     local path; only the exposed network tail belongs to communication.  Time
     not covered by either path remains a dependency/scheduling bubble.
+
+    Stage duration covers its earliest GPU start through its latest GPU
+    completion.  The returned elapsed and overlapped times are the
+    slowest-stage duration multiplied by every physical GPU, so throughput
+    includes both rank skew and idle capacity in faster PP stages.
     """
     measurement_start = result.measurement_start_us
     first_start_by_gpu = {}
@@ -400,34 +409,65 @@ def _gpu_timing_totals_us(
         first_start_by_gpu[entry.device] = min(
             first_start_by_gpu.get(entry.device, start_us), start_us)
 
-    elapsed_time_us = 0.0
+    elapsed_by_gpu = {}
+    overlapped_by_gpu = {}
+    active_elapsed_time_us = 0.0
     compute_time_us = 0.0
     communication_time_us = 0.0
-    overlapped_time_us = 0.0
     for device, final_end_us in final_end_by_gpu.items():
         elapsed = final_end_us - first_start_by_gpu[device]
         compute = compute_time_by_gpu[device]
         communication = communication_time_by_gpu[device]
-        elapsed_time_us += elapsed
+        elapsed_by_gpu[device] = elapsed
+        overlapped_by_gpu[device] = elapsed - min(compute, communication)
+        active_elapsed_time_us += elapsed
         compute_time_us += compute
         communication_time_us += communication
-        overlapped_time_us += elapsed - min(compute, communication)
+
+    if stage_devices is None:
+        stage_devices = (tuple(final_end_by_gpu),)
+
+    def stage_span_us(devices, end_by_gpu):
+        active_devices = [
+            device for device in devices if device in end_by_gpu
+        ]
+        if not active_devices:
+            return 0.0
+        return (
+            max(end_by_gpu[device] for device in active_devices)
+            - min(first_start_by_gpu[device] for device in active_devices)
+        )
+
+    slowest_stage_time_us = max(
+        stage_span_us(devices, final_end_by_gpu)
+        for devices in stage_devices
+    )
+    overlapped_end_by_gpu = {
+        device: first_start_by_gpu[device] + overlapped
+        for device, overlapped in overlapped_by_gpu.items()
+    }
+    slowest_overlapped_stage_time_us = max(
+        stage_span_us(devices, overlapped_end_by_gpu)
+        for devices in stage_devices
+    )
     return (
-        elapsed_time_us,
+        slowest_stage_time_us * n_gpus,
         compute_time_us,
         communication_time_us,
-        overlapped_time_us,
+        slowest_overlapped_stage_time_us * n_gpus,
+        active_elapsed_time_us,
     )
 
 
 def _gpu_timing_metrics(
     result, total_tokens: int, tokens_per_user: int, n_gpus: int,
     included_kernels: set, duration_us: float,
+    stage_devices: Sequence[Sequence[Compute]] | None = None,
 ) -> dict:
-    """Calculate elapsed and ideal compute/comm-overlap throughput metrics."""
+    """Calculate slowest-stage and ideal-overlap throughput metrics."""
     elapsed_time_us, compute_time_us, communication_time_us, \
-        overlapped_time_us = _gpu_timing_totals_us(
-        result, n_gpus, included_kernels)
+        overlapped_time_us, active_elapsed_time_us = _gpu_timing_totals_us(
+        result, n_gpus, included_kernels, stage_devices)
     return {
         "tokens_per_s_user_elapsed": (
             tokens_per_user / (elapsed_time_us / n_gpus / 1e6)),
@@ -439,7 +479,7 @@ def _gpu_timing_metrics(
         "compute_ratio": compute_time_us / elapsed_time_us,
         "communication_ratio": communication_time_us / elapsed_time_us,
         "gpu_completion_fraction": (
-            elapsed_time_us / (n_gpus * duration_us)),
+            active_elapsed_time_us / (n_gpus * duration_us)),
         "total_gpu_elapsed_ms": elapsed_time_us / 1000,
     }
 
@@ -534,9 +574,17 @@ def run_case(case: Case) -> dict:
             "peak_ssd_gb_overlapped": _max_memory_gb(
                 overlapped_memory, "ssd"),
         })
+        gpu_devices = [
+            device for device in hardware.nodes
+            if isinstance(device, Compute) and device.kind == "gpu"
+        ]
+        stage_devices = tuple(
+            tuple(gpu_devices[stage * case.ep:(stage + 1) * case.ep])
+            for stage in range(pp_degree)
+        )
         record.update(_gpu_timing_metrics(
             result, total_tokens, tokens_per_user, case.n_gpus, output_path,
-            duration_us))
+            duration_us, stage_devices))
     except OOMError as error:
         record.update({
             "status": "oom",

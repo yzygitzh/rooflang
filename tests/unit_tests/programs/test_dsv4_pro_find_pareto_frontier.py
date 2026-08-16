@@ -1,5 +1,6 @@
 """Tests for the DSV4 Pro Pareto-frontier search driver."""
 
+import csv
 import json
 from types import SimpleNamespace
 
@@ -611,12 +612,15 @@ def test_read_jsonl_handles_missing_blank_valid_and_invalid(tmp_path):
 
 
 def test_write_outputs_handles_no_records(tmp_path):
+    (tmp_path / "pareto_frontier_elapsed.csv").write_text("stale")
+    (tmp_path / "pareto_frontier_overlapped.csv").write_text("stale")
+
     write_outputs(tmp_path, [])
 
     assert (tmp_path / "all_points.csv").read_text() == ""
     assert (tmp_path / "pareto_frontier.csv").read_text() == ""
-    assert (tmp_path / "pareto_frontier_elapsed.csv").read_text() == ""
-    assert (tmp_path / "pareto_frontier_overlapped.csv").read_text() == ""
+    assert not (tmp_path / "pareto_frontier_elapsed.csv").exists()
+    assert not (tmp_path / "pareto_frontier_overlapped.csv").exists()
     assert not list(tmp_path.glob("*.png"))
 
 
@@ -698,12 +702,21 @@ def test_write_outputs_honors_filtered_workloads(tmp_path):
         "memory_feasible_overlapped": True,
     }
 
+    (tmp_path / "pareto_frontier_elapsed.csv").write_text("stale")
+    (tmp_path / "pareto_frontier_overlapped.csv").write_text("stale")
+
     write_outputs(tmp_path, [record])
 
     assert (tmp_path / "all_points.csv").is_file()
     assert (tmp_path / "pareto_frontier.csv").is_file()
-    assert (tmp_path / "pareto_frontier_elapsed.csv").is_file()
-    assert (tmp_path / "pareto_frontier_overlapped.csv").is_file()
+    assert not (tmp_path / "pareto_frontier_elapsed.csv").exists()
+    assert not (tmp_path / "pareto_frontier_overlapped.csv").exists()
+    with (tmp_path / "pareto_frontier.csv").open() as file:
+        rows = list(csv.DictReader(file))
+    assert [(row["_plot_timing"], row["_plot_tokens_per_s_user"],
+             row["_plot_tokens_per_s_gpu"]) for row in rows] == [
+        ("overlapped", "15.0", "30.0"),
+    ]
     assert (tmp_path / "pareto_decode-8k.png").is_file()
     assert not (tmp_path / "pareto_decode-8k_elapsed.png").exists()
     assert not (tmp_path / "pareto_decode-8k_overlapped.png").exists()

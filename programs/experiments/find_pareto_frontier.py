@@ -718,21 +718,17 @@ def write_outputs(
     records: Sequence[dict],
     point_labels: bool = False,
 ) -> None:
-    """Write timing-specific CSVs and combined-projection frontier plots."""
+    """Write all points, the final frontier CSV, and frontier plots."""
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_csv(output_dir / "all_points.csv", records)
-    for timing, (user_metric, gpu_metric) in THROUGHPUT_METRICS.items():
-        frontiers = grouped_frontiers(
-            records, user_metric, gpu_metric,
-            MEMORY_FEASIBILITY_FIELDS[timing])
-        frontier_records = [
-            point for group in frontiers.values() for point in group
-        ]
-        suffix = "" if timing == "original" else f"_{timing}"
-        _write_csv(
-            output_dir / f"pareto_frontier{suffix}.csv",
-            frontier_records,
-        )
+    frontiers = _combined_plot_frontiers(records)
+    frontier_records = [
+        point for group in frontiers.values() for point in group
+    ]
+    _write_csv(output_dir / "pareto_frontier.csv", frontier_records)
+    for timing in ("elapsed", "overlapped"):
+        (output_dir / f"pareto_frontier_{timing}.csv").unlink(
+            missing_ok=True)
 
     for workload in WORKLOADS:
         for timing in ("elapsed", "overlapped"):
@@ -761,7 +757,6 @@ def write_outputs(
     ]
     rows = 1 if len(gpu_counts) <= 2 else 2
     columns = math.ceil(len(gpu_counts) / rows)
-    frontiers = _combined_plot_frontiers(records)
     for workload in workloads:
         x_limits, y_limits = _shared_axis_limits(
             frontiers, workload, gpu_counts, hardware_names,
@@ -805,8 +800,8 @@ def write_outputs(
             axis.set_ylim(y_limits)
             axis.tick_params(
                 axis="both", which="both", labelbottom=True, labelleft=True)
-            axis.set_xlabel("tokens/s/user (combined, log2)")
-            axis.set_ylabel("tokens/s/GPU (combined, log2)")
+            axis.set_xlabel("tokens/s/user")
+            axis.set_ylabel("tokens/s/GPU")
             axis.grid(True, which="both", alpha=0.25)
         for axis in flat_axes[len(gpu_counts):]:
             axis.axis("off")
@@ -818,7 +813,7 @@ def write_outputs(
         if handles:
             figure.legend(handles, labels, loc="lower right")
         figure.suptitle(
-            f"DSV4 Pro Pareto Frontier (combined): {workload}")
+            f"DSV4 Pro Pareto Frontier: {workload}")
         figure.tight_layout(rect=(0, 0.04, 1, 0.96))
         figure.savefig(output_dir / f"pareto_{workload}.png", dpi=160)
         plt.close(figure)

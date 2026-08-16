@@ -343,15 +343,17 @@ class SparseAttn(Kernel):
     backward costs 5 scalar FLOPs.  Both receive the causal factor during
     prefill.
     bytes (per-tensor read-once / write-once):
-        input_bytes  = (2·B·H·S_q·Hd
-                        + kv_factor·B·H_kv·S_q·effective_k_sel·Hd)
-                       · sizeof(dtype)
-        output_bytes = (B·H·S_q·Hd
-                        + kv_factor·B·H_kv·S_q·effective_k_sel·Hd)
-                       · sizeof(dtype)
+        input_bytes reads saved Q at ``q_dtype``, upstream dY at
+        ``out_dtype``, and selected KV at ``kv_dtype``.
+        output_bytes writes dQ at ``q_dtype`` and dKV at ``kv_dtype``.
     Indexer bytes additionally read quantized index Q/KV, head weights, and
     the upstream reduced-score gradient, then write dQ, dKV, and dWeights at
-    the activation dtype.
+    their corresponding activation dtypes.
+
+    ``dtype`` selects the device TFLOPS used for compute time.  Q, main KV,
+    and attention output storage may independently use ``q_dtype``,
+    ``kv_dtype``, and ``out_dtype``; each defaults to ``dtype`` for backward
+    compatibility.
     """
 
     def __init__(self, B: int, H: int, H_kv: int,
@@ -359,11 +361,17 @@ class SparseAttn(Kernel):
                  dtype: str = "bf16", kv_factor: int = 2,
                  indexer_s_kv: int = 0, indexer_h: int = 0,
                  indexer_hd: int = 0, indexer_dtype: str = "fp4",
-                 *, causal: bool = False, causal_k_sel: int = 0):
+                 *, q_dtype: str | None = None,
+                 kv_dtype: str | None = None,
+                 out_dtype: str | None = None,
+                 causal: bool = False, causal_k_sel: int = 0):
         self.B, self.H, self.H_kv = B, H, H_kv
         self.S_q, self.k_sel, self.Hd = S_q, k_sel, Hd
         self.dtype_ = dtype
         self.kv_factor = kv_factor
+        self.q_dtype = q_dtype or dtype
+        self.kv_dtype = kv_dtype or dtype
+        self.out_dtype = out_dtype or dtype
         self.indexer_s_kv = indexer_s_kv
         self.indexer_h = indexer_h
         self.indexer_hd = indexer_hd
@@ -399,28 +407,32 @@ class SparseAttn(Kernel):
             self.B * self.S_q * self.indexer_h * self.indexer_hd
             + self.B * self.indexer_s_kv * self.indexer_hd
         ) * dtype_bytes(self.indexer_dtype)
-        weights_and_grad = (
-            self.B * self.S_q * self.indexer_h
-            + self.B * self.S_q * self.indexer_s_kv
-        ) * dtype_bytes(self.dtype_)
-        return index_values + weights_and_grad
+        head_weights = (self.B * self.S_q * self.indexer_h
+                        * dtype_bytes(self.q_dtype))
+        reduced_score_grad = (self.B * self.S_q * self.indexer_s_kv
+                              * dtype_bytes(self.out_dtype))
+        return index_values + head_weights + reduced_score_grad
 
     @property
     def indexer_output_bytes(self) -> float:
-        return (
-            self.B * self.S_q * self.indexer_h * self.indexer_hd
-            + self.B * self.indexer_s_kv * self.indexer_hd
-            + self.B * self.S_q * self.indexer_h
-        ) * dtype_bytes(self.dtype_)
+        index_q_grad = (self.B * self.S_q * self.indexer_h
+                        * self.indexer_hd * dtype_bytes(self.q_dtype))
+        index_kv_grad = (self.B * self.indexer_s_kv * self.indexer_hd
+                         * dtype_bytes(self.kv_dtype))
+        head_weight_grad = (self.B * self.S_q * self.indexer_h
+                            * dtype_bytes(self.q_dtype))
+        return index_q_grad + index_kv_grad + head_weight_grad
 
     @property
     def input_bytes(self) -> float:
-        b = dtype_bytes(self.dtype_)
+        q_elements = self.B * self.H * self.S_q * self.Hd
+        kv_elements = (self.kv_factor * self.B * self.H_kv * self.S_q
+                       * self.effective_k_sel * self.Hd)
         main_attention = (
-            2 * self.B * self.H * self.S_q * self.Hd
-            + self.kv_factor * self.B * self.H_kv * self.S_q
-            * self.effective_k_sel * self.Hd
-        ) * b
+            q_elements * dtype_bytes(self.q_dtype)
+            + q_elements * dtype_bytes(self.out_dtype)
+            + kv_elements * dtype_bytes(self.kv_dtype)
+        )
         return main_attention + self.indexer_input_bytes
 
     @property
@@ -429,12 +441,13 @@ class SparseAttn(Kernel):
 
     @property
     def output_bytes(self) -> float:
-        b = dtype_bytes(self.dtype_)
+        q_elements = self.B * self.H * self.S_q * self.Hd
+        kv_elements = (self.kv_factor * self.B * self.H_kv * self.S_q
+                       * self.effective_k_sel * self.Hd)
         main_attention = (
-            self.B * self.H * self.S_q * self.Hd
-            + self.kv_factor * self.B * self.H_kv * self.S_q
-            * self.effective_k_sel * self.Hd
-        ) * b
+            q_elements * dtype_bytes(self.q_dtype)
+            + kv_elements * dtype_bytes(self.kv_dtype)
+        )
         return main_attention + self.indexer_output_bytes
 
 

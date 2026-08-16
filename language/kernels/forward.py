@@ -384,6 +384,10 @@ class SparseAttn(Kernel):
 
     kv_factor=2 for standard MHA (separate K/V caches);
     kv_factor=1 for MLA (shared latent read once from HBM).
+
+    ``dtype`` selects the device TFLOPS used for compute time.  Q, main KV,
+    and output storage may independently use ``q_dtype``, ``kv_dtype``, and
+    ``out_dtype``; each defaults to ``dtype`` for backward compatibility.
     """
 
     def __init__(self, B: int, H: int, H_kv: int,
@@ -391,11 +395,17 @@ class SparseAttn(Kernel):
                  dtype: str = "bf16", kv_factor: int = 2,
                  indexer_s_kv: int = 0, indexer_h: int = 0,
                  indexer_hd: int = 0, indexer_dtype: str = "fp4",
-                 *, causal: bool = False, causal_k_sel: int = 0):
+                 *, q_dtype: str | None = None,
+                 kv_dtype: str | None = None,
+                 out_dtype: str | None = None,
+                 causal: bool = False, causal_k_sel: int = 0):
         self.B, self.H, self.H_kv = B, H, H_kv
         self.S_q, self.k_sel, self.S_kv, self.Hd = S_q, k_sel, S_kv, Hd
         self.dtype_ = dtype
         self.kv_factor = kv_factor
+        self.q_dtype = q_dtype or dtype
+        self.kv_dtype = kv_dtype or dtype
+        self.out_dtype = out_dtype or dtype
         self.indexer_s_kv = indexer_s_kv
         self.indexer_h = indexer_h
         self.indexer_hd = indexer_hd
@@ -430,23 +440,23 @@ class SparseAttn(Kernel):
 
     @property
     def input_tensor_bytes(self) -> float:
-        b = dtype_bytes(self.dtype_)
         return (
-            (self.B * self.H * self.S_q * self.Hd
-             + self.kv_factor * self.B * self.H_kv
-             * self.S_kv * self.Hd) * b
+            self.B * self.H * self.S_q * self.Hd
+            * dtype_bytes(self.q_dtype)
+            + self.kv_factor * self.B * self.H_kv
+            * self.S_kv * self.Hd * dtype_bytes(self.kv_dtype)
             + self.B * self.indexer_s_kv * self.indexer_hd
             * dtype_bytes(self.indexer_dtype)
         )
 
     @property
     def input_bytes(self) -> float:
-        b = dtype_bytes(self.dtype_)
         main_kv_reads = min(self.S_kv, self.S_q * self.k_sel)
         return (
-            (self.B * self.H * self.S_q * self.Hd
-             + self.kv_factor * self.B * self.H_kv
-             * main_kv_reads * self.Hd) * b
+            self.B * self.H * self.S_q * self.Hd
+            * dtype_bytes(self.q_dtype)
+            + self.kv_factor * self.B * self.H_kv
+            * main_kv_reads * self.Hd * dtype_bytes(self.kv_dtype)
             + self.B * self.indexer_s_kv * self.indexer_hd
             * dtype_bytes(self.indexer_dtype)
         )
@@ -457,7 +467,8 @@ class SparseAttn(Kernel):
 
     @property
     def output_bytes(self) -> float:
-        return self.B * self.H * self.S_q * self.Hd * dtype_bytes(self.dtype_)
+        return (self.B * self.H * self.S_q * self.Hd
+                * dtype_bytes(self.out_dtype))
 
 
 class TokenDispatch(Kernel):

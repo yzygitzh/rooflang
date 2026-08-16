@@ -275,6 +275,29 @@ class TestSparseAttn(TestKernelBase):
         with pytest.raises(ValueError, match="input_tensor_bytes"):
             graph.validate()
 
+    def test_compute_q_kv_and_output_dtypes_are_independent(self):
+        kernel = SparseAttn(
+            B=1, H=2, H_kv=1, S_q=3, k_sel=2, S_kv=5, Hd=4,
+            dtype="fp8", kv_factor=1,
+            q_dtype="bf16", kv_dtype="fp8", out_dtype="bf16")
+        kernel.inputs = {
+            "q": Tensor("bf16", (1, 3, 8)),
+            "kv": Tensor("fp8", (1, 5, 4)),
+        }
+        kernel.outputs = {"y": Tensor("bf16", (1, 3, 8))}
+
+        assert kernel.dtype_ == "fp8"
+        assert kernel.q_dtype == "bf16"
+        assert kernel.kv_dtype == "fp8"
+        assert kernel.out_dtype == "bf16"
+        assert kernel.input_tensor_bytes == 3 * 8 * 2.0 + 5 * 4 * 1.0
+        assert kernel.input_bytes == 3 * 8 * 2.0 + 5 * 4 * 1.0
+        assert kernel.output_bytes == 3 * 8 * 2.0
+
+        graph = ComputeGraph()
+        graph.add_kernel(kernel)
+        graph.validate()
+
     def test_causal_only_halves_context_dependent_sparse_work(self):
         kernel = SparseAttn(
             B=1, H=1, H_kv=1, S_q=8, k_sel=4, S_kv=6, Hd=1,
@@ -426,6 +449,42 @@ class TestBwdSparseAttn(TestKernelBase):
     expected_input_bytes = (2 * 2 * 8 * 256 * 64 + 2 * 2 * 8 * 256 * 64 * 64) * 2.0
     expected_weight_bytes = 0.0
     expected_output_bytes = (2 * 8 * 256 * 64 + 2 * 2 * 8 * 256 * 64 * 64) * 2.0
+
+    def test_compute_q_kv_and_output_dtypes_are_independent(self):
+        k = backward.SparseAttn(
+            B=1, H=2, H_kv=1, S_q=3, k_sel=2, Hd=4,
+            dtype="fp8", kv_factor=1,
+            q_dtype="bf16", kv_dtype="fp8", out_dtype="bf16")
+
+        q_elements = 1 * 2 * 3 * 4
+        kv_elements = 1 * 1 * 3 * 2 * 4
+        assert k.dtype_ == "fp8"
+        assert k.q_dtype == "bf16"
+        assert k.kv_dtype == "fp8"
+        assert k.out_dtype == "bf16"
+        assert k.input_bytes == (
+            q_elements * 2.0 + q_elements * 2.0 + kv_elements * 1.0)
+        assert k.output_bytes == (
+            q_elements * 2.0 + kv_elements * 1.0)
+
+    def test_fused_indexer_respects_independent_dtypes(self):
+        k = backward.SparseAttn(
+            B=2, H=8, H_kv=1, S_q=4, k_sel=6, Hd=8,
+            dtype="fp8", kv_factor=1,
+            indexer_s_kv=10, indexer_h=3, indexer_hd=4,
+            indexer_dtype="fp4", q_dtype="bf16", kv_dtype="fp8",
+            out_dtype="bf16")
+
+        assert k.indexer_input_bytes == (
+            (2 * 4 * 3 * 4 + 2 * 10 * 4) * 0.5
+            + 2 * 4 * 3 * 2.0
+            + 2 * 4 * 10 * 2.0
+        )
+        assert k.indexer_output_bytes == (
+            2 * 4 * 3 * 4 * 2.0
+            + 2 * 10 * 4 * 1.0
+            + 2 * 4 * 3 * 2.0
+        )
 
     def test_causal_only_halves_context_dependent_sparse_work(self):
         k = backward.SparseAttn(

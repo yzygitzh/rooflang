@@ -125,6 +125,9 @@ def _context_split_attn_decode(kernel, n):
             indexer_h=kernel.indexer_h,
             indexer_hd=kernel.indexer_hd,
             indexer_dtype=kernel.indexer_dtype,
+            q_dtype=kernel.q_dtype,
+            kv_dtype=kernel.kv_dtype,
+            out_dtype=kernel.out_dtype,
             causal=kernel.causal,
             causal_k_sel=kernel.causal_k_sel // n)
         copy.inputs = {
@@ -329,14 +332,17 @@ def head_split(kernel, n):
                                   if kernel.indexer_h else 0),
                        indexer_hd=kernel.indexer_hd,
                        indexer_dtype=kernel.indexer_dtype,
+                       q_dtype=kernel.q_dtype,
+                       kv_dtype=kernel.kv_dtype,
+                       out_dtype=kernel.out_dtype,
                        causal=kernel.causal,
                        causal_k_sel=kernel.causal_k_sel)
-        c.inputs = {"q": Tensor(kernel.dtype_, shard_q_shape),
-                    "kv": Tensor(kernel.dtype_, kv_tensor.shape)}
+        c.inputs = {"q": Tensor(q_tensor.dtype, shard_q_shape),
+                    "kv": Tensor(kv_tensor.dtype, kv_tensor.shape)}
         if index_tensor is not None:
             c.inputs["index_kv"] = Tensor(
                 index_tensor.dtype, index_tensor.shape)
-        c.outputs = {"y": Tensor(kernel.dtype_, shard_q_shape)}
+        c.outputs = {"y": Tensor(out_tensor.dtype, shard_q_shape)}
         copies.append(c)
 
     next_comms = {"y": _make_gather(out_tensor, n, dim=-1)}
@@ -428,6 +434,9 @@ def _context_split_attn_prefill(kernel, n):
                 indexer_h=kernel.indexer_h,
                 indexer_hd=kernel.indexer_hd,
                 indexer_dtype=kernel.indexer_dtype,
+                q_dtype=kernel.q_dtype,
+                kv_dtype=kernel.kv_dtype,
+                out_dtype=kernel.out_dtype,
                 causal=kernel.causal,
                 causal_k_sel=kernel.causal_k_sel)
         else:
@@ -581,6 +590,9 @@ def _make_batch_copy(kernel, n):
                        indexer_h=kernel.indexer_h,
                        indexer_hd=kernel.indexer_hd,
                        indexer_dtype=kernel.indexer_dtype,
+                       q_dtype=kernel.q_dtype,
+                       kv_dtype=kernel.kv_dtype,
+                       out_dtype=kernel.out_dtype,
                        causal=kernel.causal,
                        causal_k_sel=kernel.causal_k_sel)
     elif isinstance(kernel, Spawn):

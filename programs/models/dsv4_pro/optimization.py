@@ -22,6 +22,7 @@ from rooflang.programs.models.dsv4_pro.config import (
 _PREFILL_PARALLEL_FIELDS = (
     "bridge", "attn_norm", "attn_fan", "comp", "comp_norm",
     "wq_a", "q_norm", "wq_b", "wkv", "kv_norm", "kv_concat",
+    "kv_cache_quant",
     "kv_persist_fan", "index_cache_slice", "index_cache_fan", "sa",
     "kv_win_slice", "wo_a", "wo_b", "attn_add", "ffn_bridge", "ffn_norm",
     "ffn_fan", "gate", "dispatch", "combine", "sw_up", "sw_down",

@@ -189,6 +189,19 @@ def test_declare_model_marks_kv_cache_for_persistence(monkeypatch):
     assert isinstance(barrier, Nop)
     assert set(barrier.inputs) == {"kv0", "kv1", "prefill_output"}
     assert barrier.outputs["done"].shape == (1,)
+    for layer_id, layer in enumerate(layers):
+        assert layer.sa.dtype_ == "fp8"
+        assert layer.sa.q_dtype == "bf16"
+        assert layer.sa.kv_dtype == "fp8"
+        assert layer.sa.out_dtype == "bf16"
+        assert layer.sa.inputs["q"].dtype == "bf16"
+        assert layer.sa.inputs["kv"].dtype == "fp8"
+        assert layer.sa.outputs["y"].dtype == "bf16"
+        assert isinstance(layer.kv_cache_quant, Slice)
+        assert layer.kv_cache_quant.inputs["x"].dtype == "bf16"
+        assert layer.kv_cache_quant.outputs["y"].dtype == "fp8"
+        assert layer.kv_persist_fan.outputs["y2"].dtype == "fp8"
+        assert barrier.inputs[f"kv{layer_id}"].dtype == "fp8"
 
 
 def test_declare_decode_uses_read_only_persistent_kv(monkeypatch):
@@ -215,6 +228,14 @@ def test_declare_decode_uses_read_only_persistent_kv(monkeypatch):
         assert any(edge.src is layer.kv_norm
                    for edge in graph._in_edges(layer.kv_sink))
         assert layer.sa.S_kv == kv_reads[layer_id].outputs["y"].shape[1]
+        assert layer.sa.dtype_ == "fp8"
+        assert layer.sa.inputs["q"].dtype == "bf16"
+        assert layer.sa.inputs["kv"].dtype == "fp8"
+        assert layer.sa.outputs["y"].dtype == "bf16"
+        assert kv_reads[layer_id].inputs["kv"].dtype == "fp8"
+        assert kv_reads[layer_id].outputs["y"].dtype == "fp8"
+        assert layer.kv_cache_fan.outputs["y2"].dtype == "fp8"
+        assert barrier.inputs[f"kv{layer_id}"].dtype == "fp8"
         assert any(edge.src is layer.kv_cache_fan and edge.dst is barrier
                    for edge in graph._in_edges(barrier))
 
@@ -230,6 +251,7 @@ def test_ratio4_prefill_fuses_indexer_and_persists_fp4_cache(monkeypatch):
     barrier = layer.kv_persist_barrier
 
     assert isinstance(layer.index_cache_slice, Slice)
+    assert layer.index_cache_slice.inputs["x"].dtype == "fp8"
     assert layer.index_cache_slice.outputs["y"].dtype == "fp4"
     assert layer.index_cache_slice.outputs["y"].shape == (8, 2048, 128)
     assert layer.index_cache_fan.outputs["y2"].shape == (8, 2048, 128)
@@ -245,6 +267,10 @@ def test_ratio4_prefill_fuses_indexer_and_persists_fp4_cache(monkeypatch):
     attention = layer._sa_cp_dp_copies
     assert len(attention) == 8
     assert all(copy.inputs["index_kv"].shape == (2, 2048, 128)
+               and copy.dtype_ == "fp8"
+               and copy.inputs["q"].dtype == "bf16"
+               and copy.inputs["kv"].dtype == "fp8"
+               and copy.outputs["y"].dtype == "bf16"
                and copy.indexer_s_kv == 2048
                for copy in attention)
     barriers = layer._kv_persist_barrier_cp_dp_copies
@@ -273,6 +299,7 @@ def test_ratio4_decode_shards_and_preloads_fp4_index_cache(monkeypatch):
     layer = layers[2]
 
     assert len(kv_reads) == 3
+    assert kv_reads[2].inputs["kv"].dtype == "fp8"
     assert layer.index_cache_read.inputs["index_kv"].dtype == "fp4"
     assert layer.index_cache_read.inputs["index_kv"].shape == (8, 2048, 128)
     assert layer.sa.input_read_fraction("kv") == Fraction(9, 17)
@@ -287,6 +314,10 @@ def test_ratio4_decode_shards_and_preloads_fp4_index_cache(monkeypatch):
     attention = layer._decode_copies["cp_dp"]["sa"]
     assert len(attention) == 8
     assert all(copy.S_kv == 1088 and copy.k_sel == 576
+               and copy.dtype_ == "fp8"
+               and copy.inputs["q"].dtype == "bf16"
+               and copy.inputs["kv"].dtype == "fp8"
+               and copy.outputs["y"].dtype == "bf16"
                and copy.indexer_s_kv == 1024
                and copy.inputs["index_kv"].shape == (2, 1024, 128)
                and copy.input_read_fraction("kv") == Fraction(9, 17)

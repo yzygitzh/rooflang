@@ -77,6 +77,7 @@ class LayerMeta:
     comp_concat: Kernel = None
     comp_norm: Kernel = None
     kv_concat: Kernel = None
+    kv_cache_quant: Kernel = None
     sa: Kernel = None
     wo_a: Kernel = None
     wo_b: Kernel = None
@@ -289,16 +290,17 @@ def _build_layers(g, B, S, context_len, prev_out):
             k_sel += INDEX_TOPK
 
         sa = SparseAttn(
-            B, H, 1, S, k_sel, S_kv, HD, "bf16", kv_factor=1,
+            B, H, 1, S, k_sel, S_kv, HD, "fp8", kv_factor=1,
             indexer_s_kv=compressed_len if has_indexer else 0,
             indexer_h=INDEX_H if has_indexer else 0,
             indexer_hd=INDEX_HD if has_indexer else 0,
+            q_dtype="bf16", kv_dtype="fp8", out_dtype="bf16",
             causal=is_prefill,
             causal_k_sel=(compressed_len
                           if is_prefill and ratio == 128 else 0),
         )
         sa.inputs = {"q": Tensor("bf16", (B, S, H * HD)),
-                     "kv": Tensor("bf16", (B, S_kv, KV_DIM))}
+                     "kv": Tensor("fp8", (B, S_kv, KV_DIM))}
         if has_indexer:
             sa.inputs["index_kv"] = Tensor(
                 "fp4", (B, compressed_len, INDEX_HD))
@@ -327,25 +329,34 @@ def _build_layers(g, B, S, context_len, prev_out):
             g.add_data_edge(kv_win_slice, kv_concat, {"y": "a"})
             g.add_data_edge(comp_norm, kv_concat, {"y": "b"})
 
+            kv_cache_quant = Slice()
+            kv_cache_quant.inputs = {
+                "x": Tensor("bf16", (B, S_kv, KV_DIM))}
+            kv_cache_quant.outputs = {
+                "y": Tensor("fp8", (B, S_kv, KV_DIM))}
+            g.add_kernel(kv_cache_quant)
+            g.add_data_edge(kv_concat, kv_cache_quant, {"y": "x"})
+            L.kv_cache_quant = kv_cache_quant
+
             kv_persist_fan = Spawn(world=3 if has_indexer else 2)
             kv_persist_fan.inputs = {
-                "x": Tensor("bf16", (B, S_kv, KV_DIM))}
+                "x": Tensor("fp8", (B, S_kv, KV_DIM))}
             kv_persist_fan.outputs = {
-                "y": Tensor("bf16", (B, S_kv, KV_DIM)),
-                "y2": Tensor("bf16", (B, S_kv, KV_DIM)),
+                "y": Tensor("fp8", (B, S_kv, KV_DIM)),
+                "y2": Tensor("fp8", (B, S_kv, KV_DIM)),
             }
             if has_indexer:
                 kv_persist_fan.outputs["y3"] = Tensor(
-                    "bf16", (B, S_kv, KV_DIM))
+                    "fp8", (B, S_kv, KV_DIM))
             g.add_kernel(kv_persist_fan)
-            g.add_data_edge(kv_concat, kv_persist_fan, {"y": "x"})
+            g.add_data_edge(kv_cache_quant, kv_persist_fan, {"y": "x"})
             g.add_data_edge(kv_persist_fan, sa, {"y": "kv"})
             L.kv_persist_fan = kv_persist_fan
 
             if has_indexer:
                 index_cache_slice = Slice()
                 index_cache_slice.inputs = {
-                    "x": Tensor("bf16", (B, S_kv, KV_DIM))}
+                    "x": Tensor("fp8", (B, S_kv, KV_DIM))}
                 index_cache_slice.outputs = {
                     "y": Tensor("fp4", (B, compressed_len, INDEX_HD))}
                 g.add_kernel(index_cache_slice)
@@ -523,19 +534,19 @@ def _build_decode_kv_cache_read(g, B, context_len, layers):
         ratio = COMPRESS_RATIOS[layer_id]
         cache_len = min(WINDOW, context_len) + context_len // ratio
 
-        kv_read = ReadInput(B * cache_len * KV_DIM, "bf16")
+        kv_read = ReadInput(B * cache_len * KV_DIM, "fp8")
         kv_read.inputs = {
-            "kv": Tensor("bf16", (B, cache_len, KV_DIM))}
+            "kv": Tensor("fp8", (B, cache_len, KV_DIM))}
         kv_read.outputs = {
-            "y": Tensor("bf16", (B, cache_len, KV_DIM))}
+            "y": Tensor("fp8", (B, cache_len, KV_DIM))}
         g.add_kernel(kv_read)
 
         cache_fan = Spawn(world=2)
         cache_fan.inputs = {
-            "x": Tensor("bf16", (B, cache_len, KV_DIM))}
+            "x": Tensor("fp8", (B, cache_len, KV_DIM))}
         cache_fan.outputs = {
-            "y": Tensor("bf16", (B, cache_len, KV_DIM)),
-            "y2": Tensor("bf16", (B, cache_len, KV_DIM)),
+            "y": Tensor("fp8", (B, cache_len, KV_DIM)),
+            "y2": Tensor("fp8", (B, cache_len, KV_DIM)),
         }
         g.add_kernel(cache_fan)
         g.add_data_edge(kv_read, cache_fan, {"y": "x"})

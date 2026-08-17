@@ -116,35 +116,34 @@ def test_case_enumeration_applies_batch_multipliers_and_limit():
     assert all(case.pp_partition == (61,) for case in cases)
 
 
-def test_default_batch_range_reaches_128_batches_per_gpu():
+def test_default_batch_range_contains_only_each_sweeps_minimum():
     cases = list(enumerate_cases(
         workloads=["decode-8k"],
         hardware_names=["gb300"],
         gpu_counts=[8],
         batch_multipliers=None,
     ))
-    maxima = {}
+
+    assert cases
     for case in cases:
-        config = (case.cp, case.dp, case.ep, case.pp_partition)
-        maxima[config] = max(maxima.get(config, 0), case.batch_size)
-
-    assert maxima
-    assert set(maxima.values()) == {8 * 128}
+        config = ParallelConfig(
+            case.cp, case.dp, case.ep, case.pp_partition)
+        assert case.batch_size == batch_quantum("decode", 8192, config)
 
 
-def test_default_batch_range_includes_non_power_of_two_cap():
+def test_explicit_max_batch_size_bounds_default_finite_sweep():
     cases = list(enumerate_cases(
         workloads=["decode-8k"],
         hardware_names=["gb300"],
         gpu_counts=[48],
         batch_multipliers=None,
         pp_degrees=[3],
+        max_batch_size=12000,
     ))
 
     batches = {case.batch_size for case in cases}
-    assert max(batches) == 48 * 128
+    assert max(batches) == 12000
     assert 4096 in batches
-    assert 48 * 128 in batches
 
 
 def test_parallel_config_enumeration_rejects_expert_and_compression_cases(
@@ -203,6 +202,23 @@ def test_eight_gpu_node_hardware_rejects_partial_nodes(name):
 def test_build_hardware_rejects_unknown_name():
     with pytest.raises(ValueError, match="Unknown hardware"):
         build_hardware("unknown", 8)
+
+
+def test_ordered_gpus_ignores_hardware_node_set_order():
+    gpus = [
+        Compute(name=f"n{node}-gpu-{rank}", kind="gpu")
+        for node in range(2)
+        for rank in range(8)
+    ]
+    hardware = SimpleNamespace(nodes=frozenset(reversed(gpus)))
+
+    ordered = finder._ordered_gpus(hardware)
+
+    assert [device.name for device in ordered] == [
+        f"n{node}-gpu-{rank}"
+        for node in range(2)
+        for rank in range(8)
+    ]
 
 
 def test_peak_memory_filters_component_kind():
@@ -493,7 +509,7 @@ def test_run_case_success_for_prefill_and_decode(monkeypatch):
     graph = SimpleNamespace(kernels={sampling})
     declared = (graph, ["layer"], "emb", "read", ["kv"], "head")
     hardware = SimpleNamespace(nodes=[
-        Compute(name=f"gpu{i}", kind="gpu") for i in range(8)
+        Compute(name=f"n0-gpu-{i}", kind="gpu") for i in range(8)
     ])
     monkeypatch.setattr(finder, "build_hardware", lambda *args: hardware)
     monkeypatch.setattr(finder, "declare_model", lambda **kwargs: declared)
@@ -900,6 +916,128 @@ def test_run_parallel_skips_completed_and_records_worker_errors(
     ]
 
 
+def test_run_parallel_orders_each_sweep_and_stops_after_oom(
+        tmp_path, monkeypatch):
+    cases = [
+        Case("prefill-8k", hardware, 8, 8, 1, 8, 8, (61,))
+        for hardware in ("b300", "gb300")
+    ]
+    submitted = []
+
+    class Future:
+        def __init__(self, case):
+            self.case = case
+
+        def result(self):
+            status = (
+                "oom" if (
+                    self.case.hardware == "b300"
+                    and self.case.batch_size == 16
+                    or self.case.hardware == "gb300"
+                    and self.case.batch_size == 32
+                )
+                else "ok"
+            )
+            return {"case_id": self.case.case_id, "status": status}
+
+    class Executor:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def submit(self, function, case):
+            submitted.append(case)
+            return Future(case)
+
+    monkeypatch.setattr(finder, "ProcessPoolExecutor", Executor)
+    monkeypatch.setattr(
+        finder, "wait",
+        lambda futures, return_when: ({next(iter(futures))}, set()),
+    )
+
+    records = _run_parallel(
+        reversed(cases), workers=2, raw_path=tmp_path / "raw.jsonl",
+        completed_ids=set(), grow_batches=True,
+    )
+
+    b300_batches = [
+        case.batch_size for case in submitted if case.hardware == "b300"
+    ]
+    gb300_batches = [
+        case.batch_size for case in submitted if case.hardware == "gb300"
+    ]
+    assert {case.hardware for case in submitted[:2]} == {"b300", "gb300"}
+    assert b300_batches == [8, 16]
+    assert gb300_batches == [8, 16, 32]
+    assert len(records) == 5
+
+
+def test_dynamic_sweep_resumes_after_completed_batches():
+    first = Case("prefill-8k", "b300", 8, 8, 1, 8, 8, (61,))
+    second = Case("prefill-8k", "b300", 8, 16, 1, 8, 8, (61,))
+
+    sweeps = finder._pending_sweeps(
+        [first], {first.case_id, second.case_id}, grow_batches=True)
+
+    assert len(sweeps) == 1
+    assert [case.batch_size for case in sweeps[0]] == [32]
+
+
+def test_run_parallel_uses_existing_oom_as_resume_cutoff(
+        tmp_path, monkeypatch):
+    cases = [Case("prefill-8k", "b300", 8, 8, 1, 8, 8, (61,))]
+    submitted = []
+
+    class Executor(_Executor):
+        def submit(self, function, case):
+            submitted.append(case)
+            return _Future(case)
+
+    monkeypatch.setattr(finder, "ProcessPoolExecutor", Executor)
+    monkeypatch.setattr(
+        finder, "wait",
+        lambda futures, return_when: ({next(iter(futures))}, set()),
+    )
+
+    records = _run_parallel(
+        cases, workers=2, raw_path=tmp_path / "raw.jsonl",
+        completed_ids=set(),
+        baseline_oom_cutoffs={
+            ("prefill-8k", "b300", 8, 1, 8, 8, (61,)): 16,
+        },
+        grow_batches=True,
+    )
+
+    assert [case.batch_size for case in submitted] == [8]
+    assert len(records) == 1
+
+
+def test_run_parallel_does_not_stop_after_worker_error(tmp_path, monkeypatch):
+    cases = [
+        Case("prefill-8k", "h200", 8, batch_size, 1, 8, 8, (61,))
+        for batch_size in (8, 16)
+    ]
+    monkeypatch.setattr(finder, "ProcessPoolExecutor", _Executor)
+    monkeypatch.setattr(
+        finder, "wait",
+        lambda futures, return_when: ({next(iter(futures))}, set()),
+    )
+
+    records = _run_parallel(
+        cases, workers=2, raw_path=tmp_path / "raw.jsonl",
+        completed_ids=set(),
+    )
+
+    assert [record["status"] for record in records] == [
+        "worker_error", "worker_error",
+    ]
+
+
 def test_main_validates_workers_and_batch_multipliers(tmp_path):
     with pytest.raises(ValueError, match="workers"):
         finder.main(["--output-dir", str(tmp_path), "--workers", "0"])
@@ -941,7 +1079,7 @@ def test_main_dry_run_and_overwrite(tmp_path, monkeypatch, capsys):
         "--output-dir", str(tmp_path), "--overwrite", "--dry-run",
     ]) == 0
     assert not raw_path.exists()
-    assert "Generated 1 cases" in capsys.readouterr().out
+    assert "Generated 1 batch sweeps" in capsys.readouterr().out
 
 
 def test_main_resumes_and_optionally_reruns_failures(tmp_path, monkeypatch):
@@ -959,8 +1097,11 @@ def test_main_resumes_and_optionally_reruns_failures(tmp_path, monkeypatch):
     parallel_calls = []
     monkeypatch.setattr(
         finder, "_run_parallel",
-        lambda cases, workers, raw_path, completed_ids:
-        parallel_calls.append(set(completed_ids)) or [
+        lambda cases, workers, raw_path, completed_ids,
+        baseline_oom_cutoffs, grow_batches:
+        parallel_calls.append(
+            (set(completed_ids), dict(baseline_oom_cutoffs), grow_batches))
+        or [
             {"case_id": "new", "status": "ok"}
         ],
     )
@@ -972,12 +1113,16 @@ def test_main_resumes_and_optionally_reruns_failures(tmp_path, monkeypatch):
     )
 
     assert finder.main(["--output-dir", str(tmp_path)]) == 0
-    assert parallel_calls[-1] == {cases[0].case_id, cases[1].case_id}
+    assert parallel_calls[-1] == (
+        {cases[0].case_id, cases[1].case_id},
+        {("prefill-8k", "h200", 8, 1, 8, 8, (61,)): 8},
+        True,
+    )
     assert writes[-1] == (
         existing + [{"case_id": "new", "status": "ok"}], False)
 
     assert finder.main([
         "--output-dir", str(tmp_path), "--rerun-failures", "--no-plot",
     ]) == 0
-    assert parallel_calls[-1] == {cases[0].case_id}
+    assert parallel_calls[-1] == ({cases[0].case_id}, {}, True)
     assert len(writes) == 1

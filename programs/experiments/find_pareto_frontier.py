@@ -29,7 +29,10 @@ keep their simulated peak usage.
 
 Each simulation is an independent process.  Results are appended to JSONL as
 they finish, so an interrupted search can resume without repeating completed
-cases.
+cases.  Cases with the same workload, hardware, GPU count, and parallel
+configuration form a sweep: batches run in ascending order, and the first
+baseline OOM skips all larger batches in that sweep.  Independent sweeps
+remain parallel up to the requested worker limit.
 
 CSV files retain separate original, elapsed, and ideal-overlap frontiers.  A
 plot combines the feasible points from all three timing/memory projections and
@@ -45,8 +48,9 @@ import math
 import multiprocessing
 import os
 import time
+from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
@@ -93,7 +97,6 @@ WORKLOADS = {
 }
 HARDWARE_NAMES = ("h200", "gh200", "b300", "gb300", "ascend950dt")
 GPU_COUNTS = (8, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512)
-MAX_BATCH_SIZE_PER_GPU = 128
 THROUGHPUT_METRICS = {
     "original": ("tokens_per_s_user", "tokens_per_s_gpu"),
     "elapsed": (
@@ -141,6 +144,45 @@ class Case:
             f"b{self.batch_size}:cp{self.cp}:dp{self.dp}:ep{self.ep}:"
             f"pp{partition}"
         )
+
+
+SweepKey = tuple[str, str, int, int, int, int, tuple[int, ...]]
+
+
+def _sweep_key(case: Case) -> SweepKey:
+    return (
+        case.workload,
+        case.hardware,
+        case.n_gpus,
+        case.cp,
+        case.dp,
+        case.ep,
+        case.pp_partition,
+    )
+
+
+def _record_sweep_key(record: dict) -> SweepKey:
+    return (
+        record["workload"],
+        record["hardware"],
+        record["n_gpus"],
+        record["cp"],
+        record["dp"],
+        record["ep"],
+        tuple(record["pp_partition"]),
+    )
+
+
+def _next_pending_batch(
+    case: Case,
+    completed_ids: set[str],
+    oom_cutoff: int | None,
+) -> Case | None:
+    while oom_cutoff is None or case.batch_size < oom_cutoff:
+        if case.case_id not in completed_ids:
+            return case
+        case = replace(case, batch_size=case.batch_size * 2)
+    return None
 
 
 def _divisors(value: int) -> list[int]:
@@ -199,6 +241,8 @@ def batch_quantum(stage: str, seq_prefill: int, config: ParallelConfig) -> int:
 
 def _default_batch_multipliers(maximum: int) -> list[int]:
     """Double from one and include an exact, possibly non-power-of-two cap."""
+    if maximum < 1:
+        return []
     multipliers = []
     multiplier = 1
     while multiplier < maximum:
@@ -223,17 +267,18 @@ def enumerate_cases(
                 n_gpus, seq_prefill, pp_degrees)
             for config in configs:
                 quantum = batch_quantum(stage, seq_prefill, config)
-                batch_limit = n_gpus * MAX_BATCH_SIZE_PER_GPU
-                if max_batch_size is not None:
-                    batch_limit = min(batch_limit, max_batch_size)
-                multipliers = batch_multipliers
-                if multipliers is None:
+                if batch_multipliers is not None:
+                    multipliers = batch_multipliers
+                elif max_batch_size is not None:
                     multipliers = _default_batch_multipliers(
-                        n_gpus * MAX_BATCH_SIZE_PER_GPU // quantum)
+                        max_batch_size // quantum)
+                else:
+                    multipliers = (1,)
                 batches = sorted({
                     quantum * multiplier
                     for multiplier in multipliers
-                    if quantum * multiplier <= batch_limit
+                    if max_batch_size is None
+                    or quantum * multiplier <= max_batch_size
                 })
                 for hardware in hardware_names:
                     for batch_size in batches:
@@ -280,6 +325,20 @@ def build_hardware(name: str, n_gpus: int):
             n_gpus, maximum=Ascend950DTCluster.max_scope, quantum=8)
         return Ascend950DTCluster(ub_scope=scope, n_nodes=n_gpus // scope)
     raise ValueError(f"Unknown hardware: {name}")
+
+
+def _ordered_gpus(hardware) -> list[Compute]:
+    """Return GPUs in the node/rank order used by model optimizers."""
+    return sorted(
+        (
+            device for device in hardware.nodes
+            if isinstance(device, Compute) and device.kind == "gpu"
+        ),
+        key=lambda device: (
+            int(device.name.split("-", 1)[0][1:]),
+            int(device.name.rsplit("-", 1)[1]),
+        ),
+    )
 
 
 def _max_memory_gb(memory_usage, kind: str) -> float:
@@ -574,10 +633,7 @@ def run_case(case: Case) -> dict:
             "peak_ssd_gb_overlapped": _max_memory_gb(
                 overlapped_memory, "ssd"),
         })
-        gpu_devices = [
-            device for device in hardware.nodes
-            if isinstance(device, Compute) and device.kind == "gpu"
-        ]
+        gpu_devices = _ordered_gpus(hardware)
         stage_devices = tuple(
             tuple(gpu_devices[stage * case.ep:(stage + 1) * case.ep])
             for stage in range(pp_degree)
@@ -867,13 +923,49 @@ def write_outputs(
         plt.close(figure)
 
 
+def _pending_sweeps(
+    cases: Iterable[Case],
+    completed_ids: set[str],
+    baseline_oom_cutoffs: dict[SweepKey, int] | None = None,
+    grow_batches: bool = False,
+) -> deque[deque[Case]]:
+    """Group pending cases into batch-ordered, baseline-OOM-capped sweeps."""
+    baseline_oom_cutoffs = baseline_oom_cutoffs or {}
+    grouped_cases: dict[SweepKey, list[Case]] = {}
+    for case in cases:
+        grouped_cases.setdefault(_sweep_key(case), []).append(case)
+
+    sweeps = deque()
+    for key, sweep_cases in grouped_cases.items():
+        sweep_cases.sort(key=lambda case: case.batch_size)
+        oom_cutoff = baseline_oom_cutoffs.get(key)
+        if grow_batches:
+            candidate = _next_pending_batch(
+                sweep_cases[0], completed_ids, oom_cutoff)
+            pending = deque([candidate] if candidate is not None else [])
+        else:
+            pending = deque(
+                case for case in sweep_cases
+                if case.case_id not in completed_ids
+                and (oom_cutoff is None or case.batch_size < oom_cutoff)
+            )
+        if pending:
+            sweeps.append(pending)
+    return sweeps
+
+
 def _run_parallel(
     cases: Iterable[Case],
     workers: int,
     raw_path: Path,
     completed_ids: set[str],
+    baseline_oom_cutoffs: dict[SweepKey, int] | None = None,
+    grow_batches: bool = False,
 ) -> list[dict]:
-    pending_cases = (case for case in cases if case.case_id not in completed_ids)
+    baseline_oom_cutoffs = baseline_oom_cutoffs or {}
+    sweeps = _pending_sweeps(
+        cases, completed_ids, baseline_oom_cutoffs, grow_batches)
+
     new_records = []
     submitted = completed = 0
     context = multiprocessing.get_context("spawn")
@@ -883,23 +975,18 @@ def _run_parallel(
     ) as executor:
         futures = {}
 
-        def submit_next() -> bool:
+        def submit_next(sweep) -> None:
             nonlocal submitted
-            try:
-                case = next(pending_cases)
-            except StopIteration:
-                return False
-            futures[executor.submit(run_case, case)] = case
+            case = sweep.popleft()
+            futures[executor.submit(run_case, case)] = (case, sweep)
             submitted += 1
-            return True
 
-        for _ in range(workers * 2):
-            if not submit_next():
-                break
+        for _ in range(min(workers, len(sweeps))):
+            submit_next(sweeps.popleft())
         while futures:
             done, _ = wait(futures, return_when=FIRST_COMPLETED)
             for future in done:
-                case = futures.pop(future)
+                case, sweep = futures.pop(future)
                 try:
                     record = future.result()
                 except BaseException as error:
@@ -918,7 +1005,21 @@ def _run_parallel(
                     f"{case.case_id} ({record.get('wall_time_s', 0):.1f}s)",
                     flush=True,
                 )
-                submit_next()
+                if record.get("status") == "oom":
+                    sweep.clear()
+                elif grow_batches and not sweep:
+                    oom_cutoff = baseline_oom_cutoffs.get(_sweep_key(case))
+                    candidate = _next_pending_batch(
+                        replace(case, batch_size=case.batch_size * 2),
+                        completed_ids,
+                        oom_cutoff,
+                    )
+                    if candidate is not None:
+                        sweep.append(candidate)
+                if sweep:
+                    submit_next(sweep)
+                elif sweeps:
+                    submit_next(sweeps.popleft())
     return new_records
 
 
@@ -950,7 +1051,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--batch-multipliers", nargs="+", type=int,
         help="Explicit multipliers applied to each configuration's legal "
-             "batch quantum; by default doubles through 64 batches/GPU",
+             "batch quantum; by default doubles until baseline OOM",
     )
     parser.add_argument(
         "--pp-degrees", nargs="+", type=int,
@@ -1017,22 +1118,56 @@ def main(argv: Sequence[str] | None = None) -> int:
         pp_degrees=args.pp_degrees,
         max_batch_size=args.max_batch_size,
     ))
+    grow_batches = (
+        args.batch_multipliers is None and args.max_batch_size is None)
     if args.dry_run:
-        print(f"Generated {len(cases)} cases")
+        if grow_batches:
+            print(
+                f"Generated {len(cases)} batch sweeps; "
+                "each doubles until baseline OOM"
+            )
+        else:
+            print(f"Generated {len(cases)} cases")
         return 0
 
+    latest_records = {record["case_id"]: record for record in existing}
     completed_ids = {
-        record["case_id"] for record in existing
+        case_id for case_id, record in latest_records.items()
         if not args.rerun_failures or record.get("status") == "ok"
     }
-    remaining = sum(case.case_id not in completed_ids for case in cases)
-    print(
-        f"Generated {len(cases)} cases; {remaining} remaining; "
-        f"workers={args.workers}",
-        flush=True,
+    cases_by_id = {case.case_id: case for case in cases}
+    baseline_oom_cutoffs = {}
+    if not args.rerun_failures:
+        for case_id, record in latest_records.items():
+            if record.get("status") != "oom":
+                continue
+            try:
+                key = _record_sweep_key(record)
+                batch_size = record["batch_size"]
+            except KeyError:
+                case = cases_by_id.get(case_id)
+                if case is None:
+                    continue
+                key = _sweep_key(case)
+                batch_size = case.batch_size
+            baseline_oom_cutoffs[key] = min(
+                batch_size,
+                baseline_oom_cutoffs.get(key, batch_size),
+            )
+    remaining = sum(
+        len(sweep) for sweep in
+        _pending_sweeps(
+            cases, completed_ids, baseline_oom_cutoffs, grow_batches)
     )
+    if grow_batches:
+        progress = (
+            f"Generated {len(cases)} batch sweeps; {remaining} ready")
+    else:
+        progress = f"Generated {len(cases)} cases; {remaining} remaining"
+    print(f"{progress}; workers={args.workers}", flush=True)
     new_records = _run_parallel(
-        cases, args.workers, raw_path, completed_ids)
+        cases, args.workers, raw_path, completed_ids,
+        baseline_oom_cutoffs, grow_batches)
     records = existing + new_records
     if not args.no_plot:
         write_outputs(

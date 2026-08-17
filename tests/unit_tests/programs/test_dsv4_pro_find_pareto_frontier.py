@@ -654,6 +654,27 @@ def test_combined_plot_frontiers_exclude_infeasible_projection():
         "original", "overlapped"]
 
 
+def test_combined_plot_frontiers_can_use_raw_latency_for_every_projection():
+    record = {
+        "case_id": "one", "status": "ok", "workload": "decode-8k",
+        "hardware": "b300", "n_gpus": 8,
+        "tokens_per_s_user": 10.0, "tokens_per_s_gpu": 10.0,
+        "tokens_per_s_user_elapsed": 8.0,
+        "tokens_per_s_gpu_elapsed": 20.0,
+        "tokens_per_s_user_overlapped": 20.0,
+        "tokens_per_s_gpu_overlapped": 8.0,
+        "memory_feasible_elapsed": True,
+        "memory_feasible_overlapped": True,
+    }
+
+    frontier = finder._combined_plot_frontiers(
+        [record], raw_latency=True)[("decode-8k", "b300", 8)]
+
+    assert [point["_plot_timing"] for point in frontier] == ["elapsed"]
+    assert frontier[0][finder._PLOT_USER_METRIC] == 10.0
+    assert frontier[0][finder._PLOT_GPU_METRIC] == 20.0
+
+
 def test_read_jsonl_handles_missing_blank_valid_and_invalid(tmp_path):
     path = tmp_path / "records.jsonl"
     assert _read_jsonl(path) == []
@@ -774,6 +795,19 @@ def test_write_outputs_honors_filtered_workloads(tmp_path):
     assert not (tmp_path / "pareto_decode-8k_elapsed.png").exists()
     assert not (tmp_path / "pareto_decode-8k_overlapped.png").exists()
     assert not (tmp_path / "pareto_prefill-8k.png").exists()
+
+    raw_latency_dir = tmp_path / "raw_latency"
+    write_outputs(raw_latency_dir, [record], raw_latency=True)
+    assert (raw_latency_dir / "pareto_frontier_raw_latency.csv").is_file()
+    assert (raw_latency_dir / "pareto_decode-8k_raw_latency.png").is_file()
+    assert not (raw_latency_dir / "pareto_frontier.csv").exists()
+    assert not (raw_latency_dir / "pareto_decode-8k.png").exists()
+    with (raw_latency_dir / "pareto_frontier_raw_latency.csv").open() as file:
+        rows = list(csv.DictReader(file))
+    assert [(row["_plot_timing"], row["_plot_tokens_per_s_user"],
+             row["_plot_tokens_per_s_gpu"]) for row in rows] == [
+        ("overlapped", "10.0", "30.0"),
+    ]
 
 
 def test_write_outputs_point_labels_are_opt_in(tmp_path, monkeypatch):
@@ -1059,14 +1093,15 @@ def test_main_plot_only_requires_and_writes_existing_records(
     writes = []
     monkeypatch.setattr(
         finder, "write_outputs",
-        lambda output_dir, records, point_labels=False:
-        writes.append((output_dir, records, point_labels)),
+        lambda output_dir, records, point_labels=False, raw_latency=False:
+        writes.append((output_dir, records, point_labels, raw_latency)),
     )
 
     assert finder.main([
         "--output-dir", str(tmp_path), "--plot-only", "--point-labels",
+        "--raw-latency",
     ]) == 0
-    assert writes == [(tmp_path, [record], True)]
+    assert writes == [(tmp_path, [record], True, True)]
 
 
 def test_main_dry_run_and_overwrite(tmp_path, monkeypatch, capsys):
@@ -1108,8 +1143,8 @@ def test_main_resumes_and_optionally_reruns_failures(tmp_path, monkeypatch):
     writes = []
     monkeypatch.setattr(
         finder, "write_outputs",
-        lambda output_dir, records, point_labels=False:
-        writes.append((list(records), point_labels)),
+        lambda output_dir, records, point_labels=False, raw_latency=False:
+        writes.append((list(records), point_labels, raw_latency)),
     )
 
     assert finder.main(["--output-dir", str(tmp_path)]) == 0
@@ -1119,7 +1154,7 @@ def test_main_resumes_and_optionally_reruns_failures(tmp_path, monkeypatch):
         True,
     )
     assert writes[-1] == (
-        existing + [{"case_id": "new", "status": "ok"}], False)
+        existing + [{"case_id": "new", "status": "ok"}], False, False)
 
     assert finder.main([
         "--output-dir", str(tmp_path), "--rerun-failures", "--no-plot",

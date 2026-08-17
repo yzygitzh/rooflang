@@ -710,10 +710,13 @@ def grouped_frontiers(
 
 def _combined_plot_frontiers(
     records: Sequence[dict],
+    raw_latency: bool = False,
 ) -> dict[tuple, list[dict]]:
     """Merge all feasible timing/memory projections before Pareto filtering."""
     groups = {}
     for timing, (user_metric, gpu_metric) in THROUGHPUT_METRICS.items():
+        if raw_latency:
+            user_metric = "tokens_per_s_user"
         memory_feasible_field = MEMORY_FEASIBILITY_FIELDS[timing]
         for record in records:
             if record.get("status") != "ok":
@@ -821,15 +824,18 @@ def write_outputs(
     output_dir: Path,
     records: Sequence[dict],
     point_labels: bool = False,
+    raw_latency: bool = False,
 ) -> None:
     """Write all points, the final frontier CSV, and frontier plots."""
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_csv(output_dir / "all_points.csv", records)
-    frontiers = _combined_plot_frontiers(records)
+    frontiers = _combined_plot_frontiers(records, raw_latency=raw_latency)
     frontier_records = [
         point for group in frontiers.values() for point in group
     ]
-    _write_csv(output_dir / "pareto_frontier.csv", frontier_records)
+    suffix = "_raw_latency" if raw_latency else ""
+    _write_csv(
+        output_dir / f"pareto_frontier{suffix}.csv", frontier_records)
     for timing in ("elapsed", "overlapped"):
         (output_dir / f"pareto_frontier_{timing}.csv").unlink(
             missing_ok=True)
@@ -919,7 +925,8 @@ def write_outputs(
         figure.suptitle(
             f"DSV4 Pro Pareto Frontier: {workload}")
         figure.tight_layout(rect=(0, 0.04, 1, 0.96))
-        figure.savefig(output_dir / f"pareto_{workload}.png", dpi=160)
+        figure.savefig(
+            output_dir / f"pareto_{workload}{suffix}.png", dpi=160)
         plt.close(figure)
 
 
@@ -1085,6 +1092,11 @@ def _parser() -> argparse.ArgumentParser:
         "--point-labels", action="store_true",
         help="Label Pareto points with batch size and parallelism",
     )
+    parser.add_argument(
+        "--raw-latency", action="store_true",
+        help="Use end-to-end tokens/s/user for every timing projection and "
+             "suffix outputs with _raw_latency",
+    )
     return parser
 
 
@@ -1107,7 +1119,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not existing:
             raise ValueError(f"No records found in {raw_path}")
         write_outputs(
-            args.output_dir, existing, point_labels=args.point_labels)
+            args.output_dir, existing, point_labels=args.point_labels,
+            raw_latency=args.raw_latency)
         return 0
 
     cases = list(enumerate_cases(
@@ -1171,7 +1184,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     records = existing + new_records
     if not args.no_plot:
         write_outputs(
-            args.output_dir, records, point_labels=args.point_labels)
+            args.output_dir, records, point_labels=args.point_labels,
+            raw_latency=args.raw_latency)
     return 0
 
 

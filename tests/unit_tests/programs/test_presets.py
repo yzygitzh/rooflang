@@ -11,6 +11,10 @@ from rooflang.programs.presets.b300 import B300Cluster, B300SuperChip
 from rooflang.programs.presets.gb300 import GB300Cluster, GB300SuperChip
 from rooflang.programs.presets.gh200 import GH200Cluster, GH200SuperChip
 from rooflang.programs.presets.h200 import H200Cluster, H200SuperChip
+from rooflang.programs.presets.rtx6000d import (
+    RTX6000DCluster,
+    RTX6000DSuperChip,
+)
 
 
 class TestB300AggregateOverride:
@@ -723,5 +727,139 @@ class TestAscend950DTSuperChip:
         assert pcie.src_to_dst_bandwidth_gbs == 512.0
         assert dram.src_to_dst_bandwidth_gbs == 665.6
         assert uboe.src_to_dst_bandwidth_gbs == 800.0
+        assert ssd.src_to_dst_bandwidth_gbs == 112.0
+        assert ssd.dst_to_src_bandwidth_gbs == 56.0
+
+
+@pytest.mark.parametrize(
+    "preset", [RTX6000DCluster, RTX6000DSuperChip])
+@pytest.mark.parametrize("eth_scope", [0, 7, 9, 1025])
+def test_rtx6000d_rejects_invalid_eth_scope(preset, eth_scope):
+    with pytest.raises(ValueError, match="eth_scope"):
+        preset(eth_scope=eth_scope)
+
+
+@pytest.mark.parametrize(
+    "preset", [RTX6000DCluster, RTX6000DSuperChip])
+@pytest.mark.parametrize("eth_scope", [8, 1032])
+def test_rtx6000d_accepts_eth_scope_values(preset, eth_scope):
+    assert preset(eth_scope=eth_scope).eth_scope == eth_scope
+
+
+class TestRTX6000DCluster:
+    def test_eth_scope_controls_component_counts(self):
+        hw = RTX6000DCluster(eth_scope=8)
+
+        assert hw.eth_scope == 8
+        assert sum(component.kind == "gpu" for component in hw.nodes) == 8
+        assert sum(component.kind == "cpu" for component in hw.nodes) == 2
+        assert sum(component.kind == "hbm" for component in hw.nodes) == 8
+        assert sum(component.kind == "dram" for component in hw.nodes) == 2
+        assert sum(component.kind == "ssd" for component in hw.nodes) == 8
+        assert not any(component.name == "scaleout-eth-switch"
+                       for component in hw.nodes)
+
+    def test_gpu_specs_and_links(self):
+        hw = RTX6000DCluster(eth_scope=8)
+        components = {component.name: component for component in hw.nodes}
+        gpu = components["n0-nvidia-rtx-6000d-0"]
+        cpu = components["n0-intel-xeon-6767p-0"]
+
+        assert gpu.tflops == {
+            "fp4": 593.0, "fp8": 296.0,
+            "bf16": 148.0, "fp16": 148.0, "fp32": 74.0,
+        }
+        assert components["n0-gddr7-0"].capacity_gb == 84.0
+
+        gddr = hw.find_fabric(gpu, components["n0-gddr7-0"])
+        ethernet = hw.find_fabric(
+            gpu, components["n0-eth-supernode-switch"])
+        pcie = hw.find_fabric(cpu, gpu)
+
+        assert gddr.src_to_dst_bandwidth_gbs == 1398.0
+        assert ethernet.src_to_dst_bandwidth_gbs == 100.0
+        assert ethernet.dst_to_src_bandwidth_gbs == 100.0
+        assert pcie.src_to_dst_bandwidth_gbs == 64.0
+        assert pcie.dst_to_src_bandwidth_gbs == 64.0
+
+    def test_reuses_ascend_host_and_storage_specs(self):
+        hw = RTX6000DCluster(eth_scope=8)
+        components = {component.name: component for component in hw.nodes}
+
+        for cpu_index in range(2):
+            cpu = components[f"n0-intel-xeon-6767p-{cpu_index}"]
+            dram = components[f"n0-ddr5-{cpu_index}"]
+            fabric = hw.find_fabric(cpu, dram)
+            assert cpu.tflops == {
+                "bf16": 255.29, "fp16": 255.29, "int8": 511.18,
+            }
+            assert dram.capacity_gb == 1536.0
+            assert fabric.src_to_dst_bandwidth_gbs == 332.8
+
+        qpi = hw.find_fabric(
+            components["n0-intel-xeon-6767p-0"],
+            components["n0-intel-xeon-6767p-1"])
+        assert qpi.src_to_dst_bandwidth_gbs == 192.0
+
+        for index in range(8):
+            ssd = components[f"n0-ssd-{index}"]
+            cpu = components[f"n0-intel-xeon-6767p-{index // 4}"]
+            fabric = hw.find_fabric(ssd, cpu)
+            assert ssd.capacity_gb == 256000.0
+            assert fabric.src_to_dst_bandwidth_gbs == 14.0
+            assert fabric.dst_to_src_bandwidth_gbs == 7.0
+
+    def test_aggregate_bandwidth(self):
+        hw = RTX6000DCluster(eth_scope=8)
+        gpus = [component for component in hw.nodes
+                if component.kind == "gpu"]
+
+        assert hw.find_aggregate_bandwidth(gpus[:1]) == float("inf")
+        assert hw.find_aggregate_bandwidth(gpus[:2]) == 100.0
+        assert hw.find_aggregate_bandwidth(gpus) == 100.0
+
+    def test_rejects_cross_node_aggregate_bandwidth(self):
+        hw = RTX6000DCluster(eth_scope=8, n_nodes=2)
+        gpus = [component for component in hw.nodes
+                if component.kind == "gpu"]
+
+        with pytest.raises(ValueError, match="scale-out"):
+            hw.find_aggregate_bandwidth([gpus[0], gpus[8]])
+
+
+class TestRTX6000DSuperChip:
+    def test_aggregates_requested_eth_scope(self):
+        hw = RTX6000DSuperChip(eth_scope=8)
+        components = {component.name: component for component in hw.nodes}
+
+        assert hw.eth_scope == 8
+        assert components["n0-nvidia-rtx-6000d-0"].tflops == {
+            "fp4": 4744.0, "fp8": 2368.0,
+            "bf16": 1184.0, "fp16": 1184.0, "fp32": 592.0,
+        }
+        assert components["n0-intel-xeon-6767p-0"].tflops == {
+            "bf16": 510.58, "fp16": 510.58, "int8": 1022.36,
+        }
+        assert components["n0-gddr7-0"].capacity_gb == 672.0
+        assert components["n0-ddr5-0"].capacity_gb == 3072.0
+        assert components["n0-ssd"].capacity_gb == 2048000.0
+        assert not any("eth-supernode-switch" in component.name
+                       for component in hw.nodes)
+        assert "scaleout-eth-switch" not in components
+
+    def test_aggregates_bandwidths(self):
+        hw = RTX6000DSuperChip(eth_scope=8)
+        components = {component.name: component for component in hw.nodes}
+        gpu = components["n0-nvidia-rtx-6000d-0"]
+        cpu = components["n0-intel-xeon-6767p-0"]
+
+        gddr = hw.find_fabric(gpu, components["n0-gddr7-0"])
+        pcie = hw.find_fabric(cpu, gpu)
+        dram = hw.find_fabric(cpu, components["n0-ddr5-0"])
+        ssd = hw.find_fabric(components["n0-ssd"], cpu)
+
+        assert gddr.src_to_dst_bandwidth_gbs == 11184.0
+        assert pcie.src_to_dst_bandwidth_gbs == 512.0
+        assert dram.src_to_dst_bandwidth_gbs == 665.6
         assert ssd.src_to_dst_bandwidth_gbs == 112.0
         assert ssd.dst_to_src_bandwidth_gbs == 56.0

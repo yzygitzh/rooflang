@@ -454,7 +454,7 @@ def test_gpu_activity_uses_slowest_pipeline_stage():
     )
 
     assert metrics["total_gpu_elapsed_ms"] == 1.2
-    assert metrics["tokens_per_s_user_elapsed"] == 1 / 0.0002
+    assert metrics["tokens_per_s_user_elapsed"] == 1 / 0.0009
     assert metrics["tokens_per_s_gpu_elapsed"] == 120 / 0.0012
     assert metrics["tokens_per_s_gpu_overlapped"] == 120 / 0.0012
     assert metrics["compute_ratio"] == 0.75

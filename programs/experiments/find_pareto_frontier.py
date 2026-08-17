@@ -529,7 +529,7 @@ def _gpu_timing_metrics(
         result, n_gpus, included_kernels, stage_devices)
     return {
         "tokens_per_s_user_elapsed": (
-            tokens_per_user / (elapsed_time_us / n_gpus / 1e6)),
+            tokens_per_user / (duration_us / 1e6)),
         "tokens_per_s_user_overlapped": (
             tokens_per_user / (overlapped_time_us / n_gpus / 1e6)),
         "tokens_per_s_gpu_elapsed": total_tokens / (elapsed_time_us / 1e6),

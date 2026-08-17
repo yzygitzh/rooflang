@@ -373,11 +373,9 @@ def _project_memory(result, concurrent_batches: int) -> dict[Memory, float]:
     return projected
 
 
-def _concurrent_kv_batches(stage: str, pp_degree: int) -> tuple[int, int]:
-    """Return elapsed/overlapped KV copies for the selected stage."""
-    if stage == "prefill":
-        return 1, 2
-    return pp_degree, pp_degree * 2
+def _concurrent_kv_batches(stage: str, pp_degree: int) -> int:
+    """Return the number of concurrent persistent KV cache copies."""
+    return 1 if stage == "prefill" else pp_degree
 
 
 def _memory_feasible(memory_usage) -> bool:
@@ -527,11 +525,14 @@ def _gpu_timing_metrics(
     elapsed_time_us, compute_time_us, communication_time_us, \
         overlapped_time_us, active_elapsed_time_us = _gpu_timing_totals_us(
         result, n_gpus, included_kernels, stage_devices)
+    pp_degree = len(stage_devices) if stage_devices is not None else 1
+    user_elapsed_time_us = elapsed_time_us / n_gpus * pp_degree
+    user_overlapped_time_us = overlapped_time_us / n_gpus * pp_degree
     return {
         "tokens_per_s_user_elapsed": (
-            tokens_per_user / (duration_us / 1e6)),
+            tokens_per_user / (user_elapsed_time_us / 1e6)),
         "tokens_per_s_user_overlapped": (
-            tokens_per_user / (overlapped_time_us / n_gpus / 1e6)),
+            tokens_per_user / (user_overlapped_time_us / 1e6)),
         "tokens_per_s_gpu_elapsed": total_tokens / (elapsed_time_us / 1e6),
         "tokens_per_s_gpu_overlapped": (
             total_tokens / (overlapped_time_us / 1e6)),
@@ -608,30 +609,29 @@ def run_case(case: Case) -> dict:
         })
         kv_cache_memory = _kv_cache_memory(result)
         pp_degree = len(case.pp_partition)
-        elapsed_batches, overlapped_batches = _concurrent_kv_batches(
+        concurrent_batches = _concurrent_kv_batches(
             stage, pp_degree)
-        elapsed_memory = _project_memory(result, elapsed_batches)
-        overlapped_memory = _project_memory(result, overlapped_batches)
+        projected_memory = _project_memory(result, concurrent_batches)
         record.update({
-            "concurrent_batches_elapsed": elapsed_batches,
-            "concurrent_batches_overlapped": overlapped_batches,
+            "concurrent_batches_elapsed": concurrent_batches,
+            "concurrent_batches_overlapped": concurrent_batches,
             "kv_cache_hbm_gb": _max_memory_gb(kv_cache_memory, "hbm"),
             "kv_cache_ssd_gb": _max_memory_gb(kv_cache_memory, "ssd"),
-            "memory_feasible_elapsed": _memory_feasible(elapsed_memory),
+            "memory_feasible_elapsed": _memory_feasible(projected_memory),
             "memory_feasible_overlapped": _memory_feasible(
-                overlapped_memory),
+                projected_memory),
             "peak_hbm_gb_elapsed": _max_memory_gb(
-                elapsed_memory, "hbm"),
+                projected_memory, "hbm"),
             "peak_dram_gb_elapsed": _max_memory_gb(
-                elapsed_memory, "dram"),
+                projected_memory, "dram"),
             "peak_ssd_gb_elapsed": _max_memory_gb(
-                elapsed_memory, "ssd"),
+                projected_memory, "ssd"),
             "peak_hbm_gb_overlapped": _max_memory_gb(
-                overlapped_memory, "hbm"),
+                projected_memory, "hbm"),
             "peak_dram_gb_overlapped": _max_memory_gb(
-                overlapped_memory, "dram"),
+                projected_memory, "dram"),
             "peak_ssd_gb_overlapped": _max_memory_gb(
-                overlapped_memory, "ssd"),
+                projected_memory, "ssd"),
         })
         gpu_devices = _ordered_gpus(hardware)
         stage_devices = tuple(
@@ -710,13 +710,10 @@ def grouped_frontiers(
 
 def _combined_plot_frontiers(
     records: Sequence[dict],
-    raw_latency: bool = False,
 ) -> dict[tuple, list[dict]]:
     """Merge all feasible timing/memory projections before Pareto filtering."""
     groups = {}
     for timing, (user_metric, gpu_metric) in THROUGHPUT_METRICS.items():
-        if raw_latency:
-            user_metric = "tokens_per_s_user"
         memory_feasible_field = MEMORY_FEASIBILITY_FIELDS[timing]
         for record in records:
             if record.get("status") != "ok":
@@ -824,18 +821,15 @@ def write_outputs(
     output_dir: Path,
     records: Sequence[dict],
     point_labels: bool = False,
-    raw_latency: bool = False,
 ) -> None:
     """Write all points, the final frontier CSV, and frontier plots."""
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_csv(output_dir / "all_points.csv", records)
-    frontiers = _combined_plot_frontiers(records, raw_latency=raw_latency)
+    frontiers = _combined_plot_frontiers(records)
     frontier_records = [
         point for group in frontiers.values() for point in group
     ]
-    suffix = "_raw_latency" if raw_latency else ""
-    _write_csv(
-        output_dir / f"pareto_frontier{suffix}.csv", frontier_records)
+    _write_csv(output_dir / "pareto_frontier.csv", frontier_records)
     for timing in ("elapsed", "overlapped"):
         (output_dir / f"pareto_frontier_{timing}.csv").unlink(
             missing_ok=True)
@@ -926,7 +920,7 @@ def write_outputs(
             f"DSV4 Pro Pareto Frontier: {workload}")
         figure.tight_layout(rect=(0, 0.04, 1, 0.96))
         figure.savefig(
-            output_dir / f"pareto_{workload}{suffix}.png", dpi=160)
+            output_dir / f"pareto_{workload}.png", dpi=160)
         plt.close(figure)
 
 
@@ -1092,11 +1086,6 @@ def _parser() -> argparse.ArgumentParser:
         "--point-labels", action="store_true",
         help="Label Pareto points with batch size and parallelism",
     )
-    parser.add_argument(
-        "--raw-latency", action="store_true",
-        help="Use end-to-end tokens/s/user for every timing projection and "
-             "suffix outputs with _raw_latency",
-    )
     return parser
 
 
@@ -1119,8 +1108,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not existing:
             raise ValueError(f"No records found in {raw_path}")
         write_outputs(
-            args.output_dir, existing, point_labels=args.point_labels,
-            raw_latency=args.raw_latency)
+            args.output_dir, existing, point_labels=args.point_labels)
         return 0
 
     cases = list(enumerate_cases(
@@ -1184,8 +1172,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     records = existing + new_records
     if not args.no_plot:
         write_outputs(
-            args.output_dir, records, point_labels=args.point_labels,
-            raw_latency=args.raw_latency)
+            args.output_dir, records, point_labels=args.point_labels)
     return 0
 
 

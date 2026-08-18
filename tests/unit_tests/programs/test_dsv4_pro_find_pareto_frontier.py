@@ -850,6 +850,54 @@ def test_write_outputs_shows_plain_ticks_on_every_subplot(
                        for label in (*xlabels, *ylabels))
 
 
+def test_write_outputs_merges_legends_and_keeps_hardware_colors(
+        tmp_path, monkeypatch):
+    import matplotlib.pyplot as plt
+
+    figures = []
+    original_subplots = plt.subplots
+
+    def capture_subplots(*args, **kwargs):
+        figure, axes = original_subplots(*args, **kwargs)
+        figures.append((figure, axes))
+        return figure, axes
+
+    monkeypatch.setattr(plt, "subplots", capture_subplots)
+    records = []
+    for n_gpus, hardware in (
+        (8, "rtx6000d"),
+        (16, "h200"),
+        (16, "rtx6000d"),
+    ):
+        records.append({
+            "case_id": f"{hardware}-{n_gpus}", "status": "ok",
+            "workload": "prefill-8k", "hardware": hardware,
+            "n_gpus": n_gpus, "batch_size": n_gpus,
+            "cp": 1, "dp": n_gpus, "ep": n_gpus,
+            "pp": 1, "pp_partition": [61],
+            "tokens_per_s_user": float(n_gpus),
+            "tokens_per_s_gpu": float(n_gpus),
+            "tokens_per_s_user_elapsed": float(n_gpus),
+            "tokens_per_s_gpu_elapsed": float(n_gpus),
+            "tokens_per_s_user_overlapped": float(n_gpus),
+            "tokens_per_s_gpu_overlapped": float(n_gpus),
+            "memory_feasible_elapsed": True,
+            "memory_feasible_overlapped": True,
+        })
+
+    write_outputs(tmp_path, records)
+
+    figure, axes = figures[0]
+    assert [text.get_text() for text in figure.legends[0].get_texts()] == [
+        "h200", "rtx6000d",
+    ]
+    colors = [
+        {line.get_label(): line.get_color() for line in axis.lines}
+        for axis in axes.flat
+    ]
+    assert colors[0]["rtx6000d"] == colors[1]["rtx6000d"]
+
+
 def test_write_outputs_handles_empty_frontiers_and_extra_axes(tmp_path):
     records = [
         {"case_id": str(n_gpus), "status": "oom",

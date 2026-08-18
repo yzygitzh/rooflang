@@ -866,6 +866,10 @@ def write_outputs(
         hardware for hardware in HARDWARE_NAMES
         if any(record.get("hardware") == hardware for record in records)
     ]
+    hardware_colors = {
+        hardware: f"C{index}"
+        for index, hardware in enumerate(hardware_names)
+    }
     rows = 1 if len(gpu_counts) <= 2 else 2
     columns = math.ceil(len(gpu_counts) / rows)
     for workload in workloads:
@@ -876,6 +880,7 @@ def write_outputs(
             rows, columns, figsize=(6 * columns, 5 * rows), squeeze=False,
             sharex=True, sharey=True)
         flat_axes = list(axes.flat)
+        legend_handles = {}
         for axis, n_gpus in zip(flat_axes, gpu_counts):
             for hardware in hardware_names:
                 points = frontiers.get((workload, hardware, n_gpus), [])
@@ -885,12 +890,14 @@ def write_outputs(
                     point[_PLOT_USER_METRIC] for point in points]
                 gpu_values = [
                     point[_PLOT_GPU_METRIC] for point in points]
-                axis.plot(
+                line, = axis.plot(
                     user_values,
                     gpu_values,
                     marker="o",
                     label=hardware,
+                    color=hardware_colors[hardware],
                 )
+                legend_handles.setdefault(hardware, line)
                 if point_labels:
                     for point, user_value, gpu_value in zip(
                             points, user_values, gpu_values):
@@ -916,16 +923,25 @@ def write_outputs(
             axis.grid(True, which="both", alpha=0.25)
         for axis in flat_axes[len(gpu_counts):]:
             axis.axis("off")
-        handles, labels = [], []
-        for axis in flat_axes[:len(gpu_counts)]:
-            handles, labels = axis.get_legend_handles_labels()
-            if handles:
-                break
-        if handles:
-            figure.legend(handles, labels, loc="lower right")
+        legend_labels = [
+            hardware for hardware in hardware_names
+            if hardware in legend_handles
+        ]
+        bottom_margin = 0.04
+        if legend_labels:
+            legend_columns = min(6, len(legend_labels))
+            legend_rows = math.ceil(len(legend_labels) / legend_columns)
+            figure.legend(
+                [legend_handles[hardware] for hardware in legend_labels],
+                legend_labels,
+                loc="lower center",
+                bbox_to_anchor=(0.5, 0.01),
+                ncol=legend_columns,
+            )
+            bottom_margin = 0.08 + 0.04 * (legend_rows - 1)
         figure.suptitle(
             f"DSV4 Pro Pareto Frontier: {workload}")
-        figure.tight_layout(rect=(0, 0.04, 1, 0.96))
+        figure.tight_layout(rect=(0, bottom_margin, 1, 0.96))
         figure.savefig(
             output_dir / f"pareto_{workload}.png", dpi=160)
         plt.close(figure)

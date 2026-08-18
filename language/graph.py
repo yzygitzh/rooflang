@@ -568,21 +568,6 @@ class FabricEdge:
         self.is_full_duplex = is_full_duplex
         self.alpha_us = alpha_us
 
-    def transfer_time_us(self, src_to_dst_bytes: float = 0.0,
-                         dst_to_src_bytes: float = 0.0) -> float:
-        """Estimate transfer time (microseconds) for bidirectional traffic."""
-        t_fwd = (src_to_dst_bytes / (self.src_to_dst_bandwidth_gbs * 1e3)
-                 if self.src_to_dst_bandwidth_gbs > 0 and src_to_dst_bytes > 0
-                 else 0.0)
-        t_rev = (dst_to_src_bytes / (self.dst_to_src_bandwidth_gbs * 1e3)
-                 if self.dst_to_src_bandwidth_gbs > 0 and dst_to_src_bytes > 0
-                 else 0.0)
-        if self.is_full_duplex:
-            return self.alpha_us + max(t_fwd, t_rev)
-        else:
-            return self.alpha_us + t_fwd + t_rev
-
-
 class HardwareGraph:
     """Undirected graph of hardware components connected by fabric edges.
 
@@ -692,22 +677,6 @@ class HardwareGraph:
             alpha_us=total_alpha,
         )
 
-    def find_fabric_path(
-        self, src: HardwareComponent, dst: HardwareComponent,
-    ) -> List[FabricEdge]:
-        """Return the list of actual FabricEdge objects on the shortest path."""
-        return list(self._find_fabric_path(src, dst))
-
-    @lru_cache(maxsize=None)
-    def _find_fabric_path(
-        self, src: HardwareComponent, dst: HardwareComponent,
-    ) -> Tuple[FabricEdge, ...]:
-        """Cache the immutable fabric path for one ordered endpoint pair."""
-        if src is dst:
-            return ()
-        _, hops = self._find_route(src, dst)
-        return hops
-
     def find_fabric_path_directed(
         self, src: HardwareComponent, dst: HardwareComponent,
     ) -> List[Tuple[FabricEdge, str]]:
@@ -736,7 +705,6 @@ class HardwareGraph:
         """Invalidate topology-dependent lookups after graph mutation."""
         self._find_route.cache_clear()
         self.find_fabric.cache_clear()
-        self._find_fabric_path.cache_clear()
         self._find_fabric_path_directed.cache_clear()
         self.find_local_memory.cache_clear()
         self.find_local_device.cache_clear()
@@ -824,18 +792,6 @@ class HardwareGraph:
                 if bw < min_bw:
                     min_bw = bw
         return min_bw
-
-    def find_aggregate_latency(self, devices: List[Compute]) -> float:
-        """Max path latency (diameter) among all pairs in the device group."""
-        if len(devices) < 2:
-            return 0.0
-        max_alpha = 0.0
-        for i, d1 in enumerate(devices):
-            for d2 in devices[i + 1:]:
-                fab = self.find_fabric(d1, d2)
-                if fab.alpha_us > max_alpha:
-                    max_alpha = fab.alpha_us
-        return max_alpha
 
     def _best_fabric(self, a: HardwareComponent, b: HardwareComponent) -> FabricEdge:
         """Pick the highest-bandwidth fabric between two adjacent nodes."""

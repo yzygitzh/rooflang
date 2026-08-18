@@ -147,6 +147,39 @@ def _two_gpu_graph():
     return hw, g0, g1, nv, hbm0, hbm1, fab_g0_nv, fab_g1_nv, fab_g0_hbm
 
 
+def _two_route_graph(route_a, route_b):
+    """Two equal-hop routes, each described by two (fwd, rev, alpha) links."""
+    src = Compute(name="src")
+    dst = Compute(name="dst")
+    mid_a = Compute(name="mid-a")
+    mid_b = Compute(name="mid-b")
+    hw = HardwareGraph()
+    for component in [src, dst, mid_a, mid_b]:
+        hw.add_node(component)
+
+    routes = []
+    for name, mid, specs in [
+        ("route-a", mid_a, route_a),
+        ("route-b", mid_b, route_b),
+    ]:
+        edges = []
+        for index, (edge_src, edge_dst, spec) in enumerate([
+            (src, mid, specs[0]),
+            (mid, dst, specs[1]),
+        ]):
+            fwd_bw, rev_bw, alpha = spec
+            edge = FabricEdge(
+                name=f"{name}-{index}", src=edge_src, dst=edge_dst,
+                src_to_dst_bandwidth_gbs=fwd_bw,
+                dst_to_src_bandwidth_gbs=rev_bw,
+                is_full_duplex=True, alpha_us=alpha,
+            )
+            hw.add_edge(edge)
+            edges.append(edge)
+        routes.append(edges)
+    return hw, src, dst, routes[0], routes[1]
+
+
 # ── find_fabric_path tests ──────────────────────────────────────────
 
 
@@ -175,8 +208,75 @@ class TestFindFabricPath:
         with pytest.raises(ValueError, match="No path"):
             hw.find_fabric_path(a, b)
 
+    def test_routing_weight_can_prefer_more_hops(self):
+        hw, src, dst, _, fast = _two_route_graph(
+            [(100.0, 100.0, 0.5), (100.0, 100.0, 0.5)],
+            [(200.0, 200.0, 0.5), (200.0, 200.0, 0.5)],
+        )
+        direct = FabricEdge(
+            name="direct", src=src, dst=dst,
+            src_to_dst_bandwidth_gbs=1.0,
+            dst_to_src_bandwidth_gbs=1.0,
+            is_full_duplex=True, alpha_us=10.0,
+        )
+        hw.add_edge(direct)
+
+        assert hw.find_fabric_path(src, dst) == fast
+
+    def test_minimizes_sum_of_inverse_bandwidths(self):
+        hw, src, dst, lower_weight, wider_bottleneck = _two_route_graph(
+            [(100.0, 100.0, 0.5), (10.0, 10.0, 0.5)],
+            [(15.0, 15.0, 0.5), (15.0, 15.0, 0.5)],
+        )
+
+        assert hw.find_fabric_path(src, dst) == lower_weight
+        assert hw.find_fabric(src, dst).src_to_dst_bandwidth_gbs == 10.0
+        assert lower_weight != wider_bottleneck
+
+    def test_directional_bandwidth_can_select_different_routes(self):
+        hw, src, dst, forward_route, reverse_route = _two_route_graph(
+            [(100.0, 10.0, 0.5), (100.0, 10.0, 0.5)],
+            [(50.0, 50.0, 0.5), (50.0, 50.0, 0.5)],
+        )
+
+        assert hw.find_fabric_path(src, dst) == forward_route
+        assert hw.find_fabric_path(dst, src) == list(reversed(reverse_route))
+
+    def test_parallel_fabric_uses_highest_bandwidth(self):
+        src = Compute(name="src")
+        mid = Compute(name="mid")
+        dst = Compute(name="dst")
+        hw = HardwareGraph()
+        for component in [src, mid, dst]:
+            hw.add_node(component)
+        high_bw = FabricEdge(
+            name="high-bw", src=src, dst=mid,
+            src_to_dst_bandwidth_gbs=100.0,
+            dst_to_src_bandwidth_gbs=100.0,
+            is_full_duplex=True, alpha_us=10.0,
+        )
+        low_alpha = FabricEdge(
+            name="low-alpha", src=src, dst=mid,
+            src_to_dst_bandwidth_gbs=80.0,
+            dst_to_src_bandwidth_gbs=80.0,
+            is_full_duplex=True, alpha_us=1.0,
+        )
+        bottleneck = FabricEdge(
+            name="bottleneck", src=mid, dst=dst,
+            src_to_dst_bandwidth_gbs=50.0,
+            dst_to_src_bandwidth_gbs=50.0,
+            is_full_duplex=True, alpha_us=1.0,
+        )
+        for edge in [high_bw, low_alpha, bottleneck]:
+            hw.add_edge(edge)
+
+        assert hw.find_fabric_path(src, dst) == [high_bw, bottleneck]
+        assert hw.find_fabric(src, dst).src_to_dst_bandwidth_gbs == 50.0
+        assert hw.find_fabric(src, dst).alpha_us == 11.0
+
     def test_paths_are_cached_and_invalidated_by_topology_changes(self):
         hw, g0, g1, _, _, _, _, _, _ = _two_gpu_graph()
+        hw._find_route.cache_clear()
         hw._find_fabric_path.cache_clear()
         hw._find_fabric_path_directed.cache_clear()
 
@@ -186,16 +286,19 @@ class TestFindFabricPath:
         assert len(hw.find_fabric_path_directed(g0, g1)) == 2
         assert len(hw.find_fabric_path_directed(g0, g1)) == 2
         assert hw._find_fabric_path_directed.cache_info().hits == 1
+        assert hw._find_route.cache_info().misses == 1
+        assert hw._find_route.cache_info().hits == 1
 
         hw.add_edge(FabricEdge(
             name="direct", src=g0, dst=g1,
-            src_to_dst_bandwidth_gbs=100.0,
-            dst_to_src_bandwidth_gbs=100.0,
+            src_to_dst_bandwidth_gbs=10_000.0,
+            dst_to_src_bandwidth_gbs=10_000.0,
             is_full_duplex=True,
         ))
 
         assert len(hw.find_fabric_path(g0, g1)) == 1
         assert len(hw.find_fabric_path_directed(g0, g1)) == 1
+        assert hw._find_route.cache_info().misses == 1
 
 
 # ── find_aggregate_bandwidth tests ──────────────────────────────────

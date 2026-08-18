@@ -619,6 +619,37 @@ class HardwareGraph:
         return frozenset(self._graph.nodes)
 
     @lru_cache(maxsize=None)
+    def _find_route(
+        self, src: HardwareComponent, dst: HardwareComponent,
+    ) -> Tuple[Tuple[HardwareComponent, ...], Tuple[FabricEdge, ...]]:
+        """Select the route with the lowest aggregate routing weight."""
+        if not self._graph.has_node(src) or not self._graph.has_node(dst):
+            raise ValueError(f"No path between {src.name} and {dst.name}")
+        if src is dst:
+            return (src,), ()
+
+        try:
+            path = nx.shortest_path(
+                self._graph, src, dst, weight=self._routing_weight)
+        except nx.NetworkXNoPath:
+            raise ValueError(f"No path between {src.name} and {dst.name}")
+        fabrics = tuple(
+            self._best_fabric(a, b) for a, b in zip(path, path[1:]))
+        return tuple(path), fabrics
+
+    def _routing_weight(
+        self, src: HardwareComponent, dst: HardwareComponent,
+        edge_data: Dict,
+    ) -> float:
+        """Return the routing cost for one directed traversal."""
+        bandwidth = max(
+            fabric.src_to_dst_bandwidth_gbs
+            if fabric.src is src else fabric.dst_to_src_bandwidth_gbs
+            for fabric in edge_data["fabrics"]
+        )
+        return 1.0 / bandwidth
+
+    @lru_cache(maxsize=None)
     def find_fabric(self, src: HardwareComponent, dst: HardwareComponent) -> FabricEdge:
         """Find the effective fabric between src and dst.
 
@@ -631,15 +662,7 @@ class HardwareGraph:
             raise ValueError(f"No path between {src.name} and {dst.name}")
         if src is dst:
             raise ValueError(f"src and dst are the same node: {src.name}")
-        try:
-            path = nx.shortest_path(self._graph, src, dst)
-        except nx.NetworkXNoPath:
-            raise ValueError(f"No path between {src.name} and {dst.name}")
-
-        hops: List[FabricEdge] = []
-        for i in range(len(path) - 1):
-            a, b = path[i], path[i + 1]
-            hops.append(self._best_fabric(a, b))
+        path, hops = self._find_route(src, dst)
 
         if len(hops) == 1:
             return hops[0]
@@ -682,14 +705,8 @@ class HardwareGraph:
         """Cache the immutable fabric path for one ordered endpoint pair."""
         if src is dst:
             return ()
-        try:
-            path = nx.shortest_path(self._graph, src, dst)
-        except nx.NetworkXNoPath:
-            raise ValueError(f"No path between {src.name} and {dst.name}")
-        hops: List[FabricEdge] = []
-        for i in range(len(path) - 1):
-            hops.append(self._best_fabric(path[i], path[i + 1]))
-        return tuple(hops)
+        _, hops = self._find_route(src, dst)
+        return hops
 
     def find_fabric_path_directed(
         self, src: HardwareComponent, dst: HardwareComponent,
@@ -708,19 +725,16 @@ class HardwareGraph:
         """Cache an immutable directed path for one ordered endpoint pair."""
         if src is dst:
             return ()
-        try:
-            path = nx.shortest_path(self._graph, src, dst)
-        except nx.NetworkXNoPath:
-            raise ValueError(f"No path between {src.name} and {dst.name}")
+        path, hops = self._find_route(src, dst)
         result: List[Tuple[FabricEdge, str]] = []
-        for i in range(len(path) - 1):
-            edge = self._best_fabric(path[i], path[i + 1])
+        for i, edge in enumerate(hops):
             direction = 'fwd' if edge.src is path[i] else 'rev'
             result.append((edge, direction))
         return tuple(result)
 
     def _clear_lookup_caches(self) -> None:
         """Invalidate topology-dependent lookups after graph mutation."""
+        self._find_route.cache_clear()
         self.find_fabric.cache_clear()
         self._find_fabric_path.cache_clear()
         self._find_fabric_path_directed.cache_clear()

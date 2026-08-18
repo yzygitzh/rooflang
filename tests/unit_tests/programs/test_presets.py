@@ -820,11 +820,13 @@ class TestRTX6000DCluster:
 
     def test_rejects_cross_node_aggregate_bandwidth(self):
         hw = RTX6000DCluster(eth_scope=8, n_nodes=2)
-        gpus = [component for component in hw.nodes
-                if component.kind == "gpu"]
+        components = {component.name: component for component in hw.nodes}
 
         with pytest.raises(ValueError, match="scale-out"):
-            hw.find_aggregate_bandwidth([gpus[0], gpus[8]])
+            hw.find_aggregate_bandwidth([
+                components["n0-nvidia-rtx-6000d-0"],
+                components["n1-nvidia-rtx-6000d-0"],
+            ])
 
 
 class TestRTX6000DSuperChip:

@@ -157,7 +157,7 @@ def test_parallel_config_enumeration_rejects_expert_and_compression_cases(
 
 
 def test_single_node_scopes_and_eight_gpu_nodes():
-    for name in ("gh200", "gb300", "ascend950dt"):
+    for name in ("gh200", "gb300", "ascend950dt", "rtx6000d"):
         hardware = build_hardware(name, 48)
         gpus = [component for component in hardware.nodes
                 if isinstance(component, Compute)
@@ -180,6 +180,7 @@ def test_single_node_scopes_and_eight_gpu_nodes():
         ("gb300", 128, 2),
         ("gh200", 512, 2),
         ("ascend950dt", 128, 1),
+        ("rtx6000d", 512, 1),
     ],
 )
 def test_large_fabric_hardware_uses_multiple_maximal_nodes(
@@ -193,7 +194,7 @@ def test_large_fabric_hardware_uses_multiple_maximal_nodes(
     assert len({gpu.name.split("-", 1)[0] for gpu in gpus}) == expected_nodes
 
 
-@pytest.mark.parametrize("name", ["h200", "b300"])
+@pytest.mark.parametrize("name", ["h200", "b300", "rtx6000d"])
 def test_eight_gpu_node_hardware_rejects_partial_nodes(name):
     with pytest.raises(ValueError, match="divisible by 8"):
         build_hardware(name, 7)

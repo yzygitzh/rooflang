@@ -62,6 +62,7 @@ from rooflang.programs.presets.b300 import B300Cluster
 from rooflang.programs.presets.gb300 import GB300Cluster
 from rooflang.programs.presets.gh200 import GH200Cluster
 from rooflang.programs.presets.h200 import H200Cluster
+from rooflang.programs.presets.rtx6000d import RTX6000DCluster
 from rooflang.runtime.simulator import OOMError, Simulator
 
 
@@ -95,7 +96,9 @@ WORKLOADS = {
     "prefill-1m": ("prefill", 1048576),
     "decode-1m": ("decode", 1048576),
 }
-HARDWARE_NAMES = ("h200", "gh200", "b300", "gb300", "ascend950dt")
+HARDWARE_NAMES = (
+    "h200", "gh200", "b300", "gb300", "ascend950dt", "rtx6000d",
+)
 GPU_COUNTS = (8, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512)
 THROUGHPUT_METRICS = {
     "original": ("tokens_per_s_user", "tokens_per_s_gpu"),
@@ -324,6 +327,10 @@ def build_hardware(name: str, n_gpus: int):
         scope = _largest_node_scope(
             n_gpus, maximum=Ascend950DTCluster.max_scope, quantum=8)
         return Ascend950DTCluster(ub_scope=scope, n_nodes=n_gpus // scope)
+    if name == "rtx6000d":
+        if n_gpus % 8:
+            raise ValueError("RTX 6000D GPU count must be divisible by 8")
+        return RTX6000DCluster(eth_scope=n_gpus)
     raise ValueError(f"Unknown hardware: {name}")
 
 

@@ -236,14 +236,18 @@ class TestFindFabricPathDirected:
         assert hw.find_fabric(src, dst).alpha_us == 11.0
 
     def test_paths_are_cached_and_invalidated_by_topology_changes(self):
-        hw, g0, g1, _, _, _, _, _, _ = _two_gpu_graph()
+        hw, g0, g1, nv, _, _, _, _, _ = _two_gpu_graph()
+        hw._find_routes_from.cache_clear()
         hw._find_route.cache_clear()
         hw._find_fabric_path_directed.cache_clear()
 
         assert len(_fabric_path(hw, g0, g1)) == 2
+        assert len(_fabric_path(hw, g0, nv)) == 1
         assert len(_fabric_path(hw, g0, g1)) == 2
         assert hw._find_fabric_path_directed.cache_info().hits == 1
-        assert hw._find_route.cache_info().misses == 1
+        assert hw._find_routes_from.cache_info().misses == 1
+        assert hw._find_routes_from.cache_info().hits == 1
+        assert hw._find_route.cache_info().misses == 2
         hw.find_fabric(g0, g1)
         assert hw._find_route.cache_info().hits == 1
 
@@ -255,6 +259,7 @@ class TestFindFabricPathDirected:
         ))
 
         assert len(_fabric_path(hw, g0, g1)) == 1
+        assert hw._find_routes_from.cache_info().misses == 1
         assert hw._find_route.cache_info().misses == 1
 
 

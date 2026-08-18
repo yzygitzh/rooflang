@@ -604,6 +604,14 @@ class HardwareGraph:
         return frozenset(self._graph.nodes)
 
     @lru_cache(maxsize=None)
+    def _find_routes_from(
+        self, src: HardwareComponent,
+    ) -> Dict[HardwareComponent, List[HardwareComponent]]:
+        """Find and cache the lowest-weight paths from one source."""
+        return nx.single_source_dijkstra_path(
+            self._graph, src, weight=self._routing_weight)
+
+    @lru_cache(maxsize=None)
     def _find_route(
         self, src: HardwareComponent, dst: HardwareComponent,
     ) -> Tuple[Tuple[HardwareComponent, ...], Tuple[FabricEdge, ...]]:
@@ -613,11 +621,10 @@ class HardwareGraph:
         if src is dst:
             return (src,), ()
 
-        try:
-            path = nx.shortest_path(
-                self._graph, src, dst, weight=self._routing_weight)
-        except nx.NetworkXNoPath:
+        paths = self._find_routes_from(src)
+        if dst not in paths:
             raise ValueError(f"No path between {src.name} and {dst.name}")
+        path = paths[dst]
         fabrics = tuple(
             self._best_fabric(a, b) for a, b in zip(path, path[1:]))
         return tuple(path), fabrics
@@ -632,7 +639,7 @@ class HardwareGraph:
             if fabric.src is src else fabric.dst_to_src_bandwidth_gbs
             for fabric in edge_data["fabrics"]
         )
-        return 1.0 / bandwidth
+        return 1.0 / bandwidth if bandwidth > 0 else float("inf")
 
     @lru_cache(maxsize=None)
     def find_fabric(self, src: HardwareComponent, dst: HardwareComponent) -> FabricEdge:
@@ -703,6 +710,7 @@ class HardwareGraph:
 
     def _clear_lookup_caches(self) -> None:
         """Invalidate topology-dependent lookups after graph mutation."""
+        self._find_routes_from.cache_clear()
         self._find_route.cache_clear()
         self.find_fabric.cache_clear()
         self._find_fabric_path_directed.cache_clear()

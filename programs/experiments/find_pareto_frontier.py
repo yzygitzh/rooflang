@@ -784,8 +784,9 @@ def _shared_axis_limits(
     hardware_names: Sequence[str],
     user_metric: str,
     gpu_metric: str,
+    axis_scale: str = "linear",
 ) -> tuple[tuple[float, float], tuple[float, float]]:
-    """Return common positive log-scale limits for one figure's subplots."""
+    """Return common axis limits for one figure's subplots."""
     points = [
         point
         for n_gpus in gpu_counts
@@ -796,24 +797,29 @@ def _shared_axis_limits(
     def padded_limits(metric: str) -> tuple[float, float]:
         values = [point[metric] for point in points if point[metric] > 0]
         if not values:
-            return 1.0, 2.0
+            return (1.0, 2.0) if axis_scale == "log" else (0.0, 1.0)
         lower, upper = min(values), max(values)
-        if lower == upper:
-            return lower / 2, upper * 2
-        return lower / 1.05, upper * 1.05
+        if axis_scale == "log":
+            if lower == upper:
+                return lower / 2, upper * 2
+            return lower / 1.05, upper * 1.05
+        return 0.0, upper * 1.05
 
     return padded_limits(user_metric), padded_limits(gpu_metric)
 
 
-def _plain_tick_label(value: float, _position=None) -> str:
-    """Format log ticks as plain numbers with binary K/M/G/T suffixes."""
-    if value <= 0:
+def _plain_tick_label(
+        value: float, _position=None, unit_base: int = 1000) -> str:
+    """Format ticks as plain numbers with K/M/G/T suffixes."""
+    if value < 0:
         return ""
+    if value == 0:
+        return "0"
     for scale, suffix in (
-        (1024 ** 4, "T"),
-        (1024 ** 3, "G"),
-        (1024 ** 2, "M"),
-        (1024, "K"),
+        (unit_base ** 4, "T"),
+        (unit_base ** 3, "G"),
+        (unit_base ** 2, "M"),
+        (unit_base, "K"),
     ):
         if value >= scale:
             scaled = value / scale
@@ -828,6 +834,7 @@ def write_outputs(
     output_dir: Path,
     records: Sequence[dict],
     point_labels: bool = False,
+    axis_scale: str = "linear",
 ) -> None:
     """Write all points, the final frontier CSV, and frontier plots."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -875,7 +882,7 @@ def write_outputs(
     for workload in workloads:
         x_limits, y_limits = _shared_axis_limits(
             frontiers, workload, gpu_counts, hardware_names,
-            _PLOT_USER_METRIC, _PLOT_GPU_METRIC)
+            _PLOT_USER_METRIC, _PLOT_GPU_METRIC, axis_scale)
         figure, axes = plt.subplots(
             rows, columns, figsize=(6 * columns, 5 * rows), squeeze=False,
             sharex=True, sharey=True)
@@ -910,17 +917,26 @@ def write_outputs(
                             alpha=0.85,
                         )
             axis.set_title(f"{n_gpus} GPUs")
-            axis.set_xscale("log", base=2)
-            axis.set_yscale("log", base=2)
-            axis.xaxis.set_major_formatter(FuncFormatter(_plain_tick_label))
-            axis.yaxis.set_major_formatter(FuncFormatter(_plain_tick_label))
+            if axis_scale == "log":
+                axis.set_xscale("log", base=2)
+                axis.set_yscale("log", base=2)
+                unit_base = 1024
+            else:
+                axis.set_xscale("linear")
+                axis.set_yscale("linear")
+                unit_base = 1000
+            formatter = FuncFormatter(
+                lambda value, position: _plain_tick_label(
+                    value, position, unit_base))
+            axis.xaxis.set_major_formatter(formatter)
+            axis.yaxis.set_major_formatter(formatter)
             axis.set_xlim(x_limits)
             axis.set_ylim(y_limits)
             axis.tick_params(
                 axis="both", which="both", labelbottom=True, labelleft=True)
             axis.set_xlabel("tokens/s/user")
             axis.set_ylabel("tokens/s/GPU")
-            axis.grid(True, which="both", alpha=0.25)
+            axis.grid(True, which="major", alpha=0.25)
         for axis in flat_axes[len(gpu_counts):]:
             axis.axis("off")
         legend_labels = [
@@ -1109,6 +1125,11 @@ def _parser() -> argparse.ArgumentParser:
         "--point-labels", action="store_true",
         help="Label Pareto points with batch size and parallelism",
     )
+    parser.add_argument(
+        "--axis-scale", choices=("linear", "log"), default="linear",
+        help="Plot axes using linear or base-2 logarithmic scale "
+             "(default: linear)",
+    )
     return parser
 
 
@@ -1131,7 +1152,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not existing:
             raise ValueError(f"No records found in {raw_path}")
         write_outputs(
-            args.output_dir, existing, point_labels=args.point_labels)
+            args.output_dir, existing, point_labels=args.point_labels,
+            axis_scale=args.axis_scale)
         return 0
 
     cases = list(enumerate_cases(
@@ -1195,7 +1217,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     records = existing + new_records
     if not args.no_plot:
         write_outputs(
-            args.output_dir, records, point_labels=args.point_labels)
+            args.output_dir, records, point_labels=args.point_labels,
+            axis_scale=args.axis_scale)
     return 0
 
 

@@ -46,6 +46,8 @@ def test_default_worker_count_is_eight():
     assert args.model == "dsv4_pro"
     assert args.workers == 8
     assert args.gpu_counts == [8, 16, 32, 64, 128, 256, 512]
+    assert args.axis_scale == "linear"
+    assert _parser().parse_args(["--axis-scale", "log"]).axis_scale == "log"
     assert not args.point_labels
     assert _parser().parse_args(["--point-labels"]).point_labels
 
@@ -697,15 +699,15 @@ def test_shared_axis_limits_cover_all_subplots_with_same_scale():
         frontiers, "decode-8k", [8, 16], ["h200", "gb300"],
         "tokens_per_s_user", "tokens_per_s_gpu",
     )
-    assert x_limits == pytest.approx((10.0 / 1.05, 105.0))
-    assert y_limits == pytest.approx((20.0 / 1.05, 210.0))
+    assert x_limits == pytest.approx((0.0, 105.0))
+    assert y_limits == pytest.approx((0.0, 210.0))
 
 
-def test_shared_axis_limits_are_valid_for_empty_and_single_point_log_axes():
+def test_shared_axis_limits_start_at_zero_for_empty_and_single_point_axes():
     assert finder._shared_axis_limits(
         {}, "decode-8k", [8], ["h200"],
         "tokens_per_s_user", "tokens_per_s_gpu",
-    ) == ((1.0, 2.0), (1.0, 2.0))
+    ) == ((0.0, 1.0), (0.0, 1.0))
 
     frontiers = {
         ("decode-8k", "h200", 8): [
@@ -715,24 +717,45 @@ def test_shared_axis_limits_are_valid_for_empty_and_single_point_log_axes():
     assert finder._shared_axis_limits(
         frontiers, "decode-8k", [8], ["h200"],
         "tokens_per_s_user", "tokens_per_s_gpu",
+    ) == ((0.0, 16.8), (0.0, 33.6))
+
+
+def test_shared_axis_limits_restore_positive_padding_for_log_axes():
+    frontiers = {
+        ("decode-8k", "h200", 8): [
+            {"tokens_per_s_user": 16.0, "tokens_per_s_gpu": 32.0},
+        ],
+    }
+    assert finder._shared_axis_limits(
+        frontiers, "decode-8k", [8], ["h200"],
+        "tokens_per_s_user", "tokens_per_s_gpu", "log",
     ) == ((8.0, 32.0), (16.0, 64.0))
+    assert finder._shared_axis_limits(
+        {}, "decode-8k", [8], ["h200"],
+        "tokens_per_s_user", "tokens_per_s_gpu", "log",
+    ) == ((1.0, 2.0), (1.0, 2.0))
 
 
 @pytest.mark.parametrize(("value", "label"), [
-    (1024.0, "1K"),
-    (2048.0, "2K"),
-    (1024.0 * 1024, "1M"),
-    (1.5 * 1024 * 1024, "1.5M"),
-    (1024.0 ** 3, "1G"),
-    (1.5 * 1024 ** 3, "1.5G"),
-    (1024.0 ** 4, "1T"),
-    (1.5 * 1024 ** 4, "1.5T"),
+    (1000.0, "1K"),
+    (2000.0, "2K"),
+    (1000.0 * 1000, "1M"),
+    (1.5 * 1000 * 1000, "1.5M"),
+    (1000.0 ** 3, "1G"),
+    (1.5 * 1000 ** 3, "1.5G"),
+    (1000.0 ** 4, "1T"),
+    (1.5 * 1000 ** 4, "1.5T"),
     (1.0, "1"),
     (0.5, "0.5"),
-    (0.0, ""),
+    (0.0, "0"),
 ])
 def test_plain_tick_label_uses_decimal_numbers(value, label):
     assert finder._plain_tick_label(value) == label
+
+
+def test_plain_tick_label_supports_binary_log_axis_units():
+    assert finder._plain_tick_label(1024.0, unit_base=1024) == "1K"
+    assert finder._plain_tick_label(1024.0 ** 2, unit_base=1024) == "1M"
 
 
 def test_write_outputs_honors_filtered_workloads(tmp_path):
@@ -843,12 +866,26 @@ def test_write_outputs_shows_plain_ticks_on_every_subplot(
     for figure, axes in figures:
         figure.canvas.draw()
         for axis in list(axes.flat)[:3]:
+            assert axis.get_xscale() == "linear"
+            assert axis.get_yscale() == "linear"
+            assert axis.get_xlim()[0] == 0
+            assert axis.get_ylim()[0] == 0
             xlabels = axis.get_xticklabels()
             ylabels = axis.get_yticklabels()
             assert xlabels and all(label.get_visible() for label in xlabels)
             assert ylabels and all(label.get_visible() for label in ylabels)
             assert all("$" not in label.get_text()
                        for label in (*xlabels, *ylabels))
+
+    write_outputs(tmp_path, records, axis_scale="log")
+
+    assert len(figures) == 2
+    for axis in list(figures[-1][1].flat)[:3]:
+        assert axis.get_xscale() == "log"
+        assert axis.get_yscale() == "log"
+        assert axis.get_xlim()[0] > 0
+        assert axis.get_ylim()[0] > 0
+        assert axis.xaxis.get_major_formatter()(1024, 0) == "1K"
 
 
 def test_write_outputs_merges_legends_and_keeps_hardware_colors(
@@ -1110,14 +1147,15 @@ def test_main_plot_only_requires_and_writes_existing_records(
     writes = []
     monkeypatch.setattr(
         finder, "write_outputs",
-        lambda output_dir, records, point_labels=False:
-        writes.append((output_dir, records, point_labels)),
+        lambda output_dir, records, point_labels=False, axis_scale="linear":
+        writes.append((output_dir, records, point_labels, axis_scale)),
     )
 
     assert finder.main([
         "--output-dir", str(tmp_path), "--plot-only", "--point-labels",
+        "--axis-scale", "log",
     ]) == 0
-    assert writes == [(tmp_path, [record], True)]
+    assert writes == [(tmp_path, [record], True, "log")]
 
 
 def test_main_dry_run_and_overwrite(tmp_path, monkeypatch, capsys):
@@ -1159,8 +1197,8 @@ def test_main_resumes_and_optionally_reruns_failures(tmp_path, monkeypatch):
     writes = []
     monkeypatch.setattr(
         finder, "write_outputs",
-        lambda output_dir, records, point_labels=False:
-        writes.append((list(records), point_labels)),
+        lambda output_dir, records, point_labels=False, axis_scale="linear":
+        writes.append((list(records), point_labels, axis_scale)),
     )
 
     assert finder.main(["--output-dir", str(tmp_path)]) == 0
@@ -1170,7 +1208,8 @@ def test_main_resumes_and_optionally_reruns_failures(tmp_path, monkeypatch):
         True,
     )
     assert writes[-1] == (
-        existing + [{"case_id": "new", "status": "ok"}], False)
+        existing + [{"case_id": "new", "status": "ok"}], False,
+        "linear")
 
     assert finder.main([
         "--output-dir", str(tmp_path), "--rerun-failures", "--no-plot",

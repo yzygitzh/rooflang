@@ -45,6 +45,7 @@ def test_default_worker_count_is_eight():
 
     assert args.model == "dsv4_pro"
     assert args.workers == 8
+    assert args.gpu_counts == [8, 16, 32, 64, 128, 256, 512]
     assert not args.point_labels
     assert _parser().parse_args(["--point-labels"]).point_labels
 
@@ -179,7 +180,7 @@ def test_single_node_scopes_and_eight_gpu_nodes():
     [
         ("gb300", 128, 2),
         ("gh200", 512, 2),
-        ("ascend950dt", 128, 1),
+        ("ascend950dt", 128, 2),
         ("rtx6000d", 512, 1),
     ],
 )

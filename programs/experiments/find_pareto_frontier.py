@@ -99,7 +99,7 @@ WORKLOADS = {
 HARDWARE_NAMES = (
     "h200", "gh200", "b300", "gb300", "ascend950dt", "rtx6000d",
 )
-GPU_COUNTS = (8, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512)
+GPU_COUNTS = (8, 16, 32, 64, 128, 256, 512)
 THROUGHPUT_METRICS = {
     "original": ("tokens_per_s_user", "tokens_per_s_gpu"),
     "elapsed": (

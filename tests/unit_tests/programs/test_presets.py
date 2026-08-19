@@ -620,7 +620,7 @@ def test_ascend950dt_rejects_invalid_ub_scope(preset, ub_scope):
 
 @pytest.mark.parametrize(
     "preset", [Ascend950DTCluster, Ascend950DTSuperChip])
-@pytest.mark.parametrize("ub_scope", [8, 1024])
+@pytest.mark.parametrize("ub_scope", [8, 64])
 def test_ascend950dt_accepts_ub_scope_boundaries(preset, ub_scope):
     assert preset(ub_scope=ub_scope).ub_scope == ub_scope
 
@@ -640,6 +640,7 @@ class TestAscend950DTCluster:
         hw = Ascend950DTCluster(ub_scope=8)
         components = {component.name: component for component in hw.nodes}
         npu = components["n0-huawei-ascend-950dt-0"]
+        peer = components["n0-huawei-ascend-950dt-1"]
         cpu = components["n0-intel-xeon-6767p-0"]
 
         assert npu.tflops == {
@@ -647,19 +648,70 @@ class TestAscend950DTCluster:
             "bf16": 486.0, "fp16": 486.0, "fp32": 243.0,
         }
         assert components["n0-hbm-0"].capacity_gb == 144.0
+        assert "eth-switch" not in components
 
         hbm = hw.find_fabric(npu, components["n0-hbm-0"])
-        ub = hw.find_fabric(npu, components["n0-ub-switch"])
+        mesh = next(
+            fabric
+            for fabric in hw._graph.edges[npu, peer]["fabrics"]
+            if fabric.name == "ub-mesh"
+        )
+        ub_l1 = hw.find_fabric(npu, components["n0-ub-switch-l1"])
         pcie = hw.find_fabric(cpu, npu)
-        uboe = hw.find_fabric(npu, components["eth-switch"])
 
         assert hbm.src_to_dst_bandwidth_gbs == 4000.0
-        assert ub.src_to_dst_bandwidth_gbs == 896.0
-        assert ub.dst_to_src_bandwidth_gbs == 896.0
+        assert mesh.name == "ub-mesh"
+        assert mesh.src_to_dst_bandwidth_gbs == 56.0
+        assert mesh.dst_to_src_bandwidth_gbs == 56.0
+        assert mesh.alpha_us == 0.5
+        assert ub_l1.name == "ub-l1"
+        assert ub_l1.src_to_dst_bandwidth_gbs == 448.0
+        assert ub_l1.dst_to_src_bandwidth_gbs == 448.0
+        assert ub_l1.alpha_us == 0.5
         assert pcie.src_to_dst_bandwidth_gbs == 64.0
         assert pcie.dst_to_src_bandwidth_gbs == 64.0
-        assert uboe.src_to_dst_bandwidth_gbs == 100.0
-        assert uboe.dst_to_src_bandwidth_gbs == 100.0
+
+    def test_each_eight_npus_have_direct_full_mesh_links(self):
+        hw = Ascend950DTCluster(ub_scope=16)
+        components = {component.name: component for component in hw.nodes}
+
+        for group_start in (0, 8):
+            for i in range(group_start, group_start + 8):
+                for j in range(i + 1, group_start + 8):
+                    src = components[f"n0-huawei-ascend-950dt-{i}"]
+                    dst = components[f"n0-huawei-ascend-950dt-{j}"]
+                    fabrics = hw._graph.edges[src, dst]["fabrics"]
+                    assert any(fabric.name == "ub-mesh"
+                               for fabric in fabrics)
+
+    def test_l1_switches_share_l2(self):
+        hw = Ascend950DTCluster(ub_scope=8, n_nodes=2)
+        components = {component.name: component for component in hw.nodes}
+
+        assert "ub-switch-l2-0" in components
+        assert "ub-switch-l3" not in components
+        path = _fabric_path(
+            hw, components["n0-ub-switch-l1"],
+            components["n1-ub-switch-l1"])
+        assert [fabric.name for fabric in path] == ["ub-l2", "ub-l2"]
+        assert all(fabric.src_to_dst_bandwidth_gbs == 12800.0
+                   for fabric in path)
+        assert all(fabric.alpha_us == 1.0 for fabric in path)
+
+    def test_multiple_l2_switches_share_l3(self):
+        hw = Ascend950DTCluster(ub_scope=8, n_nodes=17)
+        components = {component.name: component for component in hw.nodes}
+
+        assert "ub-switch-l2-0" in components
+        assert "ub-switch-l2-1" in components
+        assert "ub-switch-l3" in components
+        path = _fabric_path(
+            hw, components["ub-switch-l2-0"],
+            components["ub-switch-l2-1"])
+        assert [fabric.name for fabric in path] == ["ub-l3", "ub-l3"]
+        assert all(fabric.src_to_dst_bandwidth_gbs == 51200.0
+                   for fabric in path)
+        assert all(fabric.alpha_us == 1.0 for fabric in path)
 
     def test_reuses_b300_cpu_dram_and_ssd_specs(self):
         hw = Ascend950DTCluster(ub_scope=8)
@@ -689,13 +741,54 @@ class TestAscend950DTCluster:
             assert fabric.dst_to_src_bandwidth_gbs == 7.0
 
     def test_aggregate_bandwidth(self):
-        hw = Ascend950DTCluster(ub_scope=8, n_nodes=2)
-        npus = [component for component in hw.nodes
-                if component.kind == "gpu"]
-        node0_npus = [npu for npu in npus if npu.name.startswith("n0-")]
+        hw = Ascend950DTCluster(ub_scope=16, n_nodes=17)
+        components = {component.name: component for component in hw.nodes}
+        npu = lambda node, rank: components[
+            f"n{node}-huawei-ascend-950dt-{rank}"]
 
-        assert hw.find_aggregate_bandwidth(node0_npus) == 896.0
-        assert hw.find_aggregate_bandwidth(npus) == 800.0
+        assert hw.find_aggregate_bandwidth([npu(0, 0)]) == float("inf")
+        assert hw.find_aggregate_bandwidth([
+            npu(0, 0), npu(0, 1)]) == 120.0
+        assert hw.find_aggregate_bandwidth([
+            npu(0, rank) for rank in range(8)]) == 840.0
+        assert hw.find_aggregate_bandwidth([
+            npu(0, 0), npu(0, 8)]) == 448.0
+        assert hw.find_aggregate_bandwidth([
+            npu(0, rank) for rank in range(4)
+        ] + [
+            npu(0, rank) for rank in range(8, 12)
+        ]) == 840.0
+        assert hw.find_aggregate_bandwidth([
+            npu(0, rank) for rank in range(16)
+        ]) == 840.0
+        assert hw.find_aggregate_bandwidth([
+            npu(0, 0), npu(1, 0)]) == 200.0
+        assert hw.find_aggregate_bandwidth([
+            npu(node, rank)
+            for node in (0, 1)
+            for rank in range(3)
+        ]) == 600.0
+        assert hw.find_aggregate_bandwidth([
+            npu(node, rank)
+            for node in (0, 1)
+            for rank in range(8)
+        ]) == 648.0
+        assert hw.find_aggregate_bandwidth([
+            npu(0, 0), npu(16, 0)]) == 50.0
+        assert hw.find_aggregate_bandwidth([
+            npu(node, 0)
+            for node in list(range(8)) + list(range(9, 17))
+        ]) == 250.0
+        assert hw.find_aggregate_bandwidth([
+            npu(node, rank)
+            for node in (0, 9)
+            for rank in range(8)
+        ]) == 400.0
+        assert hw.find_aggregate_bandwidth([
+            npu(node, rank)
+            for node in (0, 9)
+            for rank in range(10)
+        ]) == 498.0
 
 
 class TestAscend950DTSuperChip:

@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import rooflang.programs.models.dsv4_flash as dsv4_flash
 import rooflang.programs.models.dsv4_pro as dsv4_pro
 from rooflang.language.graph import ComputeGraph
 from rooflang.language.hardware.component import Compute
@@ -21,8 +22,9 @@ def test_package_lazy_visualization_attribute():
 
 
 def test_model_loader_exposes_registered_models():
-    assert MODEL_NAMES == ("dsv4_pro",)
+    assert MODEL_NAMES == ("dsv4_pro", "dsv4_flash")
     assert load_model("dsv4_pro") is dsv4_pro
+    assert load_model("dsv4_flash") is dsv4_flash
     with pytest.raises(ValueError, match="Unknown model"):
         load_model("missing")
 

@@ -225,7 +225,7 @@ def enumerate_parallel_configs(
             if any(
                 seq_prefill % ratio != 0
                 or (seq_prefill // ratio) % cp != 0
-                for ratio in set(COMPRESS_RATIOS)
+                for ratio in set(COMPRESS_RATIOS) - {0}
             ):
                 continue
             configs.append(ParallelConfig(

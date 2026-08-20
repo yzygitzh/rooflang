@@ -673,7 +673,7 @@ def test_write_outputs_handles_no_records(tmp_path):
     (tmp_path / "pareto_frontier_elapsed.csv").write_text("stale")
     (tmp_path / "pareto_frontier_overlapped.csv").write_text("stale")
 
-    write_outputs(tmp_path, [])
+    write_outputs(tmp_path, [], "dsv4_pro")
 
     assert (tmp_path / "all_points.csv").read_text() == ""
     assert (tmp_path / "pareto_frontier.csv").read_text() == ""
@@ -784,7 +784,7 @@ def test_write_outputs_honors_filtered_workloads(tmp_path):
     (tmp_path / "pareto_frontier_elapsed.csv").write_text("stale")
     (tmp_path / "pareto_frontier_overlapped.csv").write_text("stale")
 
-    write_outputs(tmp_path, [record])
+    write_outputs(tmp_path, [record], "dsv4_pro")
 
     assert (tmp_path / "all_points.csv").is_file()
     assert (tmp_path / "pareto_frontier.csv").is_file()
@@ -821,10 +821,10 @@ def test_write_outputs_point_labels_are_opt_in(tmp_path, monkeypatch):
         lambda point: labels.append(point["case_id"]) or "label",
     )
 
-    write_outputs(tmp_path, [record])
+    write_outputs(tmp_path, [record], "dsv4_pro")
     assert not labels
 
-    write_outputs(tmp_path, [record], point_labels=True)
+    write_outputs(tmp_path, [record], "dsv4_pro", point_labels=True)
     assert labels == ["one"]
 
 
@@ -860,9 +860,11 @@ def test_write_outputs_shows_plain_ticks_on_every_subplot(
             "memory_feasible_overlapped": True,
         })
 
-    write_outputs(tmp_path, records)
+    write_outputs(tmp_path, records, "dsv4_flash")
 
     assert len(figures) == 1
+    assert figures[0][0]._suptitle.get_text() == (
+        "dsv4_flash Pareto Frontier: decode-8k")
     for figure, axes in figures:
         figure.canvas.draw()
         for axis in list(axes.flat)[:3]:
@@ -877,7 +879,7 @@ def test_write_outputs_shows_plain_ticks_on_every_subplot(
             assert all("$" not in label.get_text()
                        for label in (*xlabels, *ylabels))
 
-    write_outputs(tmp_path, records, axis_scale="log")
+    write_outputs(tmp_path, records, "dsv4_flash", axis_scale="log")
 
     assert len(figures) == 2
     for axis in list(figures[-1][1].flat)[:3]:
@@ -923,7 +925,7 @@ def test_write_outputs_merges_legends_and_keeps_hardware_colors(
             "memory_feasible_overlapped": True,
         })
 
-    write_outputs(tmp_path, records)
+    write_outputs(tmp_path, records, "dsv4_pro")
 
     figure, axes = figures[0]
     assert [text.get_text() for text in figure.legends[0].get_texts()] == [
@@ -944,7 +946,7 @@ def test_write_outputs_handles_empty_frontiers_and_extra_axes(tmp_path):
         for n_gpus in (8, 16, 32, 48)
     ]
 
-    write_outputs(tmp_path, records)
+    write_outputs(tmp_path, records, "dsv4_pro")
 
     assert (tmp_path / "pareto_prefill-8k.png").is_file()
 
@@ -1147,15 +1149,16 @@ def test_main_plot_only_requires_and_writes_existing_records(
     writes = []
     monkeypatch.setattr(
         finder, "write_outputs",
-        lambda output_dir, records, point_labels=False, axis_scale="linear":
-        writes.append((output_dir, records, point_labels, axis_scale)),
+        lambda output_dir, records, model, point_labels=False,
+        axis_scale="linear":
+        writes.append((output_dir, records, model, point_labels, axis_scale)),
     )
 
     assert finder.main([
         "--output-dir", str(tmp_path), "--plot-only", "--point-labels",
-        "--axis-scale", "log",
+        "--axis-scale", "log", "--model", "dsv4_flash",
     ]) == 0
-    assert writes == [(tmp_path, [record], True, "log")]
+    assert writes == [(tmp_path, [record], "dsv4_flash", True, "log")]
 
 
 def test_main_dry_run_and_overwrite(tmp_path, monkeypatch, capsys):
@@ -1197,8 +1200,9 @@ def test_main_resumes_and_optionally_reruns_failures(tmp_path, monkeypatch):
     writes = []
     monkeypatch.setattr(
         finder, "write_outputs",
-        lambda output_dir, records, point_labels=False, axis_scale="linear":
-        writes.append((list(records), point_labels, axis_scale)),
+        lambda output_dir, records, model, point_labels=False,
+        axis_scale="linear":
+        writes.append((list(records), model, point_labels, axis_scale)),
     )
 
     assert finder.main(["--output-dir", str(tmp_path)]) == 0
@@ -1208,8 +1212,8 @@ def test_main_resumes_and_optionally_reruns_failures(tmp_path, monkeypatch):
         True,
     )
     assert writes[-1] == (
-        existing + [{"case_id": "new", "status": "ok"}], False,
-        "linear")
+        existing + [{"case_id": "new", "status": "ok"}], "dsv4_pro",
+        False, "linear")
 
     assert finder.main([
         "--output-dir", str(tmp_path), "--rerun-failures", "--no-plot",

@@ -833,6 +833,7 @@ def _plain_tick_label(
 def write_outputs(
     output_dir: Path,
     records: Sequence[dict],
+    model: str,
     point_labels: bool = False,
     axis_scale: str = "linear",
 ) -> None:
@@ -956,7 +957,7 @@ def write_outputs(
             )
             bottom_margin = 0.08 + 0.04 * (legend_rows - 1)
         figure.suptitle(
-            f"DSV4 Pro Pareto Frontier: {workload}")
+            f"{model} Pareto Frontier: {workload}")
         figure.tight_layout(rect=(0, bottom_margin, 1, 0.96))
         figure.savefig(
             output_dir / f"pareto_{workload}.png", dpi=160)
@@ -1152,7 +1153,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not existing:
             raise ValueError(f"No records found in {raw_path}")
         write_outputs(
-            args.output_dir, existing, point_labels=args.point_labels,
+            args.output_dir, existing, args.model,
+            point_labels=args.point_labels,
             axis_scale=args.axis_scale)
         return 0
 
@@ -1217,7 +1219,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     records = existing + new_records
     if not args.no_plot:
         write_outputs(
-            args.output_dir, records, point_labels=args.point_labels,
+            args.output_dir, records, args.model,
+            point_labels=args.point_labels,
             axis_scale=args.axis_scale)
     return 0
 

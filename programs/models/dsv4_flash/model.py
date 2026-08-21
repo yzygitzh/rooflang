@@ -10,7 +10,7 @@ from typing import List
 from rooflang.language.graph import ComputeGraph
 from rooflang.language.kernels.forward import (
     ElementwiseOp, Embedding, Gemm, Nop, ReadInput, RMSNorm, Sampling,
-    Slice, SparseAttn, StridedGemm, TokenCombine, TokenDispatch,
+    DpskV4SparseAttn, Slice, StridedGemm, TokenCombine, TokenDispatch,
 )
 from rooflang.language.kernels.identity import Concat, Spawn
 from rooflang.language.kernels.kernel import Kernel
@@ -289,7 +289,7 @@ def _build_layers(g, B, S, context_len, prev_out):
         elif ratio == 4:
             k_sel += INDEX_TOPK
 
-        sa = SparseAttn(
+        sa = DpskV4SparseAttn(
             B, H, 1, S, k_sel, S_kv, HD, "fp8", kv_factor=1,
             indexer_s_kv=compressed_len if has_indexer else 0,
             indexer_h=INDEX_H if has_indexer else 0,

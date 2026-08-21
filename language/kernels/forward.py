@@ -367,8 +367,8 @@ class StridedGemm(Kernel):
         return self._out_elems * dtype_bytes(self.out_dtype)
 
 
-class SparseAttn(Kernel):
-    """Sparse attention with an optional fused sparse indexer.
+class DpskV4SparseAttn(Kernel):
+    """DeepSeek V4 sparse attention with an optional fused sparse indexer.
 
     Attention FLOPS are 4·B·H·S_q·k_sel·Hd.  During causal prefill, only
     the context-dependent ``causal_k_sel`` portion receives the 0.5 triangular

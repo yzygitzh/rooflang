@@ -11,7 +11,7 @@ from rooflang.language.kernels.comm import (
     ReduceScatter, Scatter, Send, Recv,
 )
 from rooflang.language.kernels.forward import (
-    Attn, Embedding, Gemm, Nop, ReadInput, RMSNorm, Slice, SparseAttn,
+    Attn, DpskV4SparseAttn, Embedding, Gemm, Nop, ReadInput, RMSNorm, Slice,
     StridedGemm, TokenCombine, TokenDispatch,
 )
 from rooflang.language.kernels.identity import Concat, Spawn
@@ -640,8 +640,8 @@ class TestRowSplitStridedGemm:
 class TestHeadSplit:
     def setup_method(self):
         B, H, H_kv, S_q, k_sel, S_kv, Hd = 1, 8, 1, 64, 16, 80, 64
-        self.kernel = SparseAttn(B, H, H_kv, S_q, k_sel, S_kv, Hd, "bf16",
-                                 kv_factor=1)
+        self.kernel = DpskV4SparseAttn(
+            B, H, H_kv, S_q, k_sel, S_kv, Hd, "bf16", kv_factor=1)
         self.kernel.inputs = {
             "q": Tensor("bf16", (64, H * Hd)),
             "kv": Tensor("bf16", (80, Hd)),
@@ -664,7 +664,7 @@ class TestHeadSplit:
     def test_copies(self):
         assert len(self.copies) == N
         for c in self.copies:
-            assert isinstance(c, SparseAttn)
+            assert isinstance(c, DpskV4SparseAttn)
             assert c.H == 2  # 8/4
             assert c.inputs["q"].shape == (64, 128)
             assert c.inputs["kv"].shape == (80, 64)
@@ -679,7 +679,8 @@ class TestHeadSplit:
     def test_graph_validates(self):
         B, H, H_kv, S_q, k_sel, S_kv, Hd = 1, 8, 1, 64, 16, 80, 64
         g = ComputeGraph()
-        k = SparseAttn(B, H, H_kv, S_q, k_sel, S_kv, Hd, "bf16", kv_factor=1)
+        k = DpskV4SparseAttn(
+            B, H, H_kv, S_q, k_sel, S_kv, Hd, "bf16", kv_factor=1)
         k.inputs = {"q": Tensor("bf16", (64, H * Hd)),
                     "kv": Tensor("bf16", (80, Hd))}
         k.outputs = {"y": Tensor("bf16", (64, H * Hd))}
@@ -721,15 +722,15 @@ class TestContextSplitGemm:
         assert self.nxt["y"].dim == 1
 
 
-@pytest.mark.parametrize("attn_cls", [Attn, SparseAttn])
+@pytest.mark.parametrize("attn_cls", [Attn, DpskV4SparseAttn])
 def test_context_split_attention_uses_full_logical_kv(attn_cls):
     kwargs = dict(B=2, H=8, H_kv=1, S_q=16, S_kv=24, Hd=64,
                   dtype="bf16")
-    if attn_cls is SparseAttn:
+    if attn_cls is DpskV4SparseAttn:
         kwargs["k_sel"] = 8
         kwargs["kv_factor"] = 1
     kernel = attn_cls(**kwargs)
-    kv_width = 64 if attn_cls is SparseAttn else 2 * 64
+    kv_width = 64 if attn_cls is DpskV4SparseAttn else 2 * 64
     kernel.inputs = {
         "q": Tensor("bf16", (2, 16, 8 * 64)),
         "kv": Tensor("bf16", (2, 24, kv_width)),
@@ -753,29 +754,29 @@ def test_context_split_attention_uses_full_logical_kv(attn_cls):
             tensor.size_bytes for tensor in copy.inputs.values())
 
 
-@pytest.mark.parametrize("attn_cls", [Attn, SparseAttn])
+@pytest.mark.parametrize("attn_cls", [Attn, DpskV4SparseAttn])
 def test_context_split_preserves_causal_flop_factor(attn_cls):
     kwargs = dict(B=1, H=8, H_kv=1, S_q=16, S_kv=16, Hd=64,
                   dtype="bf16", causal=True)
-    if attn_cls is SparseAttn:
+    if attn_cls is DpskV4SparseAttn:
         kwargs.update(
             S_kv=12, k_sel=8, kv_factor=1,
             indexer_s_kv=8, indexer_h=4, indexer_hd=8,
             causal_k_sel=4)
     kernel = attn_cls(**kwargs)
-    kv_width = 64 if attn_cls is SparseAttn else 2 * 64
+    kv_width = 64 if attn_cls is DpskV4SparseAttn else 2 * 64
     kernel.inputs = {
         "q": Tensor("bf16", (1, 16, 8 * 64)),
         "kv": Tensor("bf16", (1, kwargs["S_kv"], kv_width)),
     }
-    if attn_cls is SparseAttn:
+    if attn_cls is DpskV4SparseAttn:
         kernel.inputs["index_kv"] = Tensor("fp4", (1, 8, 8))
     kernel.outputs = {"y": Tensor("bf16", (1, 16, 8 * 64))}
 
     _, copies, _ = context_split_prefill(kernel, N)
 
     assert all(copy.causal for copy in copies)
-    if attn_cls is SparseAttn:
+    if attn_cls is DpskV4SparseAttn:
         assert all(copy.causal_k_sel == 4 for copy in copies)
         assert all(copy.indexer_compute_dtype == "fp4" for copy in copies)
         assert sum(copy.flops_by_dtype["fp4"] for copy in copies) \
@@ -860,7 +861,7 @@ def test_batch_split_supports_terminal_nop_sink_without_gather():
 
 
 def test_context_split_decode_attention_broadcasts_q_and_shards_kv():
-    kernel = SparseAttn(
+    kernel = DpskV4SparseAttn(
         8, 8, 1, 1, 8, 12, 64, "bf16", kv_factor=1,
         indexer_s_kv=16, indexer_h=4, indexer_hd=8)
     kernel.inputs = {

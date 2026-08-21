@@ -8,7 +8,9 @@ import pytest
 
 from rooflang.language.hardware.component import Compute
 from rooflang.language.kernels.comm import Broadcast, ReduceScatter
-from rooflang.language.kernels.forward import Nop, ReadInput, Slice, SparseAttn
+from rooflang.language.kernels.forward import (
+    DpskV4SparseAttn, Nop, ReadInput, Slice,
+)
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.tensor import Tensor
 from rooflang.programs.models.dsv4_pro import optimization
@@ -539,7 +541,7 @@ def test_cp4_dp2_ep8_pp2_decode(monkeypatch):
 
         attention = copies["cp_dp"]["sa"]
         assert len(attention) == 8
-        assert all(isinstance(kernel, SparseAttn)
+        assert all(isinstance(kernel, DpskV4SparseAttn)
                    for kernel in attention)
         assert sum(kernel.S_kv for kernel in attention[:4]) \
             == kv_reads[layer_id].outputs["y"].shape[1]

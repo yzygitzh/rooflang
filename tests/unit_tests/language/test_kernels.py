@@ -8,7 +8,7 @@ from rooflang.language.graph import ComputeGraph
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.kernels.forward import (
     ElementwiseOp, Embedding, Gemm, Nop, ReadInput, RMSNorm, LayerNorm, RoPE,
-    Attn, Slice, SparseAttn, Sampling, TokenDispatch, TokenCombine,
+    Attn, DpskV4SparseAttn, Slice, Sampling, TokenDispatch, TokenCombine,
 )
 from rooflang.language.kernels import backward
 from rooflang.language.kernels.comm import (
@@ -221,16 +221,17 @@ class TestAttn(TestKernelBase):
         assert a.flops == 4.0 * 2 * 8 * 128 * 256 * 64
 
 
-class TestSparseAttn(TestKernelBase):
+class TestDpskV4SparseAttn(TestKernelBase):
     __test__ = True
-    kernel = SparseAttn(B=2, H=8, H_kv=8, S_q=256, k_sel=64, S_kv=64, Hd=64)
+    kernel = DpskV4SparseAttn(
+        B=2, H=8, H_kv=8, S_q=256, k_sel=64, S_kv=64, Hd=64)
     expected_flops = 4.0 * 2 * 8 * 256 * 64 * 64
     expected_input_bytes = (2 * 8 * 256 * 64 + 2 * 2 * 8 * 64 * 64) * 2.0
     expected_weight_bytes = 0.0
     expected_output_bytes = 2 * 8 * 256 * 64 * 2.0
 
     def test_fused_indexer_and_sparse_kv_read(self):
-        kernel = SparseAttn(
+        kernel = DpskV4SparseAttn(
             B=2, H=8, H_kv=1, S_q=1, k_sel=12, S_kv=100, Hd=64,
             kv_factor=1, indexer_s_kv=25, indexer_h=4, indexer_hd=8)
         kernel.inputs = {
@@ -267,7 +268,7 @@ class TestSparseAttn(TestKernelBase):
         graph.validate()
 
     def test_input_tensor_shape_is_checked_independently_of_sparse_read(self):
-        kernel = SparseAttn(
+        kernel = DpskV4SparseAttn(
             B=1, H=1, H_kv=1, S_q=1, k_sel=2, S_kv=8, Hd=4,
             kv_factor=1)
         kernel.inputs = {
@@ -282,7 +283,7 @@ class TestSparseAttn(TestKernelBase):
             graph.validate()
 
     def test_compute_q_kv_and_output_dtypes_are_independent(self):
-        kernel = SparseAttn(
+        kernel = DpskV4SparseAttn(
             B=1, H=2, H_kv=1, S_q=3, k_sel=2, S_kv=5, Hd=4,
             dtype="fp8", kv_factor=1,
             q_dtype="bf16", kv_dtype="fp8", out_dtype="bf16")
@@ -306,7 +307,7 @@ class TestSparseAttn(TestKernelBase):
         graph.validate()
 
     def test_causal_only_halves_context_dependent_sparse_work(self):
-        kernel = SparseAttn(
+        kernel = DpskV4SparseAttn(
             B=1, H=1, H_kv=1, S_q=8, k_sel=4, S_kv=6, Hd=1,
             kv_factor=1, indexer_s_kv=4, indexer_h=1, indexer_hd=1,
             causal=True, causal_k_sel=2)
@@ -449,16 +450,17 @@ class TestBwdAttn(TestKernelBase):
         assert k.flops == 10.0 * 2 * 8 * 128 * 256 * 64 * 0.5
 
 
-class TestBwdSparseAttn(TestKernelBase):
+class TestBwdDpskV4SparseAttn(TestKernelBase):
     __test__ = True
-    kernel = backward.SparseAttn(B=2, H=8, H_kv=8, S_q=256, k_sel=64, Hd=64)
+    kernel = backward.DpskV4SparseAttn(
+        B=2, H=8, H_kv=8, S_q=256, k_sel=64, Hd=64)
     expected_flops = 10.0 * 2 * 8 * 256 * 64 * 64
     expected_input_bytes = (2 * 2 * 8 * 256 * 64 + 2 * 2 * 8 * 256 * 64 * 64) * 2.0
     expected_weight_bytes = 0.0
     expected_output_bytes = (2 * 8 * 256 * 64 + 2 * 2 * 8 * 256 * 64 * 64) * 2.0
 
     def test_compute_q_kv_and_output_dtypes_are_independent(self):
-        k = backward.SparseAttn(
+        k = backward.DpskV4SparseAttn(
             B=1, H=2, H_kv=1, S_q=3, k_sel=2, Hd=4,
             dtype="fp8", kv_factor=1,
             q_dtype="bf16", kv_dtype="fp8", out_dtype="bf16")
@@ -476,7 +478,7 @@ class TestBwdSparseAttn(TestKernelBase):
             q_elements * 2.0 + kv_elements * 1.0)
 
     def test_fused_indexer_respects_independent_dtypes(self):
-        k = backward.SparseAttn(
+        k = backward.DpskV4SparseAttn(
             B=2, H=8, H_kv=1, S_q=4, k_sel=6, Hd=8,
             dtype="fp8", kv_factor=1,
             indexer_s_kv=10, indexer_h=3, indexer_hd=4,
@@ -499,7 +501,7 @@ class TestBwdSparseAttn(TestKernelBase):
         }
 
     def test_causal_only_halves_context_dependent_sparse_work(self):
-        k = backward.SparseAttn(
+        k = backward.DpskV4SparseAttn(
             B=2, H=8, H_kv=1, S_q=256, k_sel=64, Hd=64,
             kv_factor=1, causal=True, causal_k_sel=32)
         effective_k_sel = 48
@@ -513,14 +515,14 @@ class TestBwdSparseAttn(TestKernelBase):
             + 1 * 2 * 1 * 256 * effective_k_sel * 64) * 2.0
 
     def test_causal_fixed_topk_is_not_halved(self):
-        k = backward.SparseAttn(
+        k = backward.DpskV4SparseAttn(
             B=2, H=8, H_kv=1, S_q=256, k_sel=64, Hd=64,
             kv_factor=1, causal=True)
         assert k.effective_k_sel == 64
         assert k.flops == 10.0 * 2 * 8 * 256 * 64 * 64
 
     def test_fused_indexer_backward_flops_and_bytes(self):
-        k = backward.SparseAttn(
+        k = backward.DpskV4SparseAttn(
             B=2, H=8, H_kv=1, S_q=4, k_sel=6, Hd=8,
             kv_factor=1, indexer_s_kv=10, indexer_h=3, indexer_hd=4,
             indexer_dtype="fp4", causal=True, causal_k_sel=2)
@@ -551,8 +553,8 @@ class TestBwdSparseAttn(TestKernelBase):
         kwargs = dict(
             B=2, H=8, H_kv=1, S_q=1, k_sel=6, Hd=8,
             indexer_s_kv=10, indexer_h=3, indexer_hd=4)
-        prefill = backward.SparseAttn(**kwargs, causal=True)
-        decode = backward.SparseAttn(**kwargs, causal=False)
+        prefill = backward.DpskV4SparseAttn(**kwargs, causal=True)
+        decode = backward.DpskV4SparseAttn(**kwargs, causal=False)
         assert decode.indexer_flops == 2 * prefill.indexer_flops
 
 

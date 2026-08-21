@@ -21,7 +21,7 @@ from fractions import Fraction
 from rooflang.language.kernels.comm import Broadcast, Gather, Reduce, Scatter
 from rooflang.language.kernels.forward import (
     Attn, ElementwiseOp, Embedding, Gemm, Nop, ReadInput, RMSNorm, Sampling,
-    SparseAttn, Slice, StridedGemm, TokenCombine, TokenDispatch,
+    DpskV4SparseAttn, Slice, StridedGemm, TokenCombine, TokenDispatch,
 )
 from rooflang.language.kernels.identity import Concat, Spawn
 from rooflang.language.tensor import Tensor
@@ -94,8 +94,8 @@ def _make_dependency_gather(tensor, n):
 
 def _context_split_attn_decode(kernel, n):
     """Split one decode attention over equal-size persistent KV shards."""
-    if not isinstance(kernel, SparseAttn):
-        raise TypeError("decode attention split requires SparseAttn")
+    if not isinstance(kernel, DpskV4SparseAttn):
+        raise TypeError("decode attention split requires DpskV4SparseAttn")
     if kernel.S_kv % n != 0:
         raise ValueError(
             f"attention S_kv={kernel.S_kv} must be divisible by {n}")
@@ -117,7 +117,7 @@ def _context_split_attn_decode(kernel, n):
             index_tensor, n, dim=1)
     copies = []
     for _ in range(n):
-        copy = SparseAttn(
+        copy = DpskV4SparseAttn(
             kernel.B, kernel.H, kernel.H_kv, kernel.S_q,
             kernel.k_sel // n, local_kv, kernel.Hd, kernel.dtype_,
             kernel.kv_factor,
@@ -325,7 +325,7 @@ def head_split(kernel, n):
 
     copies = []
     for _ in range(n):
-        c = SparseAttn(kernel.B, shard_h, kernel.H_kv, kernel.S_q,
+        c = DpskV4SparseAttn(kernel.B, shard_h, kernel.H_kv, kernel.S_q,
                        kernel.k_sel, kernel.S_kv, kernel.Hd, kernel.dtype_,
                        kernel.kv_factor,
                        indexer_s_kv=kernel.indexer_s_kv,
@@ -373,7 +373,7 @@ def _context_split(kernel, n, *, is_prefill):
     Prefill attention shards Q and receives logical full KV through AllGather;
     decode attention broadcasts Q and keeps KV sharded.
     """
-    if isinstance(kernel, (Attn, SparseAttn)):
+    if isinstance(kernel, (Attn, DpskV4SparseAttn)):
         if is_prefill:
             return _context_split_attn_prefill(kernel, n)
         else:
@@ -427,8 +427,8 @@ def _context_split_attn_prefill(kernel, n):
 
     copies = []
     for _ in range(n):
-        if isinstance(kernel, SparseAttn):
-            c = SparseAttn(
+        if isinstance(kernel, DpskV4SparseAttn):
+            c = DpskV4SparseAttn(
                 kernel.B, kernel.H, kernel.H_kv, kernel.S_q // n,
                 kernel.k_sel, kernel.S_kv, kernel.Hd, kernel.dtype_,
                 kernel.kv_factor,
@@ -585,8 +585,8 @@ def _make_batch_copy(kernel, n):
     elif isinstance(kernel, TokenCombine):
         c = TokenCombine(kernel.M // n, kernel.D, kernel.N_experts,
                          kernel.topk, kernel.a_dtype)
-    elif isinstance(kernel, SparseAttn):
-        c = SparseAttn(kernel.B // n, kernel.H, kernel.H_kv, kernel.S_q,
+    elif isinstance(kernel, DpskV4SparseAttn):
+        c = DpskV4SparseAttn(kernel.B // n, kernel.H, kernel.H_kv, kernel.S_q,
                        kernel.k_sel, kernel.S_kv, kernel.Hd, kernel.dtype_,
                        kernel.kv_factor,
                        indexer_s_kv=kernel.indexer_s_kv,

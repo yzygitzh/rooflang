@@ -1363,8 +1363,8 @@ class TestInferDtype:
     """Test _infer_dtype static method coverage."""
 
     def test_sparse_attention_uses_main_compute_dtype(self):
-        from rooflang.language.kernels.forward import SparseAttn
-        kernel = SparseAttn(
+        from rooflang.language.kernels.forward import DpskV4SparseAttn
+        kernel = DpskV4SparseAttn(
             B=1, H=1, H_kv=1, S_q=1, k_sel=1, S_kv=1, Hd=1,
             dtype="fp8", q_dtype="bf16", kv_dtype="fp8",
             out_dtype="bf16")

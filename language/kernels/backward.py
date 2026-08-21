@@ -332,8 +332,8 @@ class Attn(Kernel):
                 + 2 * self.B * self.H_kv * self.S_kv * self.Hd) * b
 
 
-class SparseAttn(Kernel):
-    """Sparse-attention backward with an optional fused indexer backward.
+class DpskV4SparseAttn(Kernel):
+    """DeepSeek V4 sparse-attention backward with a fused indexer backward.
 
     flops = 10·B·H·S_q·effective_k_sel·Hd.  During causal prefill,
     only the context-dependent ``causal_k_sel`` portion receives the 0.5

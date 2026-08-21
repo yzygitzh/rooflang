@@ -78,10 +78,10 @@ def _select_model(name):
 
     model = load_model(name)
     _MODEL_NAME = name
-    COMPRESS_RATIOS = model.COMPRESS_RATIOS
+    COMPRESS_RATIOS = getattr(model, "COMPRESS_RATIOS", ())
     N_EXPERTS = model.N_EXPERTS
     N_LAYERS = model.N_LAYERS
-    WINDOW = model.WINDOW
+    WINDOW = getattr(model, "WINDOW", None)
     declare_model = model.declare_model
     optimize_model_cluster_decode = model.optimize_model_cluster_decode
     optimize_model_cluster_prefill = model.optimize_model_cluster_prefill
@@ -220,7 +220,9 @@ def enumerate_parallel_configs(
         if N_EXPERTS % ep != 0:
             continue
         for cp in _divisors(ep):
-            if WINDOW % cp != 0 or seq_prefill % cp != 0:
+            if seq_prefill % cp != 0:
+                continue
+            if WINDOW is not None and WINDOW % cp != 0:
                 continue
             if any(
                 seq_prefill % ratio != 0

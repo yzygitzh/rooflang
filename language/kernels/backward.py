@@ -259,34 +259,6 @@ class LayerNorm(Kernel):
                 + 2 * self.D * dtype_bytes(self.grad_dtype))
 
 
-class RoPE(Kernel):
-    """RoPE backward = forward rotation with negated angle.
-
-    flops = 3·M·D.
-    bytes: input_bytes = M·D (dy), output_bytes = M·D (dx).
-    """
-
-    def __init__(self, M: int, D: int, dtype: str = "bf16"):
-        self.M, self.D, self.dtype_ = M, D, dtype
-        super().__init__()
-
-    @property
-    def flops(self) -> float:
-        return 3.0 * self.M * self.D
-
-    @property
-    def input_bytes(self) -> float:
-        return self.M * self.D * dtype_bytes(self.dtype_)
-
-    @property
-    def weight_bytes(self) -> float:
-        return 0.0
-
-    @property
-    def output_bytes(self) -> float:
-        return self.M * self.D * dtype_bytes(self.dtype_)
-
-
 class Attn(Kernel):
     """Flash-Attention v2 backward (recompute S from saved LSE).
 
@@ -465,10 +437,249 @@ class DpskV4SparseAttn(Kernel):
         return main_attention + self.indexer_output_bytes
 
 
-class TokenDispatch(Kernel):
-    """TokenDispatch backward: gather scattered gradients + softmax backward.
+class Glm52SparseAttn(Kernel):
+    """Backward for GLM-5.2 DSA with full/shared indexer modes."""
 
-    flops = M·topk·D (gather-reduce for d_x) + 4·M·N_experts (softmax bwd).
+    def __init__(
+        self,
+        B: int,
+        H: int,
+        S_q: int,
+        k_sel: int,
+        S_kv: int,
+        qk_head_dim: int,
+        v_head_dim: int,
+        kv_cache_dim: int,
+        dtype: str = "bf16",
+        kv_lora_rank: int = 0,
+        qk_nope_head_dim: int = 0,
+        kv_transform_dtype: str = "fp8",
+        indexer_mode: str = "shared",
+        indexer_s_kv: int = 0,
+        indexer_h: int = 0,
+        indexer_hd: int = 0,
+        indexer_dtype: str = "fp8",
+        indexer_compute_dtype: str = "fp8",
+        indexer_reduce_dtype: str = "fp32",
+        *,
+        q_dtype: str | None = None,
+        kv_dtype: str = "fp8",
+        out_dtype: str | None = None,
+        index_q_dtype: str = "bf16",
+        index_weight_dtype: str = "fp32",
+        grad_dtype: str = "fp32",
+        causal: bool = False,
+        selected_pairs: int | Fraction | None = None,
+        indexer_pairs: int | Fraction | None = None,
+        kv_transform_tokens: int | Fraction | None = None,
+    ):
+        if indexer_mode not in {"full", "shared"}:
+            raise ValueError(
+                f"indexer_mode must be 'full' or 'shared', got {indexer_mode}")
+        if indexer_mode == "full" and min(
+                indexer_s_kv, indexer_h, indexer_hd) <= 0:
+            raise ValueError("full indexer dimensions must be positive")
+        if indexer_mode == "shared" and any(
+                (indexer_s_kv, indexer_h, indexer_hd)):
+            raise ValueError("shared indexer must not own indexer dimensions")
+
+        self.B, self.H = B, H
+        self.S_q, self.k_sel, self.S_kv = S_q, k_sel, S_kv
+        self.qk_head_dim = qk_head_dim
+        self.v_head_dim = v_head_dim
+        self.kv_cache_dim = kv_cache_dim
+        self.dtype_ = dtype
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.kv_transform_dtype = kv_transform_dtype
+        self.indexer_mode = indexer_mode
+        self.indexer_s_kv = indexer_s_kv
+        self.indexer_h = indexer_h
+        self.indexer_hd = indexer_hd
+        self.indexer_dtype = indexer_dtype
+        self.indexer_compute_dtype = indexer_compute_dtype
+        self.indexer_reduce_dtype = indexer_reduce_dtype
+        self.q_dtype = q_dtype or dtype
+        self.kv_dtype = kv_dtype
+        self.out_dtype = out_dtype or dtype
+        self.index_q_dtype = index_q_dtype
+        self.index_weight_dtype = index_weight_dtype
+        self.grad_dtype = grad_dtype
+        self.causal = causal
+        self.selected_pairs = (
+            self._default_selected_pairs() if selected_pairs is None
+            else Fraction(selected_pairs))
+        self.indexer_pairs = (
+            self._default_indexer_pairs() if indexer_pairs is None
+            else Fraction(indexer_pairs))
+        self.kv_transform_tokens = (
+            Fraction(self.S_q) if kv_transform_tokens is None
+            else Fraction(kv_transform_tokens))
+        super().__init__()
+
+    def _default_selected_pairs(self) -> Fraction:
+        selected = min(self.S_kv, self.k_sel)
+        if not self.causal:
+            return Fraction(self.S_q * selected)
+        if self.S_q == self.S_kv:
+            ramp = min(self.S_q, selected)
+            return Fraction(
+                ramp * (ramp + 1) // 2 + (self.S_q - ramp) * ramp)
+        return Fraction(self.S_q * selected, 2)
+
+    def _default_indexer_pairs(self) -> Fraction:
+        if self.indexer_mode == "shared":
+            return Fraction(0)
+        if not self.causal:
+            return Fraction(self.S_q * self.indexer_s_kv)
+        if self.S_q == self.indexer_s_kv:
+            return Fraction(self.S_q * (self.S_q + 1), 2)
+        return Fraction(self.S_q * self.indexer_s_kv, 2)
+
+    @property
+    def attention_flops(self) -> float:
+        per_pair = 6 * self.kv_cache_dim + 4 * self.kv_lora_rank
+        return float(self.B * self.H * self.selected_pairs * per_pair)
+
+    @property
+    def kv_transform_flops(self) -> float:
+        if self.kv_lora_rank == 0:
+            return 0.0
+        kv_out = self.H * (self.qk_nope_head_dim + self.v_head_dim)
+        return float(
+            4 * self.B * self.kv_transform_tokens
+            * self.kv_lora_rank * kv_out)
+
+    @property
+    def indexer_score_flops(self) -> float:
+        return float(
+            6 * self.B * self.indexer_h
+            * self.indexer_pairs * self.indexer_hd)
+
+    @property
+    def indexer_reduce_flops(self) -> float:
+        return float(
+            5 * self.B * self.indexer_h * self.indexer_pairs)
+
+    @property
+    def indexer_flops(self) -> float:
+        return self.indexer_score_flops + self.indexer_reduce_flops
+
+    @property
+    def flops(self) -> float:
+        return (self.attention_flops + self.kv_transform_flops
+                + self.indexer_flops)
+
+    @property
+    def flops_by_dtype(self) -> dict[str, float]:
+        result = {self.dtype_: self.attention_flops}
+        result[self.kv_transform_dtype] = (
+            result.get(self.kv_transform_dtype, 0.0)
+            + self.kv_transform_flops)
+        result[self.indexer_compute_dtype] = (
+            result.get(self.indexer_compute_dtype, 0.0)
+            + self.indexer_score_flops)
+        result[self.indexer_reduce_dtype] = (
+            result.get(self.indexer_reduce_dtype, 0.0)
+            + self.indexer_reduce_flops)
+        return {dtype: flops for dtype, flops in result.items() if flops > 0}
+
+    def input_read_fraction(self, port: str) -> float:
+        if port == "kv":
+            return min(
+                Fraction(1),
+                Fraction(self.S_q * min(self.k_sel, self.S_kv), self.S_kv),
+            )
+        return 1.0
+
+    @property
+    def input_tensor_bytes(self) -> float:
+        main = (
+            self.B * self.S_q * self.H * self.qk_head_dim
+            * dtype_bytes(self.q_dtype)
+            + self.B * self.S_q * self.H * self.v_head_dim
+            * dtype_bytes(self.out_dtype)
+            + self.B * self.S_kv * self.kv_cache_dim
+            * dtype_bytes(self.kv_dtype)
+        )
+        if self.indexer_mode == "shared":
+            return main
+        indexer = (
+            self.B * self.S_q * self.indexer_h * self.indexer_hd
+            * dtype_bytes(self.index_q_dtype)
+            + self.B * self.indexer_s_kv * self.indexer_hd
+            * dtype_bytes(self.indexer_dtype)
+            + self.B * self.S_q * self.indexer_h
+            * dtype_bytes(self.index_weight_dtype)
+            + self.B * self.S_q * self.indexer_s_kv
+            * dtype_bytes(self.indexer_reduce_dtype)
+        )
+        return main + indexer
+
+    @property
+    def input_bytes(self) -> float:
+        main_kv_reads = min(self.S_kv, self.S_q * self.k_sel)
+        main = (
+            self.B * self.S_q * self.H * self.qk_head_dim
+            * dtype_bytes(self.q_dtype)
+            + self.B * self.S_q * self.H * self.v_head_dim
+            * dtype_bytes(self.out_dtype)
+            + self.B * main_kv_reads * self.kv_cache_dim
+            * dtype_bytes(self.kv_dtype)
+        )
+        if self.indexer_mode == "shared":
+            return main
+        return main + (
+            self.B * self.S_q * self.indexer_h * self.indexer_hd
+            * dtype_bytes(self.index_q_dtype)
+            + self.B * self.indexer_s_kv * self.indexer_hd
+            * dtype_bytes(self.indexer_dtype)
+            + self.B * self.S_q * self.indexer_h
+            * dtype_bytes(self.index_weight_dtype)
+            + self.B * self.S_q * self.indexer_s_kv
+            * dtype_bytes(self.indexer_reduce_dtype)
+        )
+
+    @property
+    def weight_bytes(self) -> float:
+        if self.kv_lora_rank == 0:
+            return 0.0
+        kv_out = self.H * (self.qk_nope_head_dim + self.v_head_dim)
+        return (
+            self.kv_lora_rank * kv_out
+            * dtype_bytes(self.kv_transform_dtype)
+            + gemm_scale_bytes(
+                kv_out, self.kv_lora_rank, self.kv_transform_dtype)
+        )
+
+    @property
+    def output_bytes(self) -> float:
+        main = (
+            self.B * self.S_q * self.H * self.qk_head_dim
+            * dtype_bytes(self.q_dtype)
+            + self.B * self.S_kv * self.kv_cache_dim
+            * dtype_bytes(self.kv_dtype)
+        )
+        if self.kv_lora_rank:
+            kv_out = self.H * (self.qk_nope_head_dim + self.v_head_dim)
+            main += (self.kv_lora_rank * kv_out
+                     * dtype_bytes(self.grad_dtype))
+        if self.indexer_mode == "shared":
+            return main
+        return main + (
+            self.B * self.S_q * self.indexer_h * self.indexer_hd
+            * dtype_bytes(self.index_q_dtype)
+            + self.B * self.indexer_s_kv * self.indexer_hd
+            * dtype_bytes(self.indexer_dtype)
+            + self.B * self.S_q * self.indexer_h
+            * dtype_bytes(self.index_weight_dtype)
+        )
+
+
+class TokenDispatch(Kernel):
+    """TokenDispatch backward: gather gradients + routing-score backward.
+
+    Softmax backward costs 4·M·N_experts; sigmoid costs 3·M·N_experts.
     bytes:
         input_bytes  = M·topk·D·sizeof(a_dtype) + M·topk·4 + M·N_experts·4
                        (d_scattered + d_routing_weights + saved routing_probs)
@@ -477,17 +688,23 @@ class TokenDispatch(Kernel):
     """
 
     def __init__(self, M: int, D: int, N_experts: int, topk: int,
-                 a_dtype: str = "bf16"):
+                 a_dtype: str = "bf16", scoring_func: str = "softmax"):
+        if scoring_func not in {"softmax", "sigmoid"}:
+            raise ValueError(
+                f"unsupported routing scoring function: {scoring_func}")
         self.M, self.D = M, D
         self.N_experts = N_experts
         self.topk = topk
         self.a_dtype = a_dtype
+        self.scoring_func = scoring_func
         self.M_e = Fraction(M * topk, N_experts)
         super().__init__()
 
     @property
     def flops(self) -> float:
-        return self.M * self.topk * self.D + 4.0 * self.M * self.N_experts
+        score_flops = 4.0 if self.scoring_func == "softmax" else 3.0
+        return (self.M * self.topk * self.D
+                + score_flops * self.M * self.N_experts)
 
     @property
     def input_bytes(self) -> float:

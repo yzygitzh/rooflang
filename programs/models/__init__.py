@@ -3,7 +3,7 @@
 from importlib import import_module
 
 
-MODEL_NAMES = ("dsv4_pro", "dsv4_flash")
+MODEL_NAMES = ("dsv4_pro", "dsv4_flash", "glm_5_2_fp8")
 
 
 def load_model(name):

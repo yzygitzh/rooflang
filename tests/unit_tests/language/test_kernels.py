@@ -7,8 +7,9 @@ import pytest
 from rooflang.language.graph import ComputeGraph
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.kernels.forward import (
-    ElementwiseOp, Embedding, Gemm, Nop, ReadInput, RMSNorm, LayerNorm, RoPE,
-    Attn, DpskV4SparseAttn, Slice, Sampling, TokenDispatch, TokenCombine,
+    ElementwiseOp, Embedding, Gemm, Nop, ReadInput, RMSNorm, LayerNorm,
+    Attn, DpskV4SparseAttn, Glm52SparseAttn, Slice, Sampling, TokenDispatch,
+    TokenCombine,
 )
 from rooflang.language.kernels import backward
 from rooflang.language.kernels.comm import (
@@ -195,15 +196,6 @@ class TestLayerNorm(TestKernelBase):
     expected_output_bytes = 16 * 64 * 2.0
 
 
-class TestRoPE(TestKernelBase):
-    __test__ = True
-    kernel = RoPE(M=16, D=64)
-    expected_flops = 3.0 * 16 * 64
-    expected_input_bytes = 16 * 64 * 2.0
-    expected_weight_bytes = 0.0
-    expected_output_bytes = 16 * 64 * 2.0
-
-
 class TestAttn(TestKernelBase):
     __test__ = True
     kernel = Attn(B=2, H=8, H_kv=8, S_q=256, S_kv=256, Hd=64)
@@ -317,6 +309,91 @@ class TestDpskV4SparseAttn(TestKernelBase):
         assert kernel.flops == attention_flops + indexer_flops
 
 
+class TestGlm52SparseAttn:
+    def test_full_indexer_flops_bytes_and_graph_validation(self):
+        kernel = Glm52SparseAttn(
+            B=2, H=4, S_q=3, k_sel=2, S_kv=5,
+            qk_head_dim=6, v_head_dim=8, kv_cache_dim=10,
+            kv_lora_rank=4, qk_nope_head_dim=2,
+            indexer_mode="full", indexer_s_kv=5,
+            indexer_h=2, indexer_hd=4)
+        kernel.inputs = {
+            "q": Tensor("bf16", (2, 3, 4 * 6)),
+            "kv": Tensor("fp8", (2, 5, 10)),
+            "index_q": Tensor("bf16", (2, 3, 2 * 4)),
+            "index_kv": Tensor("fp8", (2, 5, 4)),
+            "index_weights": Tensor("fp32", (2, 3, 2)),
+        }
+        kernel.weights = {
+            "kv_b": Tensor("fp8", (4, 4 * (2 + 8))),
+            "kv_b_scale": Tensor("ue8m0", (1,)),
+        }
+        kernel.outputs = {"y": Tensor("bf16", (2, 3, 4 * 8))}
+
+        attention = 2 * 2 * 4 * (3 * 2) * (10 + 4)
+        transform = 2 * 2 * 3 * 4 * (4 * (2 + 8))
+        indexer_score = 2 * 2 * 2 * (3 * 5) * 4
+        indexer_reduce = 3 * 2 * 2 * (3 * 5)
+        assert kernel.attention_flops == attention
+        assert kernel.kv_transform_flops == transform
+        assert kernel.indexer_score_flops == indexer_score
+        assert kernel.indexer_reduce_flops == indexer_reduce
+        assert kernel.indexer_flops == indexer_score + indexer_reduce
+        assert kernel.flops_by_dtype == {
+            "bf16": attention,
+            "fp8": transform + indexer_score,
+            "fp32": indexer_reduce,
+        }
+        assert kernel.input_read_fraction("kv") == 1
+
+        graph = ComputeGraph()
+        graph.add_kernel(kernel)
+        graph.validate()
+
+    def test_shared_indexer_has_no_indexer_cost_or_bytes(self):
+        kernel = Glm52SparseAttn(
+            B=1, H=4, S_q=1, k_sel=2, S_kv=8,
+            qk_head_dim=6, v_head_dim=8, kv_cache_dim=10,
+            indexer_mode="shared")
+        kernel.inputs = {
+            "q": Tensor("bf16", (1, 1, 4 * 6)),
+            "kv": Tensor("fp8", (1, 8, 10)),
+        }
+        kernel.outputs = {"y": Tensor("bf16", (1, 1, 4 * 8))}
+
+        assert kernel.indexer_flops == 0
+        assert kernel.input_tensor_bytes == 4 * 6 * 2 + 8 * 10
+        assert kernel.input_bytes == 4 * 6 * 2 + 2 * 10
+        assert kernel.input_read_fraction("kv") == Fraction(1, 4)
+
+        graph = ComputeGraph()
+        graph.add_kernel(kernel)
+        graph.validate()
+
+    def test_causal_topk_pair_counts_are_exact(self):
+        kernel = Glm52SparseAttn(
+            B=1, H=1, S_q=8, k_sel=4, S_kv=8,
+            qk_head_dim=2, v_head_dim=3, kv_cache_dim=5,
+            kv_lora_rank=4,
+            indexer_mode="full", indexer_s_kv=8,
+            indexer_h=1, indexer_hd=2, causal=True)
+        assert kernel.selected_pairs == 26
+        assert kernel.indexer_pairs == 36
+        assert kernel.attention_flops == 2 * 26 * (5 + 4)
+        assert kernel.indexer_flops == 2 * 36 * 2 + 3 * 36
+
+    def test_indexer_mode_validation(self):
+        kwargs = dict(
+            B=1, H=1, S_q=1, k_sel=1, S_kv=1,
+            qk_head_dim=2, v_head_dim=2, kv_cache_dim=3)
+        with pytest.raises(ValueError, match="full indexer dimensions"):
+            Glm52SparseAttn(**kwargs, indexer_mode="full")
+        with pytest.raises(ValueError, match="shared indexer"):
+            Glm52SparseAttn(
+                **kwargs, indexer_mode="shared",
+                indexer_s_kv=1, indexer_h=1, indexer_hd=1)
+
+
 class TestElementwiseOpAdd(TestKernelBase):
     __test__ = True
     kernel = ElementwiseOp(M=8192, D=7168, dtype="bf16", op="add")
@@ -415,15 +492,6 @@ class TestBwdLayerNorm(TestKernelBase):
     expected_input_bytes = 2 * 16 * 64 * 2.0
     expected_weight_bytes = 64 * 2.0
     expected_output_bytes = 16 * 64 * 2.0 + 2 * 64 * 4.0
-
-
-class TestBwdRoPE(TestKernelBase):
-    __test__ = True
-    kernel = backward.RoPE(M=16, D=64)
-    expected_flops = 3.0 * 16 * 64
-    expected_input_bytes = 16 * 64 * 2.0
-    expected_weight_bytes = 0.0
-    expected_output_bytes = 16 * 64 * 2.0
 
 
 class TestBwdAttn(TestKernelBase):
@@ -556,6 +624,67 @@ class TestBwdDpskV4SparseAttn(TestKernelBase):
         prefill = backward.DpskV4SparseAttn(**kwargs, causal=True)
         decode = backward.DpskV4SparseAttn(**kwargs, causal=False)
         assert decode.indexer_flops == 2 * prefill.indexer_flops
+
+
+class TestBwdGlm52SparseAttn:
+    def test_full_indexer_flops_bytes_and_graph_validation(self):
+        kernel = backward.Glm52SparseAttn(
+            B=2, H=4, S_q=3, k_sel=2, S_kv=5,
+            qk_head_dim=6, v_head_dim=8, kv_cache_dim=10,
+            kv_lora_rank=4, qk_nope_head_dim=2,
+            indexer_mode="full", indexer_s_kv=5,
+            indexer_h=2, indexer_hd=4)
+        kernel.inputs = {
+            "q": Tensor("bf16", (2, 3, 4 * 6)),
+            "dy": Tensor("bf16", (2, 3, 4 * 8)),
+            "kv": Tensor("fp8", (2, 5, 10)),
+            "index_q": Tensor("bf16", (2, 3, 2 * 4)),
+            "index_kv": Tensor("fp8", (2, 5, 4)),
+            "index_weights": Tensor("fp32", (2, 3, 2)),
+            "d_index_scores": Tensor("fp32", (2, 3, 5)),
+        }
+        kernel.weights = {
+            "kv_b": Tensor("fp8", (4, 4 * (2 + 8))),
+            "kv_b_scale": Tensor("ue8m0", (1,)),
+        }
+        kernel.outputs = {
+            "dq": Tensor("bf16", (2, 3, 4 * 6)),
+            "dkv": Tensor("fp8", (2, 5, 10)),
+            "d_kv_b": Tensor("fp32", (4, 4 * (2 + 8))),
+            "d_index_q": Tensor("bf16", (2, 3, 2 * 4)),
+            "d_index_kv": Tensor("fp8", (2, 5, 4)),
+            "d_index_weights": Tensor("fp32", (2, 3, 2)),
+        }
+
+        attention = 2 * 4 * (3 * 2) * (6 * 10 + 4 * 4)
+        transform = 4 * 2 * 3 * 4 * (4 * (2 + 8))
+        indexer_score = 6 * 2 * 2 * (3 * 5) * 4
+        indexer_reduce = 5 * 2 * 2 * (3 * 5)
+        assert kernel.attention_flops == attention
+        assert kernel.kv_transform_flops == transform
+        assert kernel.indexer_score_flops == indexer_score
+        assert kernel.indexer_reduce_flops == indexer_reduce
+        assert kernel.indexer_flops == indexer_score + indexer_reduce
+        assert kernel.flops_by_dtype == {
+            "bf16": attention,
+            "fp8": transform + indexer_score,
+            "fp32": indexer_reduce,
+        }
+
+        graph = ComputeGraph()
+        graph.add_kernel(kernel)
+        graph.validate()
+
+    def test_shared_causal_has_no_indexer_backward(self):
+        kernel = backward.Glm52SparseAttn(
+            B=1, H=1, S_q=8, k_sel=4, S_kv=8,
+            qk_head_dim=2, v_head_dim=3, kv_cache_dim=5,
+            kv_lora_rank=4,
+            indexer_mode="shared", causal=True)
+        assert kernel.selected_pairs == 26
+        assert kernel.indexer_pairs == 0
+        assert kernel.indexer_flops == 0
+        assert kernel.attention_flops == 26 * (6 * 5 + 4 * 4)
 
 
 class TestBwdElementwiseOpAdd(TestKernelBase):
@@ -721,6 +850,13 @@ class TestTokenDispatch(TestKernelBase):
     def test_fractional_m_e(self):
         assert TokenDispatch(32, 7168, 384, 6).M_e == Fraction(1, 2)
 
+    def test_sigmoid_scoring(self):
+        kernel = TokenDispatch(
+            M=32, D=64, N_experts=8, topk=2,
+            scoring_func="sigmoid")
+        assert kernel.scoring_func == "sigmoid"
+        assert kernel.flops == 3.0 * 32 * 8
+
 
 class TestTokenCombine(TestKernelBase):
     __test__ = True
@@ -753,6 +889,13 @@ class TestBwdTokenDispatch(TestKernelBase):
     def test_fractional_m_e(self):
         assert backward.TokenDispatch(
             32, 7168, 384, 6).M_e == Fraction(1, 2)
+
+    def test_sigmoid_scoring(self):
+        kernel = backward.TokenDispatch(
+            M=32, D=64, N_experts=8, topk=2,
+            scoring_func="sigmoid")
+        assert kernel.scoring_func == "sigmoid"
+        assert kernel.flops == 32 * 2 * 64 + 3.0 * 32 * 8
 
 
 class TestBwdTokenCombine(TestKernelBase):

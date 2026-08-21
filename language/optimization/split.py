@@ -20,8 +20,9 @@ from fractions import Fraction
 
 from rooflang.language.kernels.comm import Broadcast, Gather, Reduce, Scatter
 from rooflang.language.kernels.forward import (
-    Attn, ElementwiseOp, Embedding, Gemm, Nop, ReadInput, RMSNorm, Sampling,
-    DpskV4SparseAttn, Slice, StridedGemm, TokenCombine, TokenDispatch,
+    Attn, DpskV4SparseAttn, ElementwiseOp, Embedding, Gemm,
+    Glm52SparseAttn, LayerNorm, Nop, ReadInput, RMSNorm, Sampling,
+    Slice, StridedGemm, TokenCombine, TokenDispatch,
 )
 from rooflang.language.kernels.identity import Concat, Spawn
 from rooflang.language.tensor import Tensor
@@ -94,8 +95,9 @@ def _make_dependency_gather(tensor, n):
 
 def _context_split_attn_decode(kernel, n):
     """Split one decode attention over equal-size persistent KV shards."""
-    if not isinstance(kernel, DpskV4SparseAttn):
-        raise TypeError("decode attention split requires DpskV4SparseAttn")
+    if not isinstance(kernel, (DpskV4SparseAttn, Glm52SparseAttn)):
+        raise TypeError(
+            "decode attention split requires a sparse-attention kernel")
     if kernel.S_kv % n != 0:
         raise ValueError(
             f"attention S_kv={kernel.S_kv} must be divisible by {n}")
@@ -113,24 +115,53 @@ def _context_split_attn_decode(kernel, n):
     }
     index_tensor = kernel.inputs.get("index_kv")
     if index_tensor is not None:
-        prev_comms["index_kv"] = _make_scatter(
-            index_tensor, n, dim=1)
+        prev_comms["index_kv"] = _make_scatter(index_tensor, n, dim=1)
+    for port in ("index_q", "index_weights"):
+        tensor = kernel.inputs.get(port)
+        if tensor is not None:
+            prev_comms[port] = _make_broadcast(tensor, n)
     copies = []
     for _ in range(n):
-        copy = DpskV4SparseAttn(
-            kernel.B, kernel.H, kernel.H_kv, kernel.S_q,
-            kernel.k_sel // n, local_kv, kernel.Hd, kernel.dtype_,
-            kernel.kv_factor,
-            indexer_s_kv=kernel.indexer_s_kv // n,
-            indexer_h=kernel.indexer_h,
-            indexer_hd=kernel.indexer_hd,
-            indexer_dtype=kernel.indexer_dtype,
-            indexer_compute_dtype=kernel.indexer_compute_dtype,
-            q_dtype=kernel.q_dtype,
-            kv_dtype=kernel.kv_dtype,
-            out_dtype=kernel.out_dtype,
-            causal=kernel.causal,
-            causal_k_sel=kernel.causal_k_sel // n)
+        if isinstance(kernel, Glm52SparseAttn):
+            copy = Glm52SparseAttn(
+                kernel.B, kernel.H, kernel.S_q, kernel.k_sel // n,
+                local_kv, kernel.qk_head_dim, kernel.v_head_dim,
+                kernel.kv_cache_dim, kernel.dtype_,
+                kv_lora_rank=kernel.kv_lora_rank,
+                qk_nope_head_dim=kernel.qk_nope_head_dim,
+                kv_transform_dtype=kernel.kv_transform_dtype,
+                indexer_mode=kernel.indexer_mode,
+                indexer_s_kv=(kernel.indexer_s_kv // n
+                              if kernel.indexer_mode == "full" else 0),
+                indexer_h=kernel.indexer_h,
+                indexer_hd=kernel.indexer_hd,
+                indexer_dtype=kernel.indexer_dtype,
+                indexer_compute_dtype=kernel.indexer_compute_dtype,
+                indexer_reduce_dtype=kernel.indexer_reduce_dtype,
+                q_dtype=kernel.q_dtype,
+                kv_dtype=kernel.kv_dtype,
+                out_dtype=kernel.out_dtype,
+                index_q_dtype=kernel.index_q_dtype,
+                index_weight_dtype=kernel.index_weight_dtype,
+                causal=kernel.causal,
+                selected_pairs=kernel.selected_pairs / n,
+                indexer_pairs=kernel.indexer_pairs / n,
+                kv_transform_tokens=kernel.kv_transform_tokens / n)
+        else:
+            copy = DpskV4SparseAttn(
+                kernel.B, kernel.H, kernel.H_kv, kernel.S_q,
+                kernel.k_sel // n, local_kv, kernel.Hd, kernel.dtype_,
+                kernel.kv_factor,
+                indexer_s_kv=kernel.indexer_s_kv // n,
+                indexer_h=kernel.indexer_h,
+                indexer_hd=kernel.indexer_hd,
+                indexer_dtype=kernel.indexer_dtype,
+                indexer_compute_dtype=kernel.indexer_compute_dtype,
+                q_dtype=kernel.q_dtype,
+                kv_dtype=kernel.kv_dtype,
+                out_dtype=kernel.out_dtype,
+                causal=kernel.causal,
+                causal_k_sel=kernel.causal_k_sel // n)
         copy.inputs = {
             "q": Tensor(q_tensor.dtype, q_tensor.shape),
             "kv": Tensor(
@@ -140,6 +171,14 @@ def _context_split_attn_decode(kernel, n):
             copy.inputs["index_kv"] = Tensor(
                 index_tensor.dtype,
                 _shard_shape(index_tensor.shape, n, dim=1))
+        for port in ("index_q", "index_weights"):
+            tensor = kernel.inputs.get(port)
+            if tensor is not None:
+                copy.inputs[port] = Tensor(tensor.dtype, tensor.shape)
+        copy.weights = {
+            port: Tensor(tensor.dtype, tensor.shape, tensor.weight_id)
+            for port, tensor in kernel.weights.items()
+        }
         copy.outputs = {
             "y": Tensor(out_tensor.dtype, out_tensor.shape)}
         copies.append(copy)
@@ -322,29 +361,88 @@ def head_split(kernel, n):
     index_tensor = kernel.inputs.get("index_kv")
     if index_tensor is not None:
         prev_comms["index_kv"] = _make_broadcast(index_tensor, n)
+    index_q_tensor = kernel.inputs.get("index_q")
+    if index_q_tensor is not None:
+        prev_comms["index_q"] = _make_scatter(
+            index_q_tensor, n, dim=-1)
+    index_weight_tensor = kernel.inputs.get("index_weights")
+    if index_weight_tensor is not None:
+        prev_comms["index_weights"] = _make_scatter(
+            index_weight_tensor, n, dim=-1)
 
     copies = []
-    for _ in range(n):
-        c = DpskV4SparseAttn(kernel.B, shard_h, kernel.H_kv, kernel.S_q,
-                       kernel.k_sel, kernel.S_kv, kernel.Hd, kernel.dtype_,
-                       kernel.kv_factor,
-                       indexer_s_kv=kernel.indexer_s_kv,
-                       indexer_h=(kernel.indexer_h // n
-                                  if kernel.indexer_h else 0),
-                       indexer_hd=kernel.indexer_hd,
-                       indexer_dtype=kernel.indexer_dtype,
-                       indexer_compute_dtype=kernel.indexer_compute_dtype,
-                       q_dtype=kernel.q_dtype,
-                       kv_dtype=kernel.kv_dtype,
-                       out_dtype=kernel.out_dtype,
-                       causal=kernel.causal,
-                       causal_k_sel=kernel.causal_k_sel)
+    for i in range(n):
+        if isinstance(kernel, Glm52SparseAttn):
+            c = Glm52SparseAttn(
+                kernel.B, shard_h, kernel.S_q, kernel.k_sel, kernel.S_kv,
+                kernel.qk_head_dim, kernel.v_head_dim, kernel.kv_cache_dim,
+                kernel.dtype_, kv_lora_rank=kernel.kv_lora_rank,
+                qk_nope_head_dim=kernel.qk_nope_head_dim,
+                kv_transform_dtype=kernel.kv_transform_dtype,
+                indexer_mode=kernel.indexer_mode,
+                indexer_s_kv=kernel.indexer_s_kv,
+                indexer_h=(kernel.indexer_h // n
+                           if kernel.indexer_mode == "full" else 0),
+                indexer_hd=kernel.indexer_hd,
+                indexer_dtype=kernel.indexer_dtype,
+                indexer_compute_dtype=kernel.indexer_compute_dtype,
+                indexer_reduce_dtype=kernel.indexer_reduce_dtype,
+                q_dtype=kernel.q_dtype,
+                kv_dtype=kernel.kv_dtype,
+                out_dtype=kernel.out_dtype,
+                index_q_dtype=kernel.index_q_dtype,
+                index_weight_dtype=kernel.index_weight_dtype,
+                causal=kernel.causal,
+                selected_pairs=kernel.selected_pairs,
+                indexer_pairs=kernel.indexer_pairs,
+                kv_transform_tokens=kernel.kv_transform_tokens)
+        else:
+            c = DpskV4SparseAttn(
+                kernel.B, shard_h, kernel.H_kv, kernel.S_q,
+                kernel.k_sel, kernel.S_kv, kernel.Hd, kernel.dtype_,
+                kernel.kv_factor,
+                indexer_s_kv=kernel.indexer_s_kv,
+                indexer_h=(kernel.indexer_h // n
+                           if kernel.indexer_h else 0),
+                indexer_hd=kernel.indexer_hd,
+                indexer_dtype=kernel.indexer_dtype,
+                indexer_compute_dtype=kernel.indexer_compute_dtype,
+                q_dtype=kernel.q_dtype,
+                kv_dtype=kernel.kv_dtype,
+                out_dtype=kernel.out_dtype,
+                causal=kernel.causal,
+                causal_k_sel=kernel.causal_k_sel)
         c.inputs = {"q": Tensor(q_tensor.dtype, shard_q_shape),
                     "kv": Tensor(kv_tensor.dtype, kv_tensor.shape)}
         if index_tensor is not None:
             c.inputs["index_kv"] = Tensor(
                 index_tensor.dtype, index_tensor.shape)
-        c.outputs = {"y": Tensor(out_tensor.dtype, shard_q_shape)}
+        if index_q_tensor is not None:
+            c.inputs["index_q"] = Tensor(
+                index_q_tensor.dtype,
+                _shard_shape(index_q_tensor.shape, n, dim=-1))
+        if index_weight_tensor is not None:
+            c.inputs["index_weights"] = Tensor(
+                index_weight_tensor.dtype,
+                _shard_shape(index_weight_tensor.shape, n, dim=-1))
+        if isinstance(kernel, Glm52SparseAttn) and kernel.weights:
+            kv_out = shard_h * (
+                kernel.qk_nope_head_dim + kernel.v_head_dim)
+            c.weights = {
+                "kv_b": Tensor(
+                    kernel.kv_transform_dtype,
+                    (kernel.kv_lora_rank, kv_out)),
+            }
+            scale_bytes = gemm_scale_bytes(
+                kv_out, kernel.kv_lora_rank, kernel.kv_transform_dtype)
+            if scale_bytes > 0:
+                c.weights["kv_b_scale"] = Tensor(
+                    "ue8m0", (int(scale_bytes),))
+            _propagate_weight_id(kernel.weights, c.weights, i, "column")
+        c.outputs = {
+            "y": Tensor(
+                out_tensor.dtype,
+                _shard_shape(out_tensor.shape, n, dim=-1))}
         copies.append(c)
 
     next_comms = {"y": _make_gather(out_tensor, n, dim=-1)}
@@ -373,7 +471,7 @@ def _context_split(kernel, n, *, is_prefill):
     Prefill attention shards Q and receives logical full KV through AllGather;
     decode attention broadcasts Q and keeps KV sharded.
     """
-    if isinstance(kernel, (Attn, DpskV4SparseAttn)):
+    if isinstance(kernel, (Attn, DpskV4SparseAttn, Glm52SparseAttn)):
         if is_prefill:
             return _context_split_attn_prefill(kernel, n)
         else:
@@ -424,10 +522,38 @@ def _context_split_attn_prefill(kernel, n):
     index_tensor = kernel.inputs.get("index_kv")
     if index_tensor is not None:
         prev_comms["index_kv"] = _make_broadcast(index_tensor, n)
+    for port in ("index_q", "index_weights"):
+        tensor = kernel.inputs.get(port)
+        if tensor is not None:
+            prev_comms[port] = _make_scatter(tensor, n, dim=1)
 
     copies = []
     for _ in range(n):
-        if isinstance(kernel, DpskV4SparseAttn):
+        if isinstance(kernel, Glm52SparseAttn):
+            c = Glm52SparseAttn(
+                kernel.B, kernel.H, kernel.S_q // n, kernel.k_sel,
+                kernel.S_kv, kernel.qk_head_dim, kernel.v_head_dim,
+                kernel.kv_cache_dim, kernel.dtype_,
+                kv_lora_rank=kernel.kv_lora_rank,
+                qk_nope_head_dim=kernel.qk_nope_head_dim,
+                kv_transform_dtype=kernel.kv_transform_dtype,
+                indexer_mode=kernel.indexer_mode,
+                indexer_s_kv=kernel.indexer_s_kv,
+                indexer_h=kernel.indexer_h,
+                indexer_hd=kernel.indexer_hd,
+                indexer_dtype=kernel.indexer_dtype,
+                indexer_compute_dtype=kernel.indexer_compute_dtype,
+                indexer_reduce_dtype=kernel.indexer_reduce_dtype,
+                q_dtype=kernel.q_dtype,
+                kv_dtype=kernel.kv_dtype,
+                out_dtype=kernel.out_dtype,
+                index_q_dtype=kernel.index_q_dtype,
+                index_weight_dtype=kernel.index_weight_dtype,
+                causal=kernel.causal,
+                selected_pairs=kernel.selected_pairs / n,
+                indexer_pairs=kernel.indexer_pairs / n,
+                kv_transform_tokens=kernel.kv_transform_tokens / n)
+        elif isinstance(kernel, DpskV4SparseAttn):
             c = DpskV4SparseAttn(
                 kernel.B, kernel.H, kernel.H_kv, kernel.S_q // n,
                 kernel.k_sel, kernel.S_kv, kernel.Hd, kernel.dtype_,
@@ -454,6 +580,15 @@ def _context_split_attn_prefill(kernel, n):
         if index_tensor is not None:
             c.inputs["index_kv"] = Tensor(
                 index_tensor.dtype, index_tensor.shape)
+        for port in ("index_q", "index_weights"):
+            tensor = kernel.inputs.get(port)
+            if tensor is not None:
+                c.inputs[port] = Tensor(
+                    tensor.dtype, _shard_shape(tensor.shape, n, dim=1))
+        c.weights = {
+            port: Tensor(tensor.dtype, tensor.shape, tensor.weight_id)
+            for port, tensor in kernel.weights.items()
+        }
         c.outputs = {"y": Tensor(out_tensor.dtype, out_shard)}
         copies.append(c)
 
@@ -474,6 +609,8 @@ def _make_context_copy(kernel, n):
                  kernel.a_dtype, kernel.out_dtype)
     elif isinstance(kernel, RMSNorm):
         c = RMSNorm(kernel.M // n, kernel.D, kernel.dtype_)
+    elif isinstance(kernel, LayerNorm):
+        c = LayerNorm(kernel.M // n, kernel.D, kernel.dtype_)
     elif isinstance(kernel, Embedding):
         c = Embedding(kernel.M // n, kernel.V, kernel.D, kernel.w_dtype,
                       kernel.idx_dtype, kernel.out_dtype)
@@ -481,7 +618,7 @@ def _make_context_copy(kernel, n):
         c = ReadInput(kernel.n_elements // n, kernel.dtype_)
     elif isinstance(kernel, TokenDispatch):
         c = TokenDispatch(kernel.M // n, kernel.D, kernel.N_experts,
-                          kernel.topk, kernel.a_dtype)
+                          kernel.topk, kernel.a_dtype, kernel.scoring_func)
     elif isinstance(kernel, TokenCombine):
         c = TokenCombine(kernel.M // n, kernel.D, kernel.N_experts,
                          kernel.topk, kernel.a_dtype)
@@ -574,6 +711,8 @@ def _make_batch_copy(kernel, n):
                  kernel.a_dtype, kernel.out_dtype)
     elif isinstance(kernel, RMSNorm):
         c = RMSNorm(kernel.M // n, kernel.D, kernel.dtype_)
+    elif isinstance(kernel, LayerNorm):
+        c = LayerNorm(kernel.M // n, kernel.D, kernel.dtype_)
     elif isinstance(kernel, Embedding):
         c = Embedding(kernel.M // n, kernel.V, kernel.D, kernel.w_dtype,
                       kernel.idx_dtype, kernel.out_dtype)
@@ -581,7 +720,7 @@ def _make_batch_copy(kernel, n):
         c = ReadInput(kernel.n_elements // n, kernel.dtype_)
     elif isinstance(kernel, TokenDispatch):
         c = TokenDispatch(kernel.M // n, kernel.D, kernel.N_experts,
-                          kernel.topk, kernel.a_dtype)
+                          kernel.topk, kernel.a_dtype, kernel.scoring_func)
     elif isinstance(kernel, TokenCombine):
         c = TokenCombine(kernel.M // n, kernel.D, kernel.N_experts,
                          kernel.topk, kernel.a_dtype)
@@ -599,6 +738,29 @@ def _make_batch_copy(kernel, n):
                        out_dtype=kernel.out_dtype,
                        causal=kernel.causal,
                        causal_k_sel=kernel.causal_k_sel)
+    elif isinstance(kernel, Glm52SparseAttn):
+        c = Glm52SparseAttn(
+            kernel.B // n, kernel.H, kernel.S_q, kernel.k_sel, kernel.S_kv,
+            kernel.qk_head_dim, kernel.v_head_dim, kernel.kv_cache_dim,
+            kernel.dtype_, kv_lora_rank=kernel.kv_lora_rank,
+            qk_nope_head_dim=kernel.qk_nope_head_dim,
+            kv_transform_dtype=kernel.kv_transform_dtype,
+            indexer_mode=kernel.indexer_mode,
+            indexer_s_kv=kernel.indexer_s_kv,
+            indexer_h=kernel.indexer_h,
+            indexer_hd=kernel.indexer_hd,
+            indexer_dtype=kernel.indexer_dtype,
+            indexer_compute_dtype=kernel.indexer_compute_dtype,
+            indexer_reduce_dtype=kernel.indexer_reduce_dtype,
+            q_dtype=kernel.q_dtype,
+            kv_dtype=kernel.kv_dtype,
+            out_dtype=kernel.out_dtype,
+            index_q_dtype=kernel.index_q_dtype,
+            index_weight_dtype=kernel.index_weight_dtype,
+            causal=kernel.causal,
+            selected_pairs=kernel.selected_pairs,
+            indexer_pairs=kernel.indexer_pairs,
+            kv_transform_tokens=kernel.kv_transform_tokens)
     elif isinstance(kernel, Spawn):
         c = Spawn(world=kernel.world)
     elif isinstance(kernel, Concat):

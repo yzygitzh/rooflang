@@ -11,8 +11,8 @@ from rooflang.language.kernels.comm import (
     ReduceScatter, Scatter, Send, Recv,
 )
 from rooflang.language.kernels.forward import (
-    Attn, DpskV4SparseAttn, Embedding, Gemm, Nop, ReadInput, RMSNorm, Slice,
-    StridedGemm, TokenCombine, TokenDispatch,
+    Attn, DpskV4SparseAttn, Embedding, Gemm, Glm52SparseAttn, Nop, ReadInput,
+    RMSNorm, Slice, StridedGemm, TokenCombine, TokenDispatch,
 )
 from rooflang.language.kernels.identity import Concat, Spawn
 from rooflang.language.tensor import Tensor
@@ -885,6 +885,95 @@ def test_context_split_decode_attention_broadcasts_q_and_shards_kv():
                for copy in copies)
     assert sum(copy.flops for copy in copies) == kernel.flops
     assert isinstance(nxt["y"], Reduce)
+
+
+def _make_glm52_sparse_attn(B=1, S_q=8, S_kv=8, causal=True):
+    kernel = Glm52SparseAttn(
+        B=B, H=8, S_q=S_q, k_sel=4, S_kv=S_kv,
+        qk_head_dim=6, v_head_dim=8, kv_cache_dim=10,
+        kv_lora_rank=4, qk_nope_head_dim=2,
+        indexer_mode="full", indexer_s_kv=S_kv,
+        indexer_h=4, indexer_hd=4, causal=causal)
+    kernel.inputs = {
+        "q": Tensor("bf16", (B, S_q, 8 * 6)),
+        "kv": Tensor("fp8", (B, S_kv, 10)),
+        "index_q": Tensor("bf16", (B, S_q, 4 * 4)),
+        "index_kv": Tensor("fp8", (B, S_kv, 4)),
+        "index_weights": Tensor("fp32", (B, S_q, 4)),
+    }
+    kernel.weights = {
+        "kv_b": Tensor("fp8", (4, 8 * (2 + 8))),
+        "kv_b_scale": Tensor("ue8m0", (1,)),
+    }
+    kernel.outputs = {"y": Tensor("bf16", (B, S_q, 8 * 8))}
+    return kernel
+
+
+def test_glm52_head_split_preserves_full_indexer_work():
+    kernel = _make_glm52_sparse_attn()
+
+    prev, copies, nxt = head_split(kernel, N)
+
+    assert set(prev) == {
+        "q", "kv", "index_q", "index_kv", "index_weights"}
+    assert isinstance(nxt["y"], Gather)
+    assert sum(copy.flops for copy in copies) == kernel.flops
+    for copy in copies:
+        assert isinstance(copy, Glm52SparseAttn)
+        assert copy.H == 2
+        assert copy.indexer_h == 1
+        assert copy.kv_cache_dim == 10
+        assert copy.inputs["q"].shape == (1, 8, 2 * 6)
+        assert copy.inputs["index_q"].shape == (1, 8, 4)
+        assert copy.outputs["y"].shape == (1, 8, 2 * 8)
+        assert copy.weights["kv_b"].shape == (4, 2 * (2 + 8))
+
+
+def test_glm52_context_split_prefill_preserves_exact_causal_pairs():
+    kernel = _make_glm52_sparse_attn()
+    assert kernel.selected_pairs == 26
+    assert kernel.indexer_pairs == 36
+
+    prev, copies, nxt = context_split_prefill(kernel, N)
+
+    assert isinstance(prev["q"], Scatter)
+    assert isinstance(prev["kv"], Broadcast)
+    assert isinstance(prev["index_q"], Scatter)
+    assert isinstance(prev["index_kv"], Broadcast)
+    assert isinstance(nxt["y"], Gather)
+    assert sum(copy.flops for copy in copies) == kernel.flops
+    assert sum(copy.selected_pairs for copy in copies) == 26
+    assert sum(copy.indexer_pairs for copy in copies) == 36
+    assert all(copy.S_q == 2 for copy in copies)
+
+
+def test_glm52_context_split_decode_shards_both_caches():
+    kernel = _make_glm52_sparse_attn(S_q=1, causal=False)
+
+    prev, copies, nxt = context_split_decode(kernel, N)
+
+    assert isinstance(prev["q"], Broadcast)
+    assert isinstance(prev["kv"], Scatter)
+    assert isinstance(prev["index_q"], Broadcast)
+    assert isinstance(prev["index_kv"], Scatter)
+    assert isinstance(nxt["y"], Reduce)
+    assert sum(copy.flops for copy in copies) == kernel.flops
+    assert all(copy.S_kv == 2 for copy in copies)
+    assert all(copy.k_sel == 1 for copy in copies)
+    assert all(copy.indexer_s_kv == 2 for copy in copies)
+
+
+def test_glm52_batch_split_preserves_modes_dtypes_and_work():
+    kernel = _make_glm52_sparse_attn(B=8, S_q=1, causal=False)
+
+    _, copies, _ = batch_split(kernel, N)
+
+    assert sum(copy.flops for copy in copies) == kernel.flops
+    assert all(copy.B == 2 for copy in copies)
+    assert all(copy.indexer_mode == "full" for copy in copies)
+    assert all(copy.kv_dtype == "fp8" for copy in copies)
+    assert all(copy.indexer_compute_dtype == "fp8" for copy in copies)
+    assert all(copy.indexer_reduce_dtype == "fp32" for copy in copies)
 
 
 @pytest.mark.parametrize("output_name", ["prefill_output", "decode_output"])

@@ -226,3 +226,25 @@ def test_decode_kda_bridge_crosses_pipeline_boundary(monkeypatch):
 
     assert len(layers[1]._decode_copies["cp_dp"]["bridge"]) == 8
     assert Simulator(graph, placement, hardware).run().total_time_us > 0
+
+
+def test_prefill_attn_residual_crosses_pipeline_boundary(monkeypatch):
+    monkeypatch.setattr(model, "N_LAYERS", 13)
+    graph, layers, emb, read_input, _, output_head = model.declare_model(
+        batch_size=8, seq_prefill=128, decode=False)
+    hardware = B300Cluster(n_nodes=2)
+
+    graph, placement = optimization.optimize_model_cluster_prefill(
+        graph, layers, hardware, emb, read_input, output_head,
+        cp=2, dp=4, ep=8, pp_partition=[6, 7], n_gpus=16)
+
+    boundary = layers[6]
+    assert len(boundary._pp_block_residual_sends) == 8
+    destination_memories = {
+        placement.get_tensor_memory(copy.inputs["x"])
+        for copy in boundary._block_in_fan_cp_dp_copies
+    }
+    assert all(memory.name.startswith("n1-")
+               for memory in destination_memories)
+    graph.validate()
+    placement.validate(graph)

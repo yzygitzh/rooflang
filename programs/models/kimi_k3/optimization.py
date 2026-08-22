@@ -5,7 +5,7 @@ from fractions import Fraction
 
 from rooflang.language.hardware.component import Compute, Memory
 from rooflang.language.kernels.comm import (
-    AllGather, Broadcast, CommKernel, Gather, Reduce, Scatter,
+    AllGather, Broadcast, CommKernel, Gather, Reduce, Scatter, Send,
 )
 from rooflang.language.kernels.forward import (
     KimiK3DeltaAttnCpMerge, KimiK3DeltaAttnCpSummary, Nop,
@@ -608,6 +608,30 @@ def optimize_model_cluster_prefill(
     ]
     copies_by_layer = {id(layer): fields for layer, fields in layer_copies}
 
+    # A block residual is carried through a chain of zero-copy Spawn aliases
+    # independently of the ordinary hidden-state bridge.  At a PP boundary,
+    # insert one explicit point-to-point materialization so the source alias
+    # remains in its stage HBM while the destination chain starts locally.
+    for layer_id in range(1, len(layers)):
+        stage = layer_stages[layer_id]
+        if stage == layer_stages[layer_id - 1]:
+            continue
+        sends = []
+        fields = copies_by_layer[id(layers[layer_id])]
+        for spawn in fields.get("block_in_fan", ()):
+            edge = g._in_edges(spawn)[0]
+            source_port = next(
+                output_name for output_name, input_name in edge.mapping.items()
+                if input_name == "x")
+            tensor = spawn.inputs["x"]
+            send = Send(tensor.size_bytes)
+            send.inputs = {"x": Tensor(tensor.dtype, tensor.shape)}
+            send.outputs = {"y": Tensor(tensor.dtype, tensor.shape)}
+            g.insert_identity(
+                send, edge.src, spawn, {source_port: "x"})
+            sends.append(send)
+        layers[layer_id]._pp_block_residual_sends = sends
+
     # Place every compute kernel and tensor only after all splits are complete.
     placement = Placement(hardware=hw, graph=g)
     if read_input is not None:
@@ -628,10 +652,9 @@ def optimize_model_cluster_prefill(
         _place_experts_and_routes(
             g, layer, fields, devices, placement, hw, shard_experts=True)
 
-    # At a PP boundary, materialize the layer input in the destination HBM
-    # once. The input Spawn has multiple consumers (norm, compression, and
-    # residual paths); leaving its aliases in the source HBM makes every
-    # consumer repeat the same remote read.
+    # At a PP boundary, materialize the ordinary hidden-state layer input in
+    # destination HBM once.  The independently carried AttnRes block residual
+    # is handled by the explicit Send inserted above.
     for layer_id in range(1, len(layers)):
         stage = layer_stages[layer_id]
         if stage == layer_stages[layer_id - 1]:

@@ -7,6 +7,7 @@ import pytest
 import rooflang.programs.models.dsv4_flash as dsv4_flash
 import rooflang.programs.models.dsv4_pro as dsv4_pro
 import rooflang.programs.models.glm_5_2_fp8 as glm_5_2_fp8
+import rooflang.programs.models.kimi_k3 as kimi_k3
 from rooflang.language.graph import ComputeGraph
 from rooflang.language.hardware.component import Compute
 from rooflang.language.kernels.forward import Nop
@@ -23,10 +24,12 @@ def test_package_lazy_visualization_attribute():
 
 
 def test_model_loader_exposes_registered_models():
-    assert MODEL_NAMES == ("dsv4_pro", "dsv4_flash", "glm_5_2_fp8")
+    assert MODEL_NAMES == (
+        "dsv4_pro", "dsv4_flash", "glm_5_2_fp8", "kimi_k3")
     assert load_model("dsv4_pro") is dsv4_pro
     assert load_model("dsv4_flash") is dsv4_flash
     assert load_model("glm_5_2_fp8") is glm_5_2_fp8
+    assert load_model("kimi_k3") is kimi_k3
     with pytest.raises(ValueError, match="Unknown model"):
         load_model("missing")
 

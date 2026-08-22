@@ -126,8 +126,9 @@ class ElementwiseOp(Kernel):
     Supported ops:
       "add": y = a + b
       "mul": y = a * b
+      "sigmoid_mul": y = a * sigmoid(b)
 
-    flops = M·D (one op per element).
+    flops = M·D for add/mul, 5·M·D for a sigmoid followed by multiply.
     bytes:
         input_bytes  = 2·M·D · sizeof(dtype)  (two input tensors)
         weight_bytes = 0
@@ -142,7 +143,8 @@ class ElementwiseOp(Kernel):
 
     @property
     def flops(self) -> float:
-        return float(self.M * self.D)
+        ops_per_element = 5 if self.op == "sigmoid_mul" else 1
+        return float(ops_per_element * self.M * self.D)
 
     @property
     def input_bytes(self) -> float:
@@ -168,14 +170,22 @@ class Gemm(Kernel):
     """
 
     def __init__(self, M: int, N: int, K: int,
-                 w_dtype: str, a_dtype: str, out_dtype: str = "bf16"):
+                 w_dtype: str, a_dtype: str, out_dtype: str = "bf16",
+                 compute_dtype: str | None = None):
         self.M, self.N, self.K = M, N, K
         self.w_dtype, self.a_dtype, self.out_dtype = w_dtype, a_dtype, out_dtype
+        self.compute_dtype = compute_dtype
         super().__init__()
 
     @property
     def flops(self) -> float:
         return 2.0 * self.M * self.N * self.K
+
+    @property
+    def flops_by_dtype(self) -> dict[str, float] | None:
+        if self.compute_dtype is None:
+            return None
+        return {self.compute_dtype: self.flops}
 
     @property
     def input_bytes(self) -> float:
@@ -222,6 +232,35 @@ class RMSNorm(Kernel):
         return self.M * self.D * dtype_bytes(self.dtype_)
 
 
+class PartialRMSNorm(Kernel):
+    """RMSNorm a prefix while forwarding the remaining features unchanged."""
+
+    def __init__(self, M: int, input_dim: int, norm_dim: int,
+                 dtype: str = "bf16"):
+        if not 0 < norm_dim <= input_dim:
+            raise ValueError(
+                f"norm_dim must be in [1, input_dim], got {norm_dim}")
+        self.M, self.input_dim = M, input_dim
+        self.norm_dim, self.dtype_ = norm_dim, dtype
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        return 4.0 * self.M * self.norm_dim
+
+    @property
+    def input_bytes(self) -> float:
+        return self.M * self.input_dim * dtype_bytes(self.dtype_)
+
+    @property
+    def weight_bytes(self) -> float:
+        return self.norm_dim * dtype_bytes(self.dtype_)
+
+    @property
+    def output_bytes(self) -> float:
+        return self.M * self.input_dim * dtype_bytes(self.dtype_)
+
+
 class LayerNorm(Kernel):
     """LayerNorm:  y = (x-mean)·rsqrt(var+eps)·gamma + beta.
 
@@ -251,6 +290,47 @@ class LayerNorm(Kernel):
     @property
     def output_bytes(self) -> float:
         return self.M * self.D * dtype_bytes(self.dtype_)
+
+
+class AttnRes(Kernel):
+    """Kimi AttnRes weighted residual aggregation.
+
+    ``R`` is the number of saved block residuals.  The current prefix sum is
+    appended internally, so every token scores and combines ``R + 1`` hidden
+    vectors.  Kimi's implementation casts the aggregation path to FP32.
+    """
+
+    def __init__(self, B: int, S: int, D: int, R: int,
+                 dtype: str = "bf16", compute_dtype: str = "fp32"):
+        self.B, self.S, self.D, self.R = B, S, D, R
+        self.dtype_ = compute_dtype
+        self.storage_dtype = dtype
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        candidates = self.R + 1
+        tokens = self.B * self.S
+        # RMS normalization + score dot + weighted reduction, plus softmax.
+        return float(
+            7 * tokens * candidates * self.D
+            + 5 * tokens * candidates
+            + self.D
+        )
+
+    @property
+    def input_bytes(self) -> float:
+        return (self.B * self.S * (self.R + 1) * self.D
+                * dtype_bytes(self.storage_dtype))
+
+    @property
+    def weight_bytes(self) -> float:
+        return 2 * self.D * dtype_bytes(self.storage_dtype)
+
+    @property
+    def output_bytes(self) -> float:
+        return (self.B * self.S * self.D
+                * dtype_bytes(self.storage_dtype))
 
 
 class Attn(Kernel):
@@ -294,6 +374,319 @@ class Attn(Kernel):
     @property
     def output_bytes(self) -> float:
         return self.B * self.H * self.S_q * self.Hd * dtype_bytes(self.dtype_)
+
+
+class KimiK3MlaAttn(Kernel):
+    """Kimi-K3 dense MLA with an absorbed latent KV core.
+
+    The logical query/output tensors retain their per-head dimensions while
+    the persistent KV input stores one shared latent plus the RoPE component.
+    The KV-B projection is absorbed into the attention kernel and remains an
+    explicit weight for memory-footprint accounting.
+    """
+
+    def __init__(
+        self,
+        B: int,
+        H: int,
+        S_q: int,
+        S_kv: int,
+        qk_head_dim: int,
+        v_head_dim: int,
+        kv_cache_dim: int,
+        kv_lora_rank: int,
+        qk_nope_head_dim: int,
+        dtype: str = "bf16",
+        kv_transform_dtype: str = "bf16",
+        *,
+        q_dtype: str | None = None,
+        kv_dtype: str = "fp8",
+        out_dtype: str | None = None,
+        causal: bool = False,
+        selected_pairs: int | Fraction | None = None,
+        kv_transform_tokens: int | Fraction | None = None,
+    ):
+        self.B, self.H = B, H
+        self.S_q, self.S_kv = S_q, S_kv
+        self.qk_head_dim = qk_head_dim
+        self.v_head_dim = v_head_dim
+        self.kv_cache_dim = kv_cache_dim
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.dtype_ = dtype
+        self.kv_transform_dtype = kv_transform_dtype
+        self.q_dtype = q_dtype or dtype
+        self.kv_dtype = kv_dtype
+        self.out_dtype = out_dtype or dtype
+        self.causal = causal
+        self.selected_pairs = (
+            self._default_selected_pairs() if selected_pairs is None
+            else Fraction(selected_pairs))
+        self.kv_transform_tokens = (
+            Fraction(self.S_q) if kv_transform_tokens is None
+            else Fraction(kv_transform_tokens))
+        super().__init__()
+
+    def _default_selected_pairs(self) -> Fraction:
+        if self.causal and self.S_q == self.S_kv:
+            return Fraction(self.S_q * (self.S_q + 1), 2)
+        return Fraction(self.S_q * self.S_kv)
+
+    @property
+    def attention_flops(self) -> float:
+        return float(
+            2 * self.B * self.H * self.selected_pairs
+            * (self.kv_cache_dim + self.kv_lora_rank))
+
+    @property
+    def kv_transform_flops(self) -> float:
+        kv_out = self.H * (self.qk_nope_head_dim + self.v_head_dim)
+        return float(
+            2 * self.B * self.kv_transform_tokens
+            * self.kv_lora_rank * kv_out)
+
+    @property
+    def flops(self) -> float:
+        return self.attention_flops + self.kv_transform_flops
+
+    @property
+    def flops_by_dtype(self) -> dict[str, float]:
+        result = {self.dtype_: self.attention_flops}
+        result[self.kv_transform_dtype] = (
+            result.get(self.kv_transform_dtype, 0.0)
+            + self.kv_transform_flops)
+        return {dtype: flops for dtype, flops in result.items() if flops > 0}
+
+    @property
+    def input_bytes(self) -> float:
+        return (
+            self.B * self.S_q * self.H * self.qk_head_dim
+            * dtype_bytes(self.q_dtype)
+            + self.B * self.S_kv * self.kv_cache_dim
+            * dtype_bytes(self.kv_dtype)
+        )
+
+    @property
+    def weight_bytes(self) -> float:
+        kv_out = self.H * (self.qk_nope_head_dim + self.v_head_dim)
+        return (
+            self.kv_lora_rank * kv_out
+            * dtype_bytes(self.kv_transform_dtype)
+            + gemm_scale_bytes(
+                kv_out, self.kv_lora_rank, self.kv_transform_dtype)
+        )
+
+    @property
+    def output_bytes(self) -> float:
+        return (self.B * self.S_q * self.H * self.v_head_dim
+                * dtype_bytes(self.out_dtype))
+
+
+class KimiK3DeltaAttn(Kernel):
+    """Kimi Delta Attention forward kernel.
+
+    Prefill uses the published chunkwise FLOP formula
+    ``6*T*d^2 + 3*T*C*d + T*C^2`` per head.  Single-token decode uses the
+    recurrent state update directly.  Q/K/V short convolutions, Q/K L2
+    normalization, and the fused gate activations are included here.
+    """
+
+    def __init__(
+        self,
+        B: int,
+        H: int,
+        S: int,
+        K: int,
+        V: int,
+        mode: str,
+        chunk_size: int = 64,
+        conv_size: int = 4,
+        dtype: str = "bf16",
+        state_dtype: str = "bf16",
+    ):
+        if mode not in {"chunk", "recurrent"}:
+            raise ValueError(f"unsupported KDA mode: {mode}")
+        self.B, self.H, self.S = B, H, S
+        self.K, self.V = K, V
+        self.mode = mode
+        self.chunk_size = chunk_size
+        self.conv_size = conv_size
+        self.dtype_ = dtype
+        self.state_dtype = state_dtype
+        self.cp_rank = None
+        super().__init__()
+
+    def input_read_fraction(self, port: str) -> float:
+        # The first sequence rank participates in the ring halo exchange but
+        # intentionally ignores the tail received from the last rank.
+        if port == "conv_halo" and self.cp_rank == 0:
+            return 0.0
+        return 1.0
+
+    @property
+    def attention_flops(self) -> float:
+        if self.mode == "chunk":
+            per_head = (
+                6 * self.S * self.K * self.V
+                + 3 * self.S * self.chunk_size * self.K
+                + self.S * self.chunk_size ** 2
+            )
+        else:
+            per_head = (
+                7 * self.S * self.K * self.V
+                + 2 * self.S * self.V
+            )
+        return float(self.B * self.H * per_head)
+
+    @property
+    def preprocessing_flops(self) -> float:
+        elements = self.B * self.H * self.S
+        conv = 3 * elements * self.K * (2 * self.conv_size + 4)
+        qk_norm = 2 * elements * (3 * self.K + 1)
+        gate = elements * (5 * self.K + 3)
+        return float(conv + qk_norm + gate)
+
+    @property
+    def flops(self) -> float:
+        return self.attention_flops + self.preprocessing_flops
+
+
+class KdaCpSummary(Kernel):
+    """Build one rank-local ``(M, S_ext)`` KDA transition summary.
+
+    This is the additional CP pre-process beyond the ordinary local chunk
+    kernel.  The dense M-chain is accumulated in FP32; other tensor-matrix
+    work follows the BF16 KDA compute path.
+    """
+
+    def __init__(
+        self,
+        B: int,
+        H: int,
+        S: int,
+        K: int,
+        V: int,
+        rank: int = 0,
+        world: int = 1,
+        chunk_size: int = 64,
+        conv_size: int = 4,
+        dtype: str = "bf16",
+        state_dtype: str = "bf16",
+    ):
+        self.B, self.H, self.S = B, H, S
+        self.K, self.V = K, V
+        self.rank, self.world = rank, world
+        self.chunk_size = chunk_size
+        self.conv_size = conv_size
+        self.dtype_ = dtype
+        self.state_dtype = state_dtype
+        super().__init__()
+
+    @property
+    def n_chunks(self) -> int:
+        return (self.S + self.chunk_size - 1) // self.chunk_size
+
+    @property
+    def bf16_flops(self) -> float:
+        if self.rank == self.world - 1:
+            return 0.0
+        per_head = (
+            4 * self.S * self.K * self.V
+            + 2 * self.n_chunks * self.K * self.V
+            + self.S * self.V
+            + 2 * self.S * self.K * self.K
+            + self.n_chunks * self.K * self.K
+        )
+        return float(self.B * self.H * per_head)
+
+    @property
+    def fp32_flops(self) -> float:
+        if self.rank == self.world - 1:
+            return 0.0
+        return float(
+            2 * self.B * self.H * self.n_chunks * self.K ** 3)
+
+    @property
+    def flops(self) -> float:
+        return self.bf16_flops + self.fp32_flops
+
+    @property
+    def flops_by_dtype(self) -> dict[str, float]:
+        return {self.dtype_: self.bf16_flops, "fp32": self.fp32_flops}
+
+    @property
+    def input_bytes(self) -> float:
+        # The summary is fused with the local WY representation.
+        return 0.0
+
+
+class KdaCpMerge(Kernel):
+    """Merge preceding rank summaries into one rank's KDA initial state."""
+
+    def __init__(
+        self,
+        B: int,
+        H: int,
+        K: int,
+        V: int,
+        rank: int,
+        world: int,
+        state_dtype: str = "bf16",
+        summary_dtype: str = "fp32",
+    ):
+        self.B, self.H = B, H
+        self.K, self.V = K, V
+        self.rank, self.world = rank, world
+        self.state_dtype = state_dtype
+        self.summary_dtype = summary_dtype
+        self.dtype_ = "fp32"
+        super().__init__()
+
+    @property
+    def flops(self) -> float:
+        per_summary = 2 * self.K * self.K * self.V + self.K * self.V
+        return float(self.B * self.H * self.rank * per_summary)
+
+    def input_read_fraction(self, port: str) -> float:
+        if port != "summaries":
+            return 1.0
+        return Fraction(self.rank, self.world)
+
+    @property
+    def input_bytes(self) -> float:
+        summary = self.B * self.H * self.rank * self.K * (self.K + self.V)
+        return summary * dtype_bytes(self.summary_dtype)
+
+
+class KdaStateStore(Kernel):
+    """Materialize persistent recurrent and short-convolution KDA state."""
+
+    def __init__(
+        self,
+        B: int,
+        H: int,
+        S: int,
+        K: int,
+        V: int,
+        conv_size: int = 4,
+        state_dtype: str = "bf16",
+    ):
+        self.B, self.H, self.S = B, H, S
+        self.K, self.V = K, V
+        self.conv_size = conv_size
+        self.state_dtype = state_dtype
+        super().__init__()
+
+    def input_read_fraction(self, port: str) -> float:
+        # Input is only a graph dependency on the fused KDA result.  The
+        # recurrent/conv state is materialized from registers, so it does not
+        # introduce another HBM read of that result.
+        return 0.0
+
+    @property
+    def input_bytes(self) -> float:
+        # Input is a dependency on the KDA result, not an additional read.
+        return 0.0
 
 
 class StridedGemm(Kernel):

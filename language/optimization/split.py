@@ -20,9 +20,11 @@ from fractions import Fraction
 
 from rooflang.language.kernels.comm import Broadcast, Gather, Reduce, Scatter
 from rooflang.language.kernels.forward import (
-    Attn, DpskV4SparseAttn, ElementwiseOp, Embedding, Gemm,
-    Glm52SparseAttn, LayerNorm, Nop, ReadInput, RMSNorm, Sampling,
-    Slice, StridedGemm, TokenCombine, TokenDispatch,
+    Attn, AttnRes, DpskV4SparseAttn, ElementwiseOp, Embedding, Gemm,
+    Glm52SparseAttn, KdaStateStore, KimiK3DeltaAttn, KimiK3MlaAttn, LayerNorm,
+    Nop,
+    PartialRMSNorm, ReadInput, RMSNorm, Sampling, Slice, StridedGemm,
+    TokenCombine, TokenDispatch,
 )
 from rooflang.language.kernels.identity import Concat, Spawn
 from rooflang.language.tensor import Tensor
@@ -95,13 +97,14 @@ def _make_dependency_gather(tensor, n):
 
 def _context_split_attn_decode(kernel, n):
     """Split one decode attention over equal-size persistent KV shards."""
-    if not isinstance(kernel, (DpskV4SparseAttn, Glm52SparseAttn)):
+    if not isinstance(
+            kernel, (DpskV4SparseAttn, Glm52SparseAttn, KimiK3MlaAttn)):
         raise TypeError(
-            "decode attention split requires a sparse-attention kernel")
+            "decode attention split requires an MLA/sparse-attention kernel")
     if kernel.S_kv % n != 0:
         raise ValueError(
             f"attention S_kv={kernel.S_kv} must be divisible by {n}")
-    if kernel.k_sel % n != 0:
+    if hasattr(kernel, "k_sel") and kernel.k_sel % n != 0:
         raise ValueError(
             f"attention k_sel={kernel.k_sel} must be divisible by {n}")
 
@@ -122,7 +125,18 @@ def _context_split_attn_decode(kernel, n):
             prev_comms[port] = _make_broadcast(tensor, n)
     copies = []
     for _ in range(n):
-        if isinstance(kernel, Glm52SparseAttn):
+        if isinstance(kernel, KimiK3MlaAttn):
+            copy = KimiK3MlaAttn(
+                kernel.B, kernel.H, kernel.S_q, local_kv,
+                kernel.qk_head_dim, kernel.v_head_dim,
+                kernel.kv_cache_dim, kernel.kv_lora_rank,
+                kernel.qk_nope_head_dim, kernel.dtype_,
+                kernel.kv_transform_dtype,
+                q_dtype=kernel.q_dtype, kv_dtype=kernel.kv_dtype,
+                out_dtype=kernel.out_dtype, causal=kernel.causal,
+                selected_pairs=kernel.selected_pairs / n,
+                kv_transform_tokens=kernel.kv_transform_tokens / n)
+        elif isinstance(kernel, Glm52SparseAttn):
             copy = Glm52SparseAttn(
                 kernel.B, kernel.H, kernel.S_q, kernel.k_sel // n,
                 local_kv, kernel.qk_head_dim, kernel.v_head_dim,
@@ -281,7 +295,8 @@ def column_split(kernel, n):
         shard_out_shape = _shard_shape(out_tensor.shape, n, dim=-1)
         for i in range(n):
             c = Gemm(kernel.M, shard_n, kernel.K, kernel.w_dtype,
-                     kernel.a_dtype, kernel.out_dtype)
+                     kernel.a_dtype, kernel.out_dtype,
+                     kernel.compute_dtype)
             c.inputs = {"x": Tensor(in_tensor.dtype, in_tensor.shape)}
             c.weights = {"w": Tensor(kernel.w_dtype, (kernel.K, shard_n))}
             scale_bytes = gemm_scale_bytes(shard_n, kernel.K, kernel.w_dtype)
@@ -327,7 +342,8 @@ def row_split(kernel, n):
     else:
         for i in range(n):
             c = Gemm(kernel.M, kernel.N, shard_k, kernel.w_dtype,
-                     kernel.a_dtype, kernel.out_dtype)
+                     kernel.a_dtype, kernel.out_dtype,
+                     kernel.compute_dtype)
             c.inputs = {"x": Tensor(in_tensor.dtype, shard_in_shape)}
             c.weights = {"w": Tensor(kernel.w_dtype, (shard_k, kernel.N))}
             scale_bytes = gemm_scale_bytes(kernel.N, shard_k, kernel.w_dtype)
@@ -471,7 +487,9 @@ def _context_split(kernel, n, *, is_prefill):
     Prefill attention shards Q and receives logical full KV through AllGather;
     decode attention broadcasts Q and keeps KV sharded.
     """
-    if isinstance(kernel, (Attn, DpskV4SparseAttn, Glm52SparseAttn)):
+    if isinstance(
+            kernel, (Attn, DpskV4SparseAttn, Glm52SparseAttn,
+                     KimiK3MlaAttn)):
         if is_prefill:
             return _context_split_attn_prefill(kernel, n)
         else:
@@ -529,7 +547,18 @@ def _context_split_attn_prefill(kernel, n):
 
     copies = []
     for _ in range(n):
-        if isinstance(kernel, Glm52SparseAttn):
+        if isinstance(kernel, KimiK3MlaAttn):
+            c = KimiK3MlaAttn(
+                kernel.B, kernel.H, kernel.S_q // n, kernel.S_kv,
+                kernel.qk_head_dim, kernel.v_head_dim,
+                kernel.kv_cache_dim, kernel.kv_lora_rank,
+                kernel.qk_nope_head_dim, kernel.dtype_,
+                kernel.kv_transform_dtype,
+                q_dtype=kernel.q_dtype, kv_dtype=kernel.kv_dtype,
+                out_dtype=kernel.out_dtype, causal=kernel.causal,
+                selected_pairs=kernel.selected_pairs / n,
+                kv_transform_tokens=kernel.kv_transform_tokens / n)
+        elif isinstance(kernel, Glm52SparseAttn):
             c = Glm52SparseAttn(
                 kernel.B, kernel.H, kernel.S_q // n, kernel.k_sel,
                 kernel.S_kv, kernel.qk_head_dim, kernel.v_head_dim,
@@ -606,11 +635,28 @@ def _make_context_copy(kernel, n):
             out_elems=kernel._out_elems // n)
     elif isinstance(kernel, Gemm):
         c = Gemm(kernel.M // n, kernel.N, kernel.K, kernel.w_dtype,
-                 kernel.a_dtype, kernel.out_dtype)
+                 kernel.a_dtype, kernel.out_dtype, kernel.compute_dtype)
     elif isinstance(kernel, RMSNorm):
         c = RMSNorm(kernel.M // n, kernel.D, kernel.dtype_)
+    elif isinstance(kernel, PartialRMSNorm):
+        c = PartialRMSNorm(
+            kernel.M // n, kernel.input_dim, kernel.norm_dim,
+            kernel.dtype_)
     elif isinstance(kernel, LayerNorm):
         c = LayerNorm(kernel.M // n, kernel.D, kernel.dtype_)
+    elif isinstance(kernel, AttnRes):
+        c = AttnRes(
+            kernel.B, kernel.S // n, kernel.D, kernel.R,
+            kernel.storage_dtype, kernel.dtype_)
+    elif isinstance(kernel, KimiK3DeltaAttn):
+        c = KimiK3DeltaAttn(
+            kernel.B, kernel.H, kernel.S // n, kernel.K, kernel.V,
+            kernel.mode, kernel.chunk_size, kernel.conv_size,
+            kernel.dtype_, kernel.state_dtype)
+    elif isinstance(kernel, KdaStateStore):
+        c = KdaStateStore(
+            kernel.B, kernel.H // n, kernel.S // n,
+            kernel.K, kernel.V, kernel.conv_size, kernel.state_dtype)
     elif isinstance(kernel, Embedding):
         c = Embedding(kernel.M // n, kernel.V, kernel.D, kernel.w_dtype,
                       kernel.idx_dtype, kernel.out_dtype)
@@ -708,11 +754,38 @@ def _make_batch_copy(kernel, n):
                         out_elems=kernel._out_elems // n)
     elif isinstance(kernel, Gemm):
         c = Gemm(kernel.M // n, kernel.N, kernel.K, kernel.w_dtype,
-                 kernel.a_dtype, kernel.out_dtype)
+                 kernel.a_dtype, kernel.out_dtype, kernel.compute_dtype)
     elif isinstance(kernel, RMSNorm):
         c = RMSNorm(kernel.M // n, kernel.D, kernel.dtype_)
+    elif isinstance(kernel, PartialRMSNorm):
+        c = PartialRMSNorm(
+            kernel.M // n, kernel.input_dim, kernel.norm_dim,
+            kernel.dtype_)
     elif isinstance(kernel, LayerNorm):
         c = LayerNorm(kernel.M // n, kernel.D, kernel.dtype_)
+    elif isinstance(kernel, AttnRes):
+        c = AttnRes(
+            kernel.B // n, kernel.S, kernel.D, kernel.R,
+            kernel.storage_dtype, kernel.dtype_)
+    elif isinstance(kernel, KimiK3MlaAttn):
+        c = KimiK3MlaAttn(
+            kernel.B // n, kernel.H, kernel.S_q, kernel.S_kv,
+            kernel.qk_head_dim, kernel.v_head_dim, kernel.kv_cache_dim,
+            kernel.kv_lora_rank, kernel.qk_nope_head_dim, kernel.dtype_,
+            kernel.kv_transform_dtype,
+            q_dtype=kernel.q_dtype, kv_dtype=kernel.kv_dtype,
+            out_dtype=kernel.out_dtype, causal=kernel.causal,
+            selected_pairs=kernel.selected_pairs,
+            kv_transform_tokens=kernel.kv_transform_tokens)
+    elif isinstance(kernel, KimiK3DeltaAttn):
+        c = KimiK3DeltaAttn(
+            kernel.B // n, kernel.H, kernel.S, kernel.K, kernel.V,
+            kernel.mode, kernel.chunk_size, kernel.conv_size,
+            kernel.dtype_, kernel.state_dtype)
+    elif isinstance(kernel, KdaStateStore):
+        c = KdaStateStore(
+            kernel.B // n, kernel.H, kernel.S,
+            kernel.K, kernel.V, kernel.conv_size, kernel.state_dtype)
     elif isinstance(kernel, Embedding):
         c = Embedding(kernel.M // n, kernel.V, kernel.D, kernel.w_dtype,
                       kernel.idx_dtype, kernel.out_dtype)

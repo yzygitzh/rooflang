@@ -9,9 +9,9 @@ from typing import List
 
 from rooflang.language.graph import ComputeGraph
 from rooflang.language.kernels.forward import (
-    AttnRes, ElementwiseOp, Embedding, Gemm, KdaStateStore,
-    KimiK3DeltaAttn, KimiK3MlaAttn, Nop, PartialRMSNorm, ReadInput, RMSNorm,
-    Sampling, Slice,
+    AttnRes, ElementwiseOp, Embedding, Gemm, KimiK3DeltaAttn,
+    KimiK3DeltaAttnStateStore, KimiK3MlaAttn, Nop, PartialRMSNorm,
+    ReadInput, RMSNorm, Sampling, Slice,
     StridedGemm, TokenCombine, TokenDispatch,
 )
 from rooflang.language.kernels.identity import Concat, Spawn
@@ -364,7 +364,7 @@ def _build_kda(g, layer, B, S, attn_fan, is_prefill):
     g.add_data_edge(sa, sa_fan, {"y": "x"})
     layer.sa_fan = sa_fan
 
-    state_store = KdaStateStore(
+    state_store = KimiK3DeltaAttnStateStore(
         B, H, S, KDA_HD, KDA_HD, KDA_CONV, "bf16")
     state_store.inputs = {"x": Tensor("bf16", (B, S, projection))}
     state_store.outputs = {

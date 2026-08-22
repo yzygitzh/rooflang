@@ -5,7 +5,10 @@ split by phase:
   forward.py    — Slice, Gemm, StridedGemm, RMSNorm, LayerNorm,
                   Attn, DpskV4SparseAttn
   backward.py   — GemmDX, GemmDW, StridedGemmDX, StridedGemmDW,
-                   RMSNorm, LayerNorm, Attn, DpskV4SparseAttn
+                   RMSNorm, PartialRMSNorm, LayerNorm, AttnRes, Attn,
+                   KimiK3MlaAttn, KimiK3DeltaAttn,
+                   KimiK3DeltaAttnCpSummary, KimiK3DeltaAttnCpMerge,
+                   KimiK3DeltaAttnStateStore, DpskV4SparseAttn
   optimizer.py  — AdamWStep
   comm.py       — AllReduce, ReduceScatter, AllGather, AllToAll, Broadcast, SendRecv
   identity.py   — Spawn, Concat

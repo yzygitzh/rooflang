@@ -21,8 +21,8 @@ from fractions import Fraction
 from rooflang.language.kernels.comm import Broadcast, Gather, Reduce, Scatter
 from rooflang.language.kernels.forward import (
     Attn, AttnRes, DpskV4SparseAttn, ElementwiseOp, Embedding, Gemm,
-    Glm52SparseAttn, KdaStateStore, KimiK3DeltaAttn, KimiK3MlaAttn, LayerNorm,
-    Nop,
+    Glm52SparseAttn, KimiK3DeltaAttn, KimiK3DeltaAttnStateStore,
+    KimiK3MlaAttn, LayerNorm, Nop,
     PartialRMSNorm, ReadInput, RMSNorm, Sampling, Slice, StridedGemm,
     TokenCombine, TokenDispatch,
 )
@@ -653,8 +653,8 @@ def _make_context_copy(kernel, n):
             kernel.B, kernel.H, kernel.S // n, kernel.K, kernel.V,
             kernel.mode, kernel.chunk_size, kernel.conv_size,
             kernel.dtype_, kernel.state_dtype)
-    elif isinstance(kernel, KdaStateStore):
-        c = KdaStateStore(
+    elif isinstance(kernel, KimiK3DeltaAttnStateStore):
+        c = KimiK3DeltaAttnStateStore(
             kernel.B, kernel.H // n, kernel.S // n,
             kernel.K, kernel.V, kernel.conv_size, kernel.state_dtype)
     elif isinstance(kernel, Embedding):
@@ -782,8 +782,8 @@ def _make_batch_copy(kernel, n):
             kernel.B // n, kernel.H, kernel.S, kernel.K, kernel.V,
             kernel.mode, kernel.chunk_size, kernel.conv_size,
             kernel.dtype_, kernel.state_dtype)
-    elif isinstance(kernel, KdaStateStore):
-        c = KdaStateStore(
+    elif isinstance(kernel, KimiK3DeltaAttnStateStore):
+        c = KimiK3DeltaAttnStateStore(
             kernel.B // n, kernel.H, kernel.S,
             kernel.K, kernel.V, kernel.conv_size, kernel.state_dtype)
     elif isinstance(kernel, Embedding):

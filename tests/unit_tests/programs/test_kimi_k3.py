@@ -4,8 +4,8 @@ import pytest
 
 from rooflang.language.kernels.comm import AllGather
 from rooflang.language.kernels.forward import (
-    AttnRes, KdaCpMerge, KdaCpSummary, KimiK3DeltaAttn, KimiK3MlaAttn,
-    PartialRMSNorm,
+    AttnRes, KimiK3DeltaAttn, KimiK3DeltaAttnCpMerge,
+    KimiK3DeltaAttnCpSummary, KimiK3MlaAttn, PartialRMSNorm,
 )
 from rooflang.programs.experiments import find_pareto_frontier as finder
 from rooflang.programs.models import kimi_k3
@@ -119,8 +119,10 @@ def test_prefill_kda_cp_summary_allgather_and_merge(monkeypatch):
         assert len(summaries) == 8
         assert len(merges) == 8
         assert len(allgathers) == 4
-        assert all(isinstance(kernel, KdaCpSummary) for kernel in summaries)
-        assert all(isinstance(kernel, KdaCpMerge) for kernel in merges)
+        assert all(isinstance(kernel, KimiK3DeltaAttnCpSummary)
+                   for kernel in summaries)
+        assert all(isinstance(kernel, KimiK3DeltaAttnCpMerge)
+                   for kernel in merges)
         assert all(isinstance(kernel, AllGather) for kernel in allgathers)
         assert [kernel.rank for kernel in merges] == [0, 1] * 4
         assert all("initial_state" in kernel.inputs

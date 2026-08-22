@@ -7,7 +7,9 @@ from rooflang.language.hardware.component import Compute, Memory
 from rooflang.language.kernels.comm import (
     AllGather, Broadcast, CommKernel, Gather, Reduce, Scatter,
 )
-from rooflang.language.kernels.forward import KdaCpMerge, KdaCpSummary, Nop
+from rooflang.language.kernels.forward import (
+    KimiK3DeltaAttnCpMerge, KimiK3DeltaAttnCpSummary, Nop,
+)
 from rooflang.language.optimization.comm import optimize_comms
 from rooflang.language.optimization.split import (
     batch_split, context_split_decode, context_split_prefill, general_dup,
@@ -369,7 +371,7 @@ def _context_split_kda(g, layer_copies, dp, cp):
             group = sa_copies[dp_rank * cp:(dp_rank + 1) * cp]
             local_summaries = []
             for rank, sa in enumerate(group):
-                summary = KdaCpSummary(
+                summary = KimiK3DeltaAttnCpSummary(
                     sa.B, H, sa.S, KDA_HD, KDA_HD,
                     rank, cp, KDA_CHUNK, KDA_CONV,
                     "bf16", "bf16")
@@ -404,7 +406,7 @@ def _context_split_kda(g, layer_copies, dp, cp):
                     summary, allgather, {"summary": f"i{rank}"})
 
             for rank, sa in enumerate(group):
-                merge = KdaCpMerge(
+                merge = KimiK3DeltaAttnCpMerge(
                     sa.B, H, KDA_HD, KDA_HD, rank, cp,
                     "bf16", "fp32")
                 merge.inputs = {

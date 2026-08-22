@@ -466,6 +466,12 @@ class TestGemmDX(TestKernelBase):
     expected_weight_bytes = 64 * 128 * 2.0
     expected_output_bytes = 32 * 128 * 2.0
 
+    def test_explicit_compute_dtype(self):
+        kernel = backward.GemmDX(
+            M=32, N=64, K=128, w_dtype="bf16", a_dtype="bf16",
+            compute_dtype="fp32")
+        assert kernel.flops_by_dtype == {"fp32": kernel.flops}
+
 
 class TestGemmDW(TestKernelBase):
     __test__ = True
@@ -474,6 +480,12 @@ class TestGemmDW(TestKernelBase):
     expected_input_bytes = 32 * 64 * 2.0 + 32 * 128 * 2.0
     expected_weight_bytes = 0.0
     expected_output_bytes = 64 * 128 * 4.0
+
+    def test_explicit_compute_dtype(self):
+        kernel = backward.GemmDW(
+            M=32, N=64, K=128, w_dtype="bf16", a_dtype="bf16",
+            compute_dtype="fp32")
+        assert kernel.flops_by_dtype == {"fp32": kernel.flops}
 
 
 class TestBwdRMSNorm(TestKernelBase):
@@ -485,6 +497,19 @@ class TestBwdRMSNorm(TestKernelBase):
     expected_output_bytes = 16 * 64 * 2.0 + 64 * 4.0
 
 
+class TestBwdPartialRMSNorm(TestKernelBase):
+    __test__ = True
+    kernel = backward.PartialRMSNorm(M=4, input_dim=10, norm_dim=6)
+    expected_flops = 9.0 * 4 * 6
+    expected_input_bytes = 2 * 4 * 10 * 2.0
+    expected_weight_bytes = 6 * 2.0
+    expected_output_bytes = 4 * 10 * 2.0 + 6 * 4.0
+
+    def test_rejects_invalid_norm_dim(self):
+        with pytest.raises(ValueError, match="norm_dim"):
+            backward.PartialRMSNorm(M=4, input_dim=10, norm_dim=11)
+
+
 class TestBwdLayerNorm(TestKernelBase):
     __test__ = True
     kernel = backward.LayerNorm(M=16, D=64)
@@ -492,6 +517,19 @@ class TestBwdLayerNorm(TestKernelBase):
     expected_input_bytes = 2 * 16 * 64 * 2.0
     expected_weight_bytes = 64 * 2.0
     expected_output_bytes = 16 * 64 * 2.0 + 2 * 64 * 4.0
+
+
+class TestBwdAttnRes(TestKernelBase):
+    __test__ = True
+    kernel = backward.AttnRes(B=2, S=3, D=4, R=2)
+    expected_flops = 18.0 * 6 * 3 * 4 + 9.0 * 6 * 3 + 3.0 * 4
+    expected_input_bytes = (6 * 3 * 4 + 6 * 4) * 2.0
+    expected_weight_bytes = 2 * 4 * 2.0
+    expected_output_bytes = 6 * 3 * 4 * 2.0 + 2 * 4 * 4.0
+
+    def test_uses_fp32_compute_with_bf16_storage(self):
+        assert self.kernel.dtype_ == "fp32"
+        assert self.kernel.storage_dtype == "bf16"
 
 
 class TestBwdAttn(TestKernelBase):
@@ -516,6 +554,159 @@ class TestBwdAttn(TestKernelBase):
         k = backward.Attn(B=2, H=8, H_kv=8, S_q=128, S_kv=256, Hd=64,
                           causal=True, triangular=True)
         assert k.flops == 10.0 * 2 * 8 * 128 * 256 * 64 * 0.5
+
+
+class TestBwdKimiK3MlaAttn(TestKernelBase):
+    __test__ = True
+    kernel = backward.KimiK3MlaAttn(
+        B=2, H=4, S_q=3, S_kv=5,
+        qk_head_dim=6, v_head_dim=8, kv_cache_dim=10,
+        kv_lora_rank=4, qk_nope_head_dim=2)
+    expected_flops = (
+        2 * 4 * (3 * 5) * (6 * 10 + 4 * 4)
+        + 4 * 2 * 3 * 4 * (4 * (2 + 8))
+    )
+    expected_input_bytes = (
+        2 * 3 * 4 * 6 * 2.0
+        + 2 * 3 * 4 * 8 * 2.0
+        + 2 * 5 * 10 * 1.0
+    )
+    expected_weight_bytes = 4 * (4 * (2 + 8)) * 2.0
+    expected_output_bytes = (
+        2 * 3 * 4 * 6 * 2.0
+        + 2 * 5 * 10 * 1.0
+        + 4 * (4 * (2 + 8)) * 4.0
+    )
+
+    def test_flop_components_and_dtype_merge(self):
+        attention = 2 * 4 * (3 * 5) * (6 * 10 + 4 * 4)
+        transform = 4 * 2 * 3 * 4 * (4 * (2 + 8))
+        assert self.kernel.attention_flops == attention
+        assert self.kernel.kv_transform_flops == transform
+        assert self.kernel.flops_by_dtype == {
+            "bf16": attention + transform,
+        }
+
+    def test_causal_dense_pairs(self):
+        kernel = backward.KimiK3MlaAttn(
+            B=1, H=2, S_q=8, S_kv=8,
+            qk_head_dim=6, v_head_dim=8, kv_cache_dim=10,
+            kv_lora_rank=4, qk_nope_head_dim=2, causal=True)
+        assert kernel.selected_pairs == 36
+
+
+class TestBwdKimiK3DeltaAttn(TestKernelBase):
+    __test__ = True
+    kernel = backward.KimiK3DeltaAttn(
+        B=2, H=3, S=8, K=4, V=5, mode="chunk",
+        chunk_size=4, conv_size=4)
+    forward_attention_per_head = (
+        6 * 8 * 4 * 5 + 3 * 8 * 4 * 4 + 8 * 4**2)
+    forward_preprocessing = (
+        3 * (2 * 3 * 8) * 4 * (2 * 4 + 4)
+        + 2 * (2 * 3 * 8) * (3 * 4 + 1)
+        + (2 * 3 * 8) * (5 * 4 + 3)
+    )
+    expected_flops = (
+        3.0 * 2 * 3 * forward_attention_per_head
+        + 2.0 * forward_preprocessing
+    )
+    expected_input_bytes = (
+        (2 * 3 * 8) * (2 * 4 + 3 * 5) * 2.0
+        + (2 * 3 * 8) * 4.0
+    )
+    expected_weight_bytes = (
+        3 * (2 * 4 + 5) * (4 + 1) * 2.0
+        + 3 * (5 + 1) * 4.0
+    )
+    expected_output_bytes = (
+        (2 * 3 * 8) * (2 * 4 + 2 * 5) * 2.0
+        + (2 * 3 * 8) * 4.0
+        + (3 * (2 * 4 + 5) * (4 + 1) + 3 * (5 + 1)) * 4.0
+    )
+
+    def test_recurrent_includes_state_gradients(self):
+        kernel = backward.KimiK3DeltaAttn(
+            B=1, H=2, S=1, K=3, V=4, mode="recurrent",
+            chunk_size=4, conv_size=2)
+        state_elements = 1 * 2 * 3 * 4
+        conv_state_elements = 1 * 2 * (2 * 3 + 4) * 2
+        state_bytes = (state_elements + conv_state_elements) * 2.0
+        base_input = 2 * (2 * 3 + 3 * 4) * 2.0 + 2 * 4.0
+        base_output = (
+            2 * (2 * 3 + 2 * 4) * 2.0
+            + 2 * 4.0
+            + (2 * (2 * 3 + 4) * 3 + 2 * (4 + 1)) * 4.0
+        )
+        assert kernel.input_bytes == base_input + state_bytes
+        assert kernel.output_bytes == base_output + state_bytes
+
+    def test_rejects_invalid_mode(self):
+        with pytest.raises(ValueError, match="unsupported KDA mode"):
+            backward.KimiK3DeltaAttn(
+                B=1, H=1, S=1, K=4, V=4, mode="invalid")
+
+
+class TestBwdKimiK3DeltaAttnCpSummary(TestKernelBase):
+    __test__ = True
+    kernel = backward.KimiK3DeltaAttnCpSummary(
+        B=2, H=3, S=10, K=4, V=5, rank=1, world=3,
+        chunk_size=4, conv_size=4)
+    forward_bf16_per_head = (
+        4 * 10 * 4 * 5
+        + 2 * 3 * 4 * 5
+        + 10 * 5
+        + 2 * 10 * 4 * 4
+        + 3 * 4 * 4
+    )
+    expected_flops = (
+        2.0 * 2 * 3 * forward_bf16_per_head
+        + 4.0 * 2 * 3 * 3 * 4**3
+    )
+    expected_input_bytes = (
+        2 * 3 * 4 * (4 + 5) * 4.0
+        + 2 * 3 * 3 * 4 * (4 - 1) * 2.0
+    )
+    expected_weight_bytes = 0.0
+    expected_output_bytes = 0.0
+
+    def test_flops_by_dtype_and_last_rank_elision(self):
+        assert self.kernel.flops_by_dtype == {
+            "bf16": 2.0 * 2 * 3 * self.forward_bf16_per_head,
+            "fp32": 4.0 * 2 * 3 * 3 * 4**3,
+        }
+        last = backward.KimiK3DeltaAttnCpSummary(
+            B=2, H=3, S=10, K=4, V=5, rank=2, world=3,
+            chunk_size=4, conv_size=4)
+        assert last.flops == 0
+        assert last.input_bytes == 0
+
+
+class TestBwdKimiK3DeltaAttnCpMerge(TestKernelBase):
+    __test__ = True
+    kernel = backward.KimiK3DeltaAttnCpMerge(
+        B=2, H=3, K=4, V=5, rank=2, world=4)
+    expected_flops = 2.0 * 2 * 3 * 2 * (2 * 4 * 4 * 5 + 4 * 5)
+    expected_input_bytes = (
+        2 * 3 * 2 * 4 * (4 + 5) * 4.0
+        + 2 * 3 * 4 * 5 * 2.0
+    )
+    expected_weight_bytes = 0.0
+    expected_output_bytes = 2 * 3 * 2 * 4 * (4 + 5) * 4.0
+
+
+class TestBwdKimiK3DeltaAttnStateStore(TestKernelBase):
+    __test__ = True
+    kernel = backward.KimiK3DeltaAttnStateStore(
+        B=2, H=3, S=8, K=4, V=5, conv_size=4)
+    expected_flops = 0.0
+    expected_input_bytes = 0.0
+    expected_weight_bytes = 0.0
+    expected_output_bytes = 0.0
+    expected_transferred_bytes = 0.0
+
+    def test_requires_no_placement(self):
+        assert self.kernel._requires_placement is False
 
 
 class TestBwdDpskV4SparseAttn(TestKernelBase):
@@ -700,6 +891,16 @@ class TestBwdElementwiseOpMul(TestKernelBase):
     __test__ = True
     kernel = backward.ElementwiseOp(M=8192, D=7168, dtype="bf16", op="mul")
     expected_flops = 2.0 * 8192 * 7168
+    expected_input_bytes = 3 * 8192 * 7168 * 2.0
+    expected_weight_bytes = 0.0
+    expected_output_bytes = 2 * 8192 * 7168 * 4.0
+
+
+class TestBwdElementwiseOpSigmoidMul(TestKernelBase):
+    __test__ = True
+    kernel = backward.ElementwiseOp(
+        M=8192, D=7168, dtype="bf16", op="sigmoid_mul")
+    expected_flops = 9.0 * 8192 * 7168
     expected_input_bytes = 3 * 8192 * 7168 * 2.0
     expected_weight_bytes = 0.0
     expected_output_bytes = 2 * 8192 * 7168 * 4.0

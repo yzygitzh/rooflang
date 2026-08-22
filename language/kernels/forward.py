@@ -551,7 +551,7 @@ class KimiK3DeltaAttn(Kernel):
         return self.attention_flops + self.preprocessing_flops
 
 
-class KdaCpSummary(Kernel):
+class KimiK3DeltaAttnCpSummary(Kernel):
     """Build one rank-local ``(M, S_ext)`` KDA transition summary.
 
     This is the additional CP pre-process beyond the ordinary local chunk
@@ -620,7 +620,7 @@ class KdaCpSummary(Kernel):
         return 0.0
 
 
-class KdaCpMerge(Kernel):
+class KimiK3DeltaAttnCpMerge(Kernel):
     """Merge preceding rank summaries into one rank's KDA initial state."""
 
     def __init__(
@@ -658,7 +658,7 @@ class KdaCpMerge(Kernel):
         return summary * dtype_bytes(self.summary_dtype)
 
 
-class KdaStateStore(Kernel):
+class KimiK3DeltaAttnStateStore(Kernel):
     """Materialize persistent recurrent and short-convolution KDA state."""
 
     def __init__(

@@ -131,22 +131,14 @@ class GemmDX(Kernel):
     """
 
     def __init__(self, M: int, N: int, K: int,
-                 w_dtype: str, a_dtype: str, out_dtype: str = "bf16",
-                 compute_dtype: str | None = None):
+                 w_dtype: str, a_dtype: str, out_dtype: str = "bf16"):
         self.M, self.N, self.K = M, N, K
         self.w_dtype, self.a_dtype, self.out_dtype = w_dtype, a_dtype, out_dtype
-        self.compute_dtype = compute_dtype
         super().__init__()
 
     @property
     def flops(self) -> float:
         return 2.0 * self.M * self.N * self.K
-
-    @property
-    def flops_by_dtype(self) -> dict[str, float] | None:
-        if self.compute_dtype is None:
-            return None
-        return {self.compute_dtype: self.flops}
 
     @property
     def input_bytes(self) -> float:
@@ -175,23 +167,15 @@ class GemmDW(Kernel):
 
     def __init__(self, M: int, N: int, K: int,
                  w_dtype: str, a_dtype: str, out_dtype: str = "bf16",
-                 grad_dtype: str = "fp32",
-                 compute_dtype: str | None = None):
+                 grad_dtype: str = "fp32"):
         self.M, self.N, self.K = M, N, K
         self.w_dtype, self.a_dtype, self.out_dtype = w_dtype, a_dtype, out_dtype
         self.grad_dtype = grad_dtype
-        self.compute_dtype = compute_dtype
         super().__init__()
 
     @property
     def flops(self) -> float:
         return 2.0 * self.M * self.N * self.K
-
-    @property
-    def flops_by_dtype(self) -> dict[str, float] | None:
-        if self.compute_dtype is None:
-            return None
-        return {self.compute_dtype: self.flops}
 
     @property
     def input_bytes(self) -> float:

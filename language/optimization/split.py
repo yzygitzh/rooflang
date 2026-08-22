@@ -295,8 +295,7 @@ def column_split(kernel, n):
         shard_out_shape = _shard_shape(out_tensor.shape, n, dim=-1)
         for i in range(n):
             c = Gemm(kernel.M, shard_n, kernel.K, kernel.w_dtype,
-                     kernel.a_dtype, kernel.out_dtype,
-                     kernel.compute_dtype)
+                     kernel.a_dtype, kernel.out_dtype)
             c.inputs = {"x": Tensor(in_tensor.dtype, in_tensor.shape)}
             c.weights = {"w": Tensor(kernel.w_dtype, (kernel.K, shard_n))}
             scale_bytes = gemm_scale_bytes(shard_n, kernel.K, kernel.w_dtype)
@@ -342,8 +341,7 @@ def row_split(kernel, n):
     else:
         for i in range(n):
             c = Gemm(kernel.M, kernel.N, shard_k, kernel.w_dtype,
-                     kernel.a_dtype, kernel.out_dtype,
-                     kernel.compute_dtype)
+                     kernel.a_dtype, kernel.out_dtype)
             c.inputs = {"x": Tensor(in_tensor.dtype, shard_in_shape)}
             c.weights = {"w": Tensor(kernel.w_dtype, (shard_k, kernel.N))}
             scale_bytes = gemm_scale_bytes(kernel.N, shard_k, kernel.w_dtype)
@@ -635,7 +633,7 @@ def _make_context_copy(kernel, n):
             out_elems=kernel._out_elems // n)
     elif isinstance(kernel, Gemm):
         c = Gemm(kernel.M // n, kernel.N, kernel.K, kernel.w_dtype,
-                 kernel.a_dtype, kernel.out_dtype, kernel.compute_dtype)
+                 kernel.a_dtype, kernel.out_dtype)
     elif isinstance(kernel, RMSNorm):
         c = RMSNorm(kernel.M // n, kernel.D, kernel.dtype_)
     elif isinstance(kernel, PartialRMSNorm):
@@ -754,7 +752,7 @@ def _make_batch_copy(kernel, n):
                         out_elems=kernel._out_elems // n)
     elif isinstance(kernel, Gemm):
         c = Gemm(kernel.M // n, kernel.N, kernel.K, kernel.w_dtype,
-                 kernel.a_dtype, kernel.out_dtype, kernel.compute_dtype)
+                 kernel.a_dtype, kernel.out_dtype)
     elif isinstance(kernel, RMSNorm):
         c = RMSNorm(kernel.M // n, kernel.D, kernel.dtype_)
     elif isinstance(kernel, PartialRMSNorm):

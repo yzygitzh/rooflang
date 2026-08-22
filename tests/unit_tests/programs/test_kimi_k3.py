@@ -62,22 +62,36 @@ def test_text_graph_layer_types_caches_and_precisions(monkeypatch, decode):
     assert layers[3].kv_norm.input_dim == 576
     assert layers[3].kv_norm.norm_dim == 512
     assert layers[3].sa.inputs["kv"].dtype == "fp8"
-    assert layers[3].sa.weights["kv_b"].dtype == "bf16"
+    assert layers[3].sa.inputs["q"].dtype == "bf16"
+    assert layers[3].sa.dtype_ == "fp8"
+    assert layers[3].sa.kv_transform_dtype == "fp8"
+    assert layers[3].sa.weights["kv_b"].dtype == "fp8"
     assert layers[3].sa.weights["kv_b"].shape == (
         512, 96 * (128 + 128))
+    assert layers[3].sa.weights["kv_b_scale"].dtype == "ue8m0"
     assert layers[0].sa.mode == ("recurrent" if decode else "chunk")
+    assert layers[0].sa.dtype_ == "bf16"
     assert layers[0].state_store.outputs["state"].dtype == "bf16"
     assert layers[0].state_store.outputs["conv_state"].dtype == "bf16"
     assert isinstance(layers[0].mlp_res, AttnRes)
     assert layers[0].mlp_res.R == 1
     assert isinstance(output_head[0], AttnRes)
-    assert layers[0].dense_up.weights["w"].dtype == "bf16"
+    assert all(getattr(layers[0], field).weights["w"].dtype == "fp8"
+               for field in ("kda_wq", "kda_wk", "kda_wv",
+                             "kda_f_a", "kda_f_b", "output_gate", "wo"))
+    assert layers[0].kda_beta.weights["w"].dtype == "bf16"
+    assert layers[0].dense_up.weights["w"].dtype == "fp8"
+    assert layers[0].dense_down.weights["w"].dtype == "fp8"
     assert not layers[0].experts
     assert layers[1].routed_down.weights["w"].dtype == "bf16"
     assert layers[1].experts[0].weights["w"].dtype == "fp4"
-    assert layers[1].sw_up.weights["w"].dtype == "bf16"
+    assert layers[1].sw_up.weights["w"].dtype == "fp8"
+    assert layers[1].sw_down.weights["w"].dtype == "fp8"
     assert layers[1].gate.weights["w"].dtype == "bf16"
-    assert layers[1].gate.compute_dtype == "fp32"
+    assert layers[1].gate.outputs["y"].dtype == "fp32"
+    assert all(getattr(layers[3], field).weights["w"].dtype == "fp8"
+               for field in ("wq_a", "wq_b", "wkv",
+                             "output_gate", "wo"))
     assert len(layers[1].experts) == 2 * kimi_k3.N_EXPERTS
     assert emb.weights["emb"].weight_id != output_head[-2].weights["w"].weight_id
 

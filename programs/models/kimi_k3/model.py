@@ -215,7 +215,7 @@ def _build_output_head(g, B, hidden_src):
 
 def _build_mla(g, layer, B, S, cache_len, attn_fan, is_prefill):
     """Build one Kimi dense-MLA token-mixing path."""
-    wq_a = _make_gemm(B, S, Q_LORA, D, "bf16")
+    wq_a = _make_gemm(B, S, Q_LORA, D, "fp8")
     g.add_kernel(wq_a)
     g.add_data_edge(attn_fan, wq_a, {"y": "x"})
     layer.wq_a = wq_a
@@ -225,12 +225,12 @@ def _build_mla(g, layer, B, S, cache_len, attn_fan, is_prefill):
     g.add_data_edge(wq_a, q_norm, {"y": "x"})
     layer.q_norm = q_norm
 
-    wq_b = _make_gemm(B, S, H * QK_HD, Q_LORA, "bf16")
+    wq_b = _make_gemm(B, S, H * QK_HD, Q_LORA, "fp8")
     g.add_kernel(wq_b)
     g.add_data_edge(q_norm, wq_b, {"y": "x"})
     layer.wq_b = wq_b
 
-    wkv = _make_gemm(B, S, KV_CACHE_DIM, D, "bf16")
+    wkv = _make_gemm(B, S, KV_CACHE_DIM, D, "fp8")
     g.add_kernel(wkv)
     g.add_data_edge(attn_fan, wkv, {"y2": "x"})
     layer.wkv = wkv
@@ -245,7 +245,7 @@ def _build_mla(g, layer, B, S, cache_len, attn_fan, is_prefill):
 
     sa = KimiK3MlaAttn(
         B, H, S, cache_len, QK_HD, V_HD, KV_CACHE_DIM, KV_LORA,
-        QK_NOPE_HD, dtype="bf16", kv_transform_dtype="bf16",
+        QK_NOPE_HD, dtype="fp8", kv_transform_dtype="fp8",
         q_dtype="bf16", kv_dtype="fp8", out_dtype="bf16",
         causal=is_prefill,
     )
@@ -255,8 +255,13 @@ def _build_mla(g, layer, B, S, cache_len, attn_fan, is_prefill):
     }
     sa.weights = {
         "kv_b": Tensor(
-            "bf16", (KV_LORA, H * (QK_NOPE_HD + V_HD))),
+            "fp8", (KV_LORA, H * (QK_NOPE_HD + V_HD))),
     }
+    scale_bytes = gemm_scale_bytes(
+        H * (QK_NOPE_HD + V_HD), KV_LORA, "fp8")
+    if scale_bytes > 0:
+        sa.weights["kv_b_scale"] = Tensor(
+            "ue8m0", (int(scale_bytes),))
     sa.outputs = {"y": Tensor("bf16", (B, S, H * V_HD))}
     g.add_kernel(sa)
     g.add_data_edge(wq_b, sa, {"y": "q"})
@@ -300,19 +305,19 @@ def _build_kda(g, layer, B, S, attn_fan, is_prefill):
     paths = []
     for field, port in (("kda_wq", "y"), ("kda_wk", "y2"),
                         ("kda_wv", "y3")):
-        kernel = _make_gemm(B, S, projection, D, "bf16")
+        kernel = _make_gemm(B, S, projection, D, "fp8")
         g.add_kernel(kernel)
         g.add_data_edge(attn_fan, kernel, {port: "x"})
         setattr(layer, field, kernel)
         paths.append(kernel)
     wq, wk, wv = paths
 
-    f_a = _make_gemm(B, S, KDA_HD, D, "bf16")
+    f_a = _make_gemm(B, S, KDA_HD, D, "fp8")
     g.add_kernel(f_a)
     g.add_data_edge(attn_fan, f_a, {"y4": "x"})
     layer.kda_f_a = f_a
 
-    f_b = _make_gemm(B, S, projection, KDA_HD, "bf16")
+    f_b = _make_gemm(B, S, projection, KDA_HD, "fp8")
     g.add_kernel(f_b)
     g.add_data_edge(f_a, f_b, {"y": "x"})
     layer.kda_f_b = f_b
@@ -497,7 +502,7 @@ def _build_layers(g, B, S, context_len, prev_out):
             output_gate_port = "y3"
             attn_output = sa
 
-        output_gate = _make_gemm(B, S, H * V_HD, D, "bf16")
+        output_gate = _make_gemm(B, S, H * V_HD, D, "fp8")
         g.add_kernel(output_gate)
         g.add_data_edge(attn_fan, output_gate, {output_gate_port: "x"})
         layer.output_gate = output_gate
@@ -514,7 +519,7 @@ def _build_layers(g, B, S, context_len, prev_out):
         g.add_data_edge(output_gate, attn_gate, {"y": "b"})
         layer.attn_gate = attn_gate
 
-        wo = _make_gemm(B, S, D, H * V_HD, "bf16")
+        wo = _make_gemm(B, S, D, H * V_HD, "fp8")
         g.add_kernel(wo)
         g.add_data_edge(attn_gate, wo, {"y": "x"})
         layer.wo = wo
@@ -559,12 +564,12 @@ def _build_layers(g, B, S, context_len, prev_out):
         layer.ffn_norm = ffn_norm
 
         if layer_id < DENSE_LAYERS:
-            dense_up = _make_gated_up(B, S, DENSE_INTER, D, "bf16")
+            dense_up = _make_gated_up(B, S, DENSE_INTER, D, "fp8")
             g.add_kernel(dense_up)
             g.add_data_edge(ffn_norm, dense_up, {"y": "x"})
             layer.dense_up = dense_up
 
-            dense_down = _make_gemm(B, S, D, DENSE_INTER, "bf16")
+            dense_down = _make_gemm(B, S, D, DENSE_INTER, "fp8")
             g.add_kernel(dense_down)
             g.add_data_edge(dense_up, dense_down, {"y": "x"})
             layer.dense_down = dense_down
@@ -582,10 +587,9 @@ def _build_layers(g, B, S, context_len, prev_out):
             g.add_data_edge(ffn_norm, ffn_fan, {"y": "x"})
             layer.ffn_fan = ffn_fan
 
-            # The checkpoint stores router weights in BF16, while the model
-            # casts both operands and evaluates routing logits in FP32.
-            gate = Gemm(
-                M, N_EXPERTS, D, "bf16", "bf16", "fp32", "fp32")
+            # Optimized serving uses a BF16 gate GEMM with FP32 accumulation
+            # and logits; scoring, correction, and Top-K remain in FP32.
+            gate = Gemm(M, N_EXPERTS, D, "bf16", "bf16", "fp32")
             gate.inputs = {"x": Tensor("bf16", (B, S, D))}
             gate.weights = {"w": Tensor("bf16", (D, N_EXPERTS))}
             gate.outputs = {"y": Tensor("fp32", (B, S, N_EXPERTS))}
@@ -668,12 +672,12 @@ def _build_layers(g, B, S, context_len, prev_out):
             g.add_data_edge(routed_norm, routed_up, {"y": "x"})
             layer.routed_up = routed_up
 
-            sw_up = _make_gated_up(B, S, SHARED_INTER, D, "bf16")
+            sw_up = _make_gated_up(B, S, SHARED_INTER, D, "fp8")
             g.add_kernel(sw_up)
             g.add_data_edge(ffn_fan, sw_up, {"y3": "x"})
             layer.sw_up = sw_up
 
-            sw_down = _make_gemm(B, S, D, SHARED_INTER, "bf16")
+            sw_down = _make_gemm(B, S, D, SHARED_INTER, "fp8")
             g.add_kernel(sw_down)
             g.add_data_edge(sw_up, sw_down, {"y": "x"})
             layer.sw_down = sw_down

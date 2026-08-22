@@ -466,13 +466,6 @@ class TestGemmDX(TestKernelBase):
     expected_weight_bytes = 64 * 128 * 2.0
     expected_output_bytes = 32 * 128 * 2.0
 
-    def test_explicit_compute_dtype(self):
-        kernel = backward.GemmDX(
-            M=32, N=64, K=128, w_dtype="bf16", a_dtype="bf16",
-            compute_dtype="fp32")
-        assert kernel.flops_by_dtype == {"fp32": kernel.flops}
-
-
 class TestGemmDW(TestKernelBase):
     __test__ = True
     kernel = backward.GemmDW(M=32, N=64, K=128, w_dtype="bf16", a_dtype="bf16")
@@ -480,13 +473,6 @@ class TestGemmDW(TestKernelBase):
     expected_input_bytes = 32 * 64 * 2.0 + 32 * 128 * 2.0
     expected_weight_bytes = 0.0
     expected_output_bytes = 64 * 128 * 4.0
-
-    def test_explicit_compute_dtype(self):
-        kernel = backward.GemmDW(
-            M=32, N=64, K=128, w_dtype="bf16", a_dtype="bf16",
-            compute_dtype="fp32")
-        assert kernel.flops_by_dtype == {"fp32": kernel.flops}
-
 
 class TestBwdRMSNorm(TestKernelBase):
     __test__ = True

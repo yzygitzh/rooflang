@@ -1128,6 +1128,41 @@ def test_run_parallel_does_not_stop_after_worker_error(tmp_path, monkeypatch):
     ]
 
 
+@pytest.mark.parametrize("status", ["error", "worker_error"])
+def test_dynamic_sweep_stops_after_failure(
+        tmp_path, monkeypatch, status):
+    cases = [Case("prefill-8k", "b300", 8, 8, 1, 8, 8, (61,))]
+    submitted = []
+
+    class Future:
+        def __init__(self, case):
+            self.case = case
+
+        def result(self):
+            if status == "worker_error":
+                raise RuntimeError("worker failed")
+            return {"case_id": self.case.case_id, "status": status}
+
+    class Executor(_Executor):
+        def submit(self, function, case):
+            submitted.append(case)
+            return Future(case)
+
+    monkeypatch.setattr(finder, "ProcessPoolExecutor", Executor)
+    monkeypatch.setattr(
+        finder, "wait",
+        lambda futures, return_when: ({next(iter(futures))}, set()),
+    )
+
+    records = _run_parallel(
+        cases, workers=1, raw_path=tmp_path / "raw.jsonl",
+        completed_ids=set(), grow_batches=True,
+    )
+
+    assert [case.batch_size for case in submitted] == [8]
+    assert [record["status"] for record in records] == [status]
+
+
 def test_main_validates_workers_and_batch_multipliers(tmp_path):
     with pytest.raises(ValueError, match="workers"):
         finder.main(["--output-dir", str(tmp_path), "--workers", "0"])

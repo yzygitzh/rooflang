@@ -239,6 +239,35 @@ def test_decode_kda_bridge_crosses_pipeline_boundary(monkeypatch):
         pp_partition=[1, 1], n_gpus=16)
 
     assert len(layers[1]._decode_copies["cp_dp"]["bridge"]) == 8
+    assert len(layers[1]._pp_block_residual_sends) == 8
+    assert Simulator(graph, placement, hardware).run().total_time_us > 0
+
+
+@pytest.mark.parametrize(
+    ("pp_partition", "boundary_id", "copy_group"),
+    [([3, 10], 3, "dp"), ([6, 7], 6, "cp_dp")],
+)
+def test_decode_attn_residual_crosses_pipeline_boundary(
+        monkeypatch, pp_partition, boundary_id, copy_group):
+    monkeypatch.setattr(model, "N_LAYERS", 13)
+    graph, layers, emb, read_input, kv_reads, output_head = \
+        model.declare_model(batch_size=1, seq_prefill=128, decode=True)
+    hardware = B300Cluster(n_nodes=1)
+
+    graph, placement = optimization.optimize_model_cluster_decode(
+        graph, layers, hardware, emb, read_input, kv_reads, output_head,
+        seq_prefill=128, cp=1, dp=1, ep=1,
+        pp_partition=pp_partition, n_gpus=2)
+
+    boundary = layers[boundary_id]
+    assert len(boundary._pp_block_residual_sends) == 1
+    destination_memories = {
+        placement.get_tensor_memory(copy.inputs["x"])
+        for copy in boundary._decode_copies[copy_group]["block_in_fan"]
+    }
+    assert {memory.name for memory in destination_memories} == {
+        "n0-hbm3e-1",
+    }
     assert Simulator(graph, placement, hardware).run().total_time_us > 0
 
 

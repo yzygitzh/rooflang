@@ -534,6 +534,29 @@ def _place_pp_boundary_spawn(g, placement, spawn, memory):
                 edge.dst.inputs[input_name], memory)
 
 
+def _insert_pp_block_residual_sends(
+    g, layers, layer_stages, block_in_fans_by_layer,
+):
+    """Materialize the independently carried AttnRes state at PP edges."""
+    for layer_id in range(1, len(layers)):
+        if layer_stages[layer_id] == layer_stages[layer_id - 1]:
+            continue
+        sends = []
+        for spawn in block_in_fans_by_layer[layer_id]:
+            edge = g._in_edges(spawn)[0]
+            source_port = next(
+                output_name for output_name, input_name in edge.mapping.items()
+                if input_name == "x")
+            tensor = spawn.inputs["x"]
+            send = Send(tensor.size_bytes)
+            send.inputs = {"x": Tensor(tensor.dtype, tensor.shape)}
+            send.outputs = {"y": Tensor(tensor.dtype, tensor.shape)}
+            g.insert_identity(
+                send, edge.src, spawn, {source_port: "x"})
+            sends.append(send)
+        layers[layer_id]._pp_block_residual_sends = sends
+
+
 def optimize_model_cluster_prefill(
     g, layers, hw, emb=None, read_input=None, output_head=None, *,
     cp, dp, ep, pp_partition, n_gpus,
@@ -612,25 +635,13 @@ def optimize_model_cluster_prefill(
     # independently of the ordinary hidden-state bridge.  At a PP boundary,
     # insert one explicit point-to-point materialization so the source alias
     # remains in its stage HBM while the destination chain starts locally.
-    for layer_id in range(1, len(layers)):
-        stage = layer_stages[layer_id]
-        if stage == layer_stages[layer_id - 1]:
-            continue
-        sends = []
-        fields = copies_by_layer[id(layers[layer_id])]
-        for spawn in fields.get("block_in_fan", ()):
-            edge = g._in_edges(spawn)[0]
-            source_port = next(
-                output_name for output_name, input_name in edge.mapping.items()
-                if input_name == "x")
-            tensor = spawn.inputs["x"]
-            send = Send(tensor.size_bytes)
-            send.inputs = {"x": Tensor(tensor.dtype, tensor.shape)}
-            send.outputs = {"y": Tensor(tensor.dtype, tensor.shape)}
-            g.insert_identity(
-                send, edge.src, spawn, {source_port: "x"})
-            sends.append(send)
-        layers[layer_id]._pp_block_residual_sends = sends
+    _insert_pp_block_residual_sends(
+        g, layers, layer_stages,
+        [
+            copies_by_layer[id(layer)].get("block_in_fan", ())
+            for layer in layers
+        ],
+    )
 
     # Place every compute kernel and tensor only after all splits are complete.
     placement = Placement(hardware=hw, graph=g)
@@ -848,6 +859,20 @@ def optimize_model_cluster_decode(
         layer_copies["cp_dp"] = cp_fields
 
     optimize_comms(g)
+
+    # Decode carries the AttnRes block state outside the ordinary hidden-state
+    # bridge just like prefill. MLA keeps this fan-out DP-only while KDA splits
+    # it across CP x DP, so collect both layouts before inserting PP sends.
+    _insert_pp_block_residual_sends(
+        g, layers, layer_stages,
+        [
+            (
+                *layer_copies["dp"].get("block_in_fan", ()),
+                *layer_copies["cp_dp"].get("block_in_fan", ()),
+            )
+            for layer_copies in copies_by_layer
+        ],
+    )
 
     # Treat KV loading as a preload phase. The token reader marks the start of
     # the measured decode step and cannot run until every DP×CP KV shard has

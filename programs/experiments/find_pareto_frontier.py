@@ -1048,7 +1048,8 @@ def _run_parallel(
                     f"{case.case_id} ({record.get('wall_time_s', 0):.1f}s)",
                     flush=True,
                 )
-                if record.get("status") == "oom":
+                status = record.get("status")
+                if status == "oom" or (grow_batches and status != "ok"):
                     sweep.clear()
                 elif grow_batches and not sweep:
                     oom_cutoff = baseline_oom_cutoffs.get(_sweep_key(case))

@@ -2,7 +2,7 @@
 
 import pytest
 
-from rooflang.language.kernels.comm import AllGather
+from rooflang.language.kernels.comm import AllGather, Scatter
 from rooflang.language.kernels.forward import (
     AttnRes, KimiK3DeltaAttn, KimiK3DeltaAttnCpMerge,
     KimiK3DeltaAttnCpSummary, KimiK3MlaAttn, PartialRMSNorm,
@@ -269,6 +269,33 @@ def test_decode_attn_residual_crosses_pipeline_boundary(
         "n0-hbm3e-1",
     }
     assert Simulator(graph, placement, hardware).run().total_time_us > 0
+
+
+def test_decode_existing_cp_comm_materializes_pp_residual(monkeypatch):
+    monkeypatch.setattr(model, "N_LAYERS", 25)
+    graph, layers, emb, read_input, kv_reads, output_head = \
+        model.declare_model(batch_size=2, seq_prefill=128, decode=True)
+    hardware = B300Cluster(n_nodes=1)
+
+    graph, placement = optimization.optimize_model_cluster_decode(
+        graph, layers, hardware, emb, read_input, kv_reads, output_head,
+        seq_prefill=128, cp=2, dp=1, ep=2,
+        pp_partition=[24, 1], n_gpus=4)
+
+    boundary = layers[24]
+    assert boundary.is_kda
+    assert boundary._pp_block_residual_sends == []
+    block_in_fans = boundary._decode_copies["cp_dp"]["block_in_fan"]
+    assert len(block_in_fans) == 2
+    assert all(isinstance(graph._in_edges(fan)[0].src, Scatter)
+               for fan in block_in_fans)
+    destination_memories = {
+        placement.get_tensor_memory(fan.inputs["x"]).name
+        for fan in block_in_fans
+    }
+    assert destination_memories == {"n0-hbm3e-2", "n0-hbm3e-3"}
+    graph.validate()
+    placement.validate(graph)
 
 
 def test_prefill_attn_residual_crosses_pipeline_boundary(monkeypatch):

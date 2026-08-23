@@ -544,6 +544,12 @@ def _insert_pp_block_residual_sends(
         sends = []
         for spawn in block_in_fans_by_layer[layer_id]:
             edge = g._in_edges(spawn)[0]
+            # A split-generated communication kernel already materializes its
+            # output according to the destination consumer placement. Adding
+            # a Send after it would leave the intermediate comm-to-comm tensor
+            # without a memory anchor (for example Scatter -> Send -> Spawn).
+            if isinstance(edge.src, CommKernel):
+                continue
             source_port = next(
                 output_name for output_name, input_name in edge.mapping.items()
                 if input_name == "x")

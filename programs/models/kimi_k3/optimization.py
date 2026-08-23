@@ -535,31 +535,48 @@ def _place_pp_boundary_spawn(g, placement, spawn, memory):
 
 
 def _insert_pp_block_residual_sends(
-    g, layers, layer_stages, block_in_fans_by_layer,
+    g, layers, layer_stages, block_in_fans_by_layer, bridges_by_layer,
 ):
-    """Materialize the independently carried AttnRes state at PP edges."""
+    """Materialize AttnRes state at PP edges once the main path is ready."""
     for layer_id in range(1, len(layers)):
         if layer_stages[layer_id] == layer_stages[layer_id - 1]:
             continue
+        block_in_fans = block_in_fans_by_layer[layer_id]
+        bridges = bridges_by_layer[layer_id]
+        if len(block_in_fans) != len(bridges):
+            raise ValueError(
+                f"Layer {layer_id} has {len(block_in_fans)} block residual "
+                f"ranks but {len(bridges)} main-path ranks")
         sends = []
-        for spawn in block_in_fans_by_layer[layer_id]:
+        for spawn, bridge in zip(block_in_fans, bridges):
             edge = g._in_edges(spawn)[0]
             # A split-generated communication kernel already materializes its
             # output according to the destination consumer placement. Adding
             # a Send after it would leave the intermediate comm-to-comm tensor
             # without a memory anchor (for example Scatter -> Send -> Spawn).
             if isinstance(edge.src, CommKernel):
-                continue
-            source_port = next(
-                output_name for output_name, input_name in edge.mapping.items()
-                if input_name == "x")
-            tensor = spawn.inputs["x"]
-            send = Send(tensor.size_bytes)
-            send.inputs = {"x": Tensor(tensor.dtype, tensor.shape)}
-            send.outputs = {"y": Tensor(tensor.dtype, tensor.shape)}
-            g.insert_identity(
-                send, edge.src, spawn, {source_port: "x"})
-            sends.append(send)
+                materialization = edge.src
+            else:
+                source_port = next(
+                    output_name
+                    for output_name, input_name in edge.mapping.items()
+                    if input_name == "x")
+                tensor = spawn.inputs["x"]
+                send = Send(tensor.size_bytes)
+                send.inputs = {"x": Tensor(tensor.dtype, tensor.shape)}
+                send.outputs = {"y": Tensor(tensor.dtype, tensor.shape)}
+                g.insert_identity(
+                    send, edge.src, spawn, {source_port: "x"})
+                sends.append(send)
+                materialization = send
+
+            # The block residual can be produced near the beginning of the
+            # source stage and bypass many layers. Delay its PP transfer until
+            # the ordinary hidden-state path reaches the same boundary. This
+            # keeps the destination stage from starting with an early transfer
+            # followed by a long dependency bubble before AttnRes.
+            main_source = g._in_edges(bridge)[0].src
+            g.add_control_edge(main_source, materialization)
         layers[layer_id]._pp_block_residual_sends = sends
 
 
@@ -645,6 +662,10 @@ def optimize_model_cluster_prefill(
         g, layers, layer_stages,
         [
             copies_by_layer[id(layer)].get("block_in_fan", ())
+            for layer in layers
+        ],
+        [
+            copies_by_layer[id(layer)].get("bridge", ())
             for layer in layers
         ],
     )
@@ -875,6 +896,13 @@ def optimize_model_cluster_decode(
             (
                 *layer_copies["dp"].get("block_in_fan", ()),
                 *layer_copies["cp_dp"].get("block_in_fan", ()),
+            )
+            for layer_copies in copies_by_layer
+        ],
+        [
+            (
+                *layer_copies["dp"].get("bridge", ()),
+                *layer_copies["cp_dp"].get("bridge", ()),
             )
             for layer_copies in copies_by_layer
         ],

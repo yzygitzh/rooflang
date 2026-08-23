@@ -261,6 +261,11 @@ def test_decode_attn_residual_crosses_pipeline_boundary(
 
     boundary = layers[boundary_id]
     assert len(boundary._pp_block_residual_sends) == 1
+    send = boundary._pp_block_residual_sends[0]
+    bridge = boundary._decode_copies[copy_group]["bridge"][0]
+    main_source = graph._in_edges(bridge)[0].src
+    assert graph._dag.has_edge(main_source, send)
+    assert graph._dag.edges[main_source, send]["mapping"] == {}
     destination_memories = {
         placement.get_tensor_memory(copy.inputs["x"])
         for copy in boundary._decode_copies[copy_group]["block_in_fan"]
@@ -289,6 +294,17 @@ def test_decode_existing_cp_comm_materializes_pp_residual(monkeypatch):
     assert len(block_in_fans) == 2
     assert all(isinstance(graph._in_edges(fan)[0].src, Scatter)
                for fan in block_in_fans)
+    residual_scatter = graph._in_edges(block_in_fans[0])[0].src
+    assert all(graph._in_edges(fan)[0].src is residual_scatter
+               for fan in block_in_fans)
+    main_sources = {
+        graph._in_edges(bridge)[0].src
+        for bridge in boundary._decode_copies["cp_dp"]["bridge"]
+    }
+    assert all(graph._dag.has_edge(source, residual_scatter)
+               for source in main_sources)
+    assert all(graph._dag.edges[source, residual_scatter]["mapping"] == {}
+               for source in main_sources)
     destination_memories = {
         placement.get_tensor_memory(fan.inputs["x"]).name
         for fan in block_in_fans

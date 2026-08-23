@@ -636,7 +636,6 @@ def optimize_model_cluster_prefill(
     emb_copies = cp_emb_copies
     layer_copies = _split_prefill_state(
         g, layer_copies, context_split_prefill, cp, "cp_dp")
-    _context_split_kda(g, layer_copies, dp, cp)
     barrier_copies = []
     for copy in barrier_dp_copies:
         _, split_copies, _ = g.split_kernel(
@@ -646,6 +645,11 @@ def optimize_model_cluster_prefill(
         layer._kv_persist_barrier_cp_dp_copies = barrier_copies
 
     optimize_comms(g)
+    # KDA summaries have no tensor inputs of their own, so their readiness is
+    # expressed with control edges from the local attention predecessors.
+    # Add those edges only after communication fusion has finalized those
+    # predecessors; otherwise fusion can remove them and make summaries roots.
+    _context_split_kda(g, layer_copies, dp, cp)
 
     # PP changes placement only; it does not split kernels or modify the graph.
     stage_gpus = [

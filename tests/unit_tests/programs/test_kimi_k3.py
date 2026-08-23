@@ -144,6 +144,21 @@ def test_prefill_kda_cp_summary_allgather_and_merge(monkeypatch):
         assert summaries[0].flops_by_dtype["fp32"] > 0
         assert summaries[0].outputs["summary"].dtype == "fp32"
         assert summaries[1].flops == 0
+        for summary, sa in zip(
+                summaries, layer._sa_cp_dp_copies, strict=True):
+            control_sources = {
+                source for source in graph._dag.predecessors(summary)
+                if graph._dag.edges[source, summary]["mapping"] == {}
+            }
+            stable_sa_sources = {
+                edge.src for edge in graph._in_edges(sa)
+                if not isinstance(
+                    edge.src,
+                    (KimiK3DeltaAttnCpMerge,
+                     KimiK3DeltaAttnCpSummary))
+            }
+            assert control_sources == stable_sa_sources
+            assert control_sources
         for dp_rank in range(4):
             source = summaries[dp_rank * 2]
             sink = layer._sa_cp_dp_copies[dp_rank * 2 + 1]

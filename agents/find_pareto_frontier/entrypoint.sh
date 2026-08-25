@@ -20,6 +20,7 @@ mkdir -p \
     "$XDG_CONFIG_HOME" \
     "$XDG_DATA_HOME" \
     "$XDG_STATE_HOME" \
+    "$HOME/.local/bin" \
     /tmp/cache \
     /tmp/matplotlib \
     /tmp/rooflang-pareto-agent
@@ -30,8 +31,13 @@ cd /tmp/rooflang-pareto-agent
 
 case "$agent" in
     codex)
-        echo "[agent-update] Updating Codex with the official installer" >&2
-        curl -fsSL https://chatgpt.com/codex/install.sh | sh
+        mkdir -p "$CODEX_HOME/packages"
+        cp -R /opt/rooflang-agent/codex/standalone \
+            "$CODEX_HOME/packages/standalone"
+        ln -s "$CODEX_HOME/packages/standalone/current/bin/codex" \
+            "$HOME/.local/bin/codex"
+        echo "[agent-update] Running codex update" >&2
+        codex update >&2
         hash -r
         codex --version >&2
 
@@ -53,10 +59,17 @@ case "$agent" in
         exec "${command[@]}" - < "$task_file"
         ;;
     claude)
-        echo "[agent-update] Updating Claude Code with the official installer" >&2
-        curl -fsSL https://claude.ai/install.sh | bash
-        hash -r
+        mkdir -p "$XDG_DATA_HOME/claude"
+        cp -R /opt/rooflang-agent/claude/versions \
+            "$XDG_DATA_HOME/claude/versions"
+        claude_seed=$(find "$XDG_DATA_HOME/claude/versions" \
+            -mindepth 1 -maxdepth 1 -type f -print -quit)
+        [[ -n "$claude_seed" ]] \
+            || { echo "error: Claude CLI seed is missing" >&2; exit 2; }
+        ln -s "$claude_seed" "$HOME/.local/bin/claude"
+        echo "[agent-update] Running claude update" >&2
         claude update >&2
+        hash -r
         claude --version >&2
 
         command=(
@@ -72,7 +85,7 @@ case "$agent" in
         if [[ -n "$agent_model" ]]; then
             command+=(--model "$agent_model")
         fi
-        exec "${command[@]}" "$(<"$task_file")"
+        exec "${command[@]}" < "$task_file"
         ;;
     *)
         echo "error: ROOFLANG_AGENT must be 'codex' or 'claude'" >&2

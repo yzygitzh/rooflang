@@ -21,14 +21,23 @@ RUN apt-get update \
 
 ENV PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# Install both native CLIs through their official installers and verify them at
-# build time. Each run installs/updates the selected CLI again inside its own
-# ephemeral home, so no build-time or previous-run CLI state is reused.
+# Install both native CLIs through their official installers, verify them, and
+# retain immutable seeds for isolated per-run updates.
 RUN curl -fsSL https://chatgpt.com/codex/install.sh | sh \
-    && codex --version
+    && codex --version \
+    && mkdir -p /opt/rooflang-agent/codex \
+    && cp -a /root/.codex/packages/standalone \
+        /opt/rooflang-agent/codex/standalone \
+    && codex_release=$(basename "$(readlink -f \
+        /root/.codex/packages/standalone/current)") \
+    && ln -sfn "releases/$codex_release" \
+        /opt/rooflang-agent/codex/standalone/current
 
 RUN curl -fsSL https://claude.ai/install.sh | bash \
-    && claude --version
+    && claude --version \
+    && mkdir -p /opt/rooflang-agent/claude/versions \
+    && cp -a "$(readlink -f "$(command -v claude)")" \
+        /opt/rooflang-agent/claude/versions/
 
 COPY requirements.txt /tmp/rooflang-requirements.txt
 RUN python3 -m venv /opt/rooflang-venv \

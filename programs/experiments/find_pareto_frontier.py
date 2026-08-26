@@ -19,13 +19,14 @@ reported as bubble.  Ideal-overlap variants additionally hide, independently
 on each GPU, the shorter of total compute and exposed communication time
 before selecting the slowest stage.
 
-The simulator executes and accounts for one batch.  Memory feasibility is
-then evaluated separately for each frontier: original uses one KV copy,
-decode elapsed uses ``PP`` concurrent copies, and decode overlapped uses
-``2 * PP`` copies. Prefill does not retain KV state for pipeline concurrency,
-so its elapsed and overlapped projections use one and two copies respectively.
-Only the tagged KV-cache footprint is replicated; weights and activations
-keep their simulated peak usage.
+The simulator executes and accounts for one batch.  Memory feasibility for
+the derived elapsed and ideal-overlap frontiers uses the same KV concurrency:
+prefill uses one copy and decode uses ``PP`` concurrent copies.  Ideal overlap
+does not represent multi-batch overlap or double buffering.  It assumes that
+each kernel's data can be divided finely enough for local compute/memory work
+and exposed communication to overlap as a dataflow, for example at tile
+granularity.  Only the tagged KV-cache footprint is replicated; weights and
+activations keep their simulated peak usage.
 
 Each simulation is an independent process.  Results are appended to JSONL as
 they finish, so an interrupted search can resume without repeating completed

@@ -8,7 +8,7 @@ Improve the overlapped Pareto frontier for one Rooflang model/preset pair by imp
 - Model: `{{MODEL}}`
 - Preset: `{{PRESET}}`
 - Complete prior results: `/workspace/results`
-- Scratch: `/tmp/rooflang-pareto-agent`
+- Persistent run artifacts and scratch: `/workspace/artifacts`
 
 This file is the complete task input. Do not rely on chat history, hidden state, or other repository instructions. The model, preset, paths, baseline results, and acceptance rules are immutable.
 

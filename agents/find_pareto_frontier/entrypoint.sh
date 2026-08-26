@@ -13,6 +13,11 @@ if [[ ! -r /workspace/rooflang/programs/experiments/find_pareto_frontier.py ]]; 
     exit 2
 fi
 
+if [[ ! -d /workspace/artifacts || ! -w /workspace/artifacts ]]; then
+    echo "error: /workspace/artifacts is not a writable directory" >&2
+    exit 2
+fi
+
 mkdir -p \
     "$HOME" \
     "$CODEX_HOME" \
@@ -52,6 +57,7 @@ case "$agent" in
             --color never
             --cd /tmp/rooflang-pareto-agent
             --add-dir /workspace/rooflang
+            --add-dir /workspace/artifacts
         )
         if [[ -n "$agent_model" ]]; then
             command+=(--model "$agent_model")
@@ -81,6 +87,7 @@ case "$agent" in
             --output-format stream-json
             --verbose
             --add-dir /workspace/rooflang
+            --add-dir /workspace/artifacts
         )
         if [[ -n "$agent_model" ]]; then
             command+=(--model "$agent_model")

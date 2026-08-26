@@ -203,9 +203,10 @@ run_stamp=$(date -u +%Y%m%dT%H%M%SZ)
 run_dir=$(mktemp -d "$runs_root/run-${run_stamp}-XXXXXX")
 run_rooflang=$run_dir/rooflang
 run_task_dir=$run_dir/task
+run_artifacts_dir=$run_dir/artifacts
 trace_log=$run_dir/agent.trace.log
 
-mkdir -p -- "$run_task_dir"
+mkdir -p -- "$run_task_dir" "$run_artifacts_dir"
 rsync "${rsync_args[@]}" "$rooflang_dir/" "$run_rooflang/"
 
 run_target_file=$run_rooflang/$target_rel
@@ -249,6 +250,8 @@ docker_args+=(
     --env "XDG_DATA_HOME=/home/agent/.local/share"
     --env "XDG_STATE_HOME=/home/agent/.local/state"
     --env "XDG_CACHE_HOME=/tmp/cache"
+    --env "ROOFLANG_ARTIFACTS=/workspace/artifacts"
+    --mount "type=bind,source=$run_artifacts_dir,target=/workspace/artifacts"
     --mount "type=bind,source=$run_task_dir/AGENTS.md,target=/workspace/task/AGENTS.md,readonly"
     --mount "type=bind,source=$run_rooflang,target=/workspace/rooflang,readonly"
     --mount "type=bind,source=$run_target_file,target=/workspace/rooflang/$target_rel"
@@ -265,6 +268,7 @@ docker_args+=(
     echo "Results:           $results_path"
     echo "Writable model:    $run_target_file"
     echo "Writable search:   $run_experiments_dir"
+    echo "Run artifacts:     $run_artifacts_dir"
     echo "Docker image:      $image"
     echo "Run directory:     $run_dir"
     echo "Trace log:         $trace_log"

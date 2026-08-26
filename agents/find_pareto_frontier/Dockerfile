@@ -48,6 +48,7 @@ RUN python3 -m venv /opt/rooflang-venv \
 COPY entrypoint.sh /usr/local/bin/rooflang-agent
 RUN chmod 0755 /usr/local/bin/rooflang-agent \
     && mkdir -p \
+        /workspace/artifacts \
         /workspace/task \
         /workspace/results \
         /workspace/rooflang \

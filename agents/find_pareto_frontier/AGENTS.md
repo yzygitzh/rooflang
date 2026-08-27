@@ -36,7 +36,9 @@ Persistent source changes are allowed only in:
 1. `/workspace/rooflang/programs/models/{{MODEL}}/optimization.py`
 2. `/workspace/rooflang/programs/experiments/`
 
-The model file may change only placement and optimization: device/stream/tensor-memory mapping, legal parallel or PP placement, legal graph transforms, and local helpers for them. The experiment subtree may change legal case generation, exploration, pruning, batch growth, scheduling, parallelism, resume/output handling, and frontier analysis.
+The model file may change only placement and optimization: device/tensor-memory mapping, legal parallel or PP placement, legal graph transforms, and local helpers for them. The experiment subtree may change legal case generation, exploration, pruning, batch growth, scheduling, parallelism, resume/output handling, and frontier analysis.
+
+Do not introduce or alter non-default stream assignments.
 
 Never change model definitions or semantics, architecture, shapes, dtypes, operations, another model file, presets, tests, simulator/language/runtime code, hardware/timing/memory accounting, feasibility, metrics, grouping, dominance, or this 5% rule. Never reduce required work/domain, bypass dependencies, falsify accounting, hard-code answers, commit, stage, or push. Report suspected out-of-scope bugs and impact without fixing or compensating for them.
 

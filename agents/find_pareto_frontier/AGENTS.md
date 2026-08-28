@@ -64,6 +64,10 @@ For each credible hypothesis: state a falsifiable prediction; make the smallest 
 
 After a promising screen, rerun every supplied case identity for the preset. Include newly found legal cases and extend moved OOM boundaries using the original legal growth rule. Audit pruning against a less-pruned tractable reference. Fast subsets may screen ideas but cannot establish acceptance.
 
+### 5.1 Continuous Supervision
+
+Treat every required simulation and validation as part of this task. Do not launch required work in the background and then end the agent session. Keep each process under supervision by polling its PID, logs, and outputs; detect stalls, failures, and OOMs; and resume safely when needed. Do not end the session or report completion until all required work, final checks, and artifacts are complete.
+
 ## 6. Final Validation and State
 
 Run every supplied case plus required extensions in fresh processes. Independently recompute `F_final`, `F_union`, preservation, `D(n)`, and both percentage deltas. Run relevant model, placement, optimization, simulator, and search tests. Diff both writable locations against snapshots and verify no other source changed.

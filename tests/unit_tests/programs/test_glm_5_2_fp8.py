@@ -138,6 +138,27 @@ def test_cluster_optimization_with_dense_and_moe_layers(monkeypatch, decode):
     assert layers[3]._expert_weight_read_fraction > 0
 
 
+@pytest.mark.parametrize("decode", [False, True])
+def test_two_stage_cluster_placement_materializes_pipeline_boundary(
+        monkeypatch, decode):
+    monkeypatch.setattr(model, "N_LAYERS", 2)
+    graph, layers, emb, read_input, kv_reads, output_head = \
+        model.declare_model(batch_size=8, seq_prefill=128, decode=decode)
+    hardware = B300Cluster(n_nodes=2)
+    kwargs = dict(cp=1, dp=8, ep=8, pp_partition=[1, 1], n_gpus=16)
+
+    if decode:
+        graph, placement = optimization.optimize_model_cluster_decode(
+            graph, layers, hardware, emb, read_input, kv_reads, output_head,
+            seq_prefill=128, **kwargs)
+    else:
+        graph, placement = optimization.optimize_model_cluster_prefill(
+            graph, layers, hardware, emb, read_input, output_head, **kwargs)
+
+    graph.validate()
+    placement.validate(graph)
+
+
 def test_pareto_model_selection_does_not_require_compression_constants():
     finder._select_model("glm_5_2_fp8")
 

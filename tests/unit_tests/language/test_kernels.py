@@ -75,6 +75,34 @@ class TestKernelToDict:
         assert "outputs" in d
         assert d["outputs"] == {"y": {"dtype": "fp32", "shape": (4,)}}
 
+    def test_optional_metrics_and_fractional_reads_included(self):
+        class MixedKernel(Kernel):
+            @property
+            def flops(self):
+                return 12.0
+
+            @property
+            def flops_by_dtype(self):
+                return {"fp8": 12.0}
+
+            def input_read_fraction(self, port):
+                assert port == "x"
+                return 0.5
+
+        k = MixedKernel(
+            inputs={"x": Tensor("bf16", (4,))},
+            weights={"w": Tensor("bf16", (4,))},
+            outputs={"y": Tensor("bf16", (4,))},
+        )
+        k.weight_read_fraction = Fraction(1, 2)
+
+        result = k.to_dict()
+
+        assert result["flops_by_dtype"] == {"fp8": 12.0}
+        assert result["input_tensor_bytes"] == 8.0
+        assert result["loaded_weight_bytes"] == 4.0
+        assert result["weight_read_fraction"] == 0.5
+
 
 # ── Shared base for all kernel subclass tests ────────────────────────
 

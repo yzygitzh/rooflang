@@ -92,6 +92,33 @@ def test_zero_ratio_layer_cluster_optimization(monkeypatch, decode):
     placement.validate(graph)
 
 
+def test_prefill_two_stage_cluster_placement(monkeypatch):
+    """Exercise placement and aliasing across a pipeline boundary."""
+    monkeypatch.setattr(model, "N_LAYERS", 2)
+    graph, layers, emb, read_input, _, output_head = model.declare_model(
+        batch_size=8, seq_prefill=128, decode=False)
+    graph, placement = optimization.optimize_model_cluster_prefill(
+        graph, layers, B300Cluster(n_nodes=2), emb, read_input, output_head,
+        cp=1, dp=8, ep=8, pp_partition=[1, 1], n_gpus=16)
+
+    graph.validate()
+    placement.validate(graph)
+
+
+def test_decode_with_index_cache_and_two_pipeline_stages(monkeypatch):
+    """Exercise decode index-cache splits and a pipeline boundary."""
+    monkeypatch.setattr(model, "N_LAYERS", 4)
+    graph, layers, emb, read_input, kv_reads, output_head = model.declare_model(
+        batch_size=8, seq_prefill=128, decode=True)
+    graph, placement = optimization.optimize_model_cluster_decode(
+        graph, layers, B300Cluster(n_nodes=2), emb, read_input, kv_reads,
+        output_head, seq_prefill=128, cp=1, dp=8, ep=8,
+        pp_partition=[2, 2], n_gpus=16)
+
+    graph.validate()
+    placement.validate(graph)
+
+
 def test_pareto_enumeration_ignores_zero_ratio(monkeypatch):
     monkeypatch.setattr(finder, "N_LAYERS", 43, raising=False)
     monkeypatch.setattr(finder, "N_EXPERTS", 256, raising=False)

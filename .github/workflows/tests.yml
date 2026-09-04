@@ -4,9 +4,13 @@
 name: Tests
 
 on:
+  push:
+    branches:
+    - main
   pull_request:
     branches:
-      - main
+    - main
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -38,4 +42,40 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}/..
           PYTHONDONTWRITEBYTECODE: "1"
-        run: pytest -q -p no:cacheprovider
+        run: >-
+          pytest -q -p no:cacheprovider
+          --cov=rooflang.language
+          --cov=rooflang.runtime
+          --cov=rooflang.programs
+          --cov-report=term-missing
+          --cov-report=json:coverage.json
+
+      - name: Enforce per-file coverage
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          minimum = 95.0
+          report = json.loads(Path("coverage.json").read_text())
+          failures = []
+
+          for filename, details in sorted(report["files"].items()):
+              percent = details["summary"]["percent_covered"]
+              if percent < minimum:
+                  failures.append((filename, percent))
+                  print(
+                      f"::error file={filename}::Coverage is {percent:.2f}%, "
+                      f"below the required {minimum:.2f}%"
+                  )
+
+          if failures:
+              raise SystemExit(
+                  f"{len(failures)} file(s) have coverage below {minimum:.2f}%"
+              )
+
+          print(
+              f"All {len(report['files'])} measured files have coverage "
+              f"of at least {minimum:.2f}%"
+          )
+          PY

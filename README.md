@@ -4,7 +4,7 @@
 
 RoofLang provides a verification-constrained design space in which an optimizer can declare LLM workloads and hardware as graphs, transform and place the workload, and evaluate the resulting architecture before committing to an implementation. It is intended as an analytical oracle for architecture exploration, not as a high-fidelity production-performance predictor.
 
-[Project page](https://yzygitzh.github.io/rooflang)
+[Paper]() [Project page](https://yzygitzh.github.io/rooflang)
 
 ## Code structure
 

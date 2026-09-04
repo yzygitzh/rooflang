@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """Unit tests for HardwareGraph topology (find_fabric, find_local_memory)."""
 
 import pytest

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """Forward-pass Kernel subclasses for the model-roofline op enumerators.
 
 Each class takes shape + dtype arguments and exposes roofline metrics

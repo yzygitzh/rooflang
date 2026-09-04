@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """GLM-5.2-FP8 inference — Declaration Phase.
 
 Builds the logical compute graph (add_kernel + add_data_edge).

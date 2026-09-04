@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """GLM-5.2-FP8 model configuration constants."""
 
 D = 6144

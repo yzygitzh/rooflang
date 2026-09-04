@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """RTX 6000D Ethernet supernode and aggregated-scope presets."""
 
 from collections import Counter

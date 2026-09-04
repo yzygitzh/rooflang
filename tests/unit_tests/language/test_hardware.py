@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """Unit tests for rooflang.language.hardware (component nodes)."""
 
 import pytest

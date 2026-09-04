@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """Focused tests for model-specific placement helper edge cases."""
 
 from types import SimpleNamespace

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """Base Kernel class for the model-roofline DSL.
 
 Every primitive (forward, backward, optimizer, comm, identity) is a Kernel

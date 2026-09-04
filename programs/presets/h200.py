@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """H200 cluster and aggregated-node presets."""
 
 from collections import Counter

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """Model implementations available to rooflang experiments."""
 
 from importlib import import_module

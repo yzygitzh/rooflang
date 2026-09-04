@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """DeepSeek V4 Pro inference — graph splitting and placement strategies."""
 
 from collections import defaultdict, deque

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 FROM ubuntu:24.04
 
 ARG DEBIAN_FRONTEND=noninteractive

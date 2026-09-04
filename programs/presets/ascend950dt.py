@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """Ascend 950DT Unified Bus cluster and aggregated-scope presets."""
 
 from collections import Counter

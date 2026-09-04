@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """DeepSeek V4 Pro model configuration constants."""
 
 D = 7168

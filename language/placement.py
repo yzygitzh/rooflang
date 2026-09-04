@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """Placement — assigns kernels to devices and tensors to memory nodes.
 
 The placement pass produces a Placement object that maps each compute kernel

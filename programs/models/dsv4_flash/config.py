@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """DeepSeek V4 Flash model configuration constants."""
 
 D = 4096

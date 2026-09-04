@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """Kimi-K3 text-model inference simulation.
 
 Three-phase structure:

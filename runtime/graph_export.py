@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """Export ComputeGraph visualization using networkx + matplotlib."""
 
 from __future__ import annotations

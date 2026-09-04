@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """GLM-5.2-FP8 inference — graph splitting and placement strategies."""
 
 from collections import defaultdict, deque

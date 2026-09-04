@@ -64,7 +64,7 @@ PYTHONPATH="$(pwd)/.." python -m rooflang.programs.experiments.find_pareto_front
 PYTHONPATH="$(pwd)/.." pytest -q
 ```
 
-## Cite us
+## Citation
 
 If RoofLang is useful in your work, please cite the technical report:
 

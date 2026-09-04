@@ -1,10 +1,9 @@
 # RoofLang
 
-**RoofLang is an embedded domain-specific language and intermediate representation for AI-driven architecting of LLM inference systems, combining semantics-preserving graph transformations with roofline-based discrete-event simulation.**
+RoofLang is a domain-specific language (DSL) for AI-driven architecting of LLM inference systems. It combines graph-based workload and hardware representations, semantics-preserving transformations, and roofline-based simulation to provide a verifiable, implementation-independent environment for exploring system architectures.
 
-RoofLang provides a verification-constrained design space in which an optimizer can declare LLM workloads and hardware as graphs, transform and place the workload, and evaluate the resulting architecture before committing to an implementation. It is intended as an analytical oracle for architecture exploration, not as a high-fidelity production-performance predictor.
-
-[Paper]() [Project page](https://yzygitzh.github.io/rooflang)
+[Technical report]()<br>
+[Project page](https://yzygitzh.github.io/rooflang)
 
 ## Code structure
 

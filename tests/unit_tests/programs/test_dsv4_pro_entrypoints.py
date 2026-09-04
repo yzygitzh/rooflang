@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """Tests for the lightweight DSV4 Pro entry points and visualization."""
 
 from types import SimpleNamespace

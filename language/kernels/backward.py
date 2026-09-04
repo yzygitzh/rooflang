@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """Backward-pass Kernel subclasses, paired with forward.py.
 
 Per-kernel bytes convention:

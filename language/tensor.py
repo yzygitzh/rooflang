@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """Tensor — a shaped, typed array descriptor."""
 
 from __future__ import annotations

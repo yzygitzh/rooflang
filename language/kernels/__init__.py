@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """kernels — Kernel classes for closed-form FLOPs / HBM-byte formulas,
 split by phase:
 

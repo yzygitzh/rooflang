@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """Model inference simulation entry point."""
 
 import argparse

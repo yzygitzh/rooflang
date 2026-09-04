@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """Communication optimization pass — fuse primitive pairs into collectives.
 
 Recognizes (Gather|Reduce) → (Scatter|Broadcast) pairs introduced by

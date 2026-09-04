@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """GB300 NVL cluster and aggregated-scope presets."""
 
 from collections import Counter

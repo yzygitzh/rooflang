@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """DeepSeek V4 Flash inference simulation on B300 hardware.
 
 Three-phase structure:

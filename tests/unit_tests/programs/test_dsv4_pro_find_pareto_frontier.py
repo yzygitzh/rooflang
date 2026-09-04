@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """Tests for the DSV4 Pro Pareto-frontier search driver."""
 
 import csv

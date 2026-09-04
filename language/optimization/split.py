@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """Split and duplication callables for semantics-preserving graph rewrites.
 
 Each callable takes (kernel, n) and returns (prev_comms, copies, next_comms):

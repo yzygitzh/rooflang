@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """Export SimulationResult to Google Trace Event Format (JSON).
 
 Output can be loaded in chrome://tracing or Perfetto UI.

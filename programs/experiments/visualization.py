@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """DeepSeek V4 Pro inference — Visualization Phase."""
 
 from collections import deque

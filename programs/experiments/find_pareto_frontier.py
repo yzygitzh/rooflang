@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """Search and plot DSV4 Pro throughput/latency Pareto frontiers.
 
 The two maximized Pareto metrics are:

@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """Communication Kernel subclasses for collective operations.
 
 These model the cost of NCCL-style collectives at sharding boundaries.

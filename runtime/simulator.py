@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """Roofline simulator — DES with resource contention.
 
 Overlapping kernels on the same device share compute/memory by weighted

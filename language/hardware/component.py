@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """Hardware component nodes: Compute and Memory.
 
 Nodes in the hardware graph. Compute represents processing units (GPU, CPU,

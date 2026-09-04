@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 set -euo pipefail
 
 readonly task_file=/workspace/task/AGENTS.md

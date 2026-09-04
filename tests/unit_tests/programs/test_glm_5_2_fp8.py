@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """Tests for GLM-5.2-FP8 model-specific behavior."""
 
 import pytest

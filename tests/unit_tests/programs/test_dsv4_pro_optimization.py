@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """Tests for DeepSeek V4 Pro placement strategies."""
 
 import inspect

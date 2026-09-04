@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """Optimizer-step Kernel subclasses, paired with forward.py and backward.py.
 
 The optimizer step is per-parameter — `n_param` is the total parameter

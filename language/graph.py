@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """ComputeGraph — DAG of kernels with typed edges.
 
 Two edge types (distinguished by whether mapping is empty):

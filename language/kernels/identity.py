@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Ziyue Yang
+# Licensed under the MIT License.
+
 """Identity kernels — zero-cost structural nodes."""
 
 from __future__ import annotations

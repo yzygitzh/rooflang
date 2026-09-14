@@ -2,7 +2,7 @@
 
 RoofLang is a domain-specific language (DSL) for AI-driven architecting of LLM inference systems. It combines graph-based workload and hardware representations, semantics-preserving transformations, and roofline-based simulation to provide a verifiable, implementation-independent environment for exploring system architectures.
 
-[Technical report]()<br>
+[Technical report](https://arxiv.org/abs/2609.12551)<br>
 [Project page](https://yzygitzh.github.io/rooflang)
 
 ## Code structure
@@ -69,11 +69,11 @@ PYTHONPATH="$(pwd)/.." pytest -q
 If RoofLang is useful in your work, please cite the technical report:
 
 ```bibtex
-@misc{yang2026rooflang,
-  title        = {RoofLang: Enabling AI-Driven Architecting of LLM Inference Systems},
-  author       = {{RoofLang Project}},
-  year         = {2026},
-  howpublished = {Technical report},
-  url          = {https://yzygitzh.github.io/rooflang/}
+@article{yang2026rooflang,
+  author = {Yang, Ziyue and Jiang, Yuting and Qu, Lei and Cheng, Peng},
+  title = {RoofLang: Enabling AI-Driven Architecting of LLM Inference Systems},
+  journal = {arXiv preprint arXiv:2609.12551},
+  year = {2026},
+  url = {https://arxiv.org/abs/2609.12551}
 }
 ```

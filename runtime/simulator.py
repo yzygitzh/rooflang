@@ -11,6 +11,7 @@ Stream semantics: kernels on the same (device, stream) execute serially.
 from __future__ import annotations
 
 import heapq
+import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
@@ -235,6 +236,7 @@ class Simulator:
         self._completed: Set[Kernel] = set()
         self._eid = 0
         self._eq: list = []
+        self._end_event_ids: Dict[RunningKernel, int] = {}
         self._stream_active: Dict[Tuple[Compute, int], RunningKernel] = {}
         self._stream_pending: Dict[Tuple[Compute, int], List[Kernel]] = {}
         self._multi_stream_waiting: List[Tuple[float, Kernel]] = []
@@ -294,7 +296,7 @@ class Simulator:
                 self._push(0.0, "start", kernel, dev, stream)
 
         while self._eq:
-            now, _, typ, kernel, dev, stream = heapq.heappop(self._eq)
+            now, event_id, typ, kernel, dev, stream = heapq.heappop(self._eq)
             if kernel in self._completed:
                 continue
             if typ == "start":
@@ -310,10 +312,17 @@ class Simulator:
                 rk = self._stream_active.get((dev, stream))
                 if rk is None or rk.kernel is not kernel:
                     continue
-                rk.advance_to(now)
-                if rk.eta() > now + 1e-9:
-                    self._push(rk.eta(), "end", kernel, dev, stream)
+                if self._end_event_ids.get(rk) != event_id:
                     continue
+                rk.advance_to(now)
+                # Near completion, fraction updates can stop changing at float
+                # precision.  A few ULPs of simulated time are immaterial but
+                # rescheduling them can keep the event loop busy indefinitely.
+                end_tolerance = max(1e-9, 32 * math.ulp(now))
+                if rk.eta() - now > end_tolerance:
+                    self._schedule_end(rk)
+                    continue
+                del self._end_event_ids[rk]
                 self._completed.add(kernel)
                 self._kernel_end[kernel] = now
                 self._stream_end[(dev, stream)] = now
@@ -364,8 +373,16 @@ class Simulator:
     # ── Event queue ─────────────────────────────────────────────────
 
     def _push(self, t, typ, kernel, dev, stream):
-        heapq.heappush(self._eq, (t, self._eid, typ, kernel, dev, stream))
+        event_id = self._eid
+        heapq.heappush(self._eq, (t, event_id, typ, kernel, dev, stream))
         self._eid += 1
+        return event_id
+
+    def _schedule_end(self, rk: RunningKernel) -> None:
+        # Resource contention changes a running kernel's ETA.  Leave the old
+        # heap entry in place, but invalidate it so it cannot reschedule itself.
+        self._end_event_ids[rk] = self._push(
+            rk.eta(), "end", rk.kernel, rk.device, rk.stream)
 
     # ── Kernel lifecycle ────────────────────────────────────────────
 
@@ -401,7 +418,7 @@ class Simulator:
         self._allocate_outputs(kernel)
         self._advance_peers(rk, now)
         self._recompute_shares(rk)
-        self._push(rk.eta(), "end", kernel, dev, stream)
+        self._schedule_end(rk)
         self._resched_peers(rk)
         return True
 
@@ -567,7 +584,7 @@ class Simulator:
 
     def _resched_peers(self, rk: RunningKernel):
         for p in self._affected_peers(rk) - {rk}:
-            self._push(p.eta(), "end", p.kernel, p.device, p.stream)
+            self._schedule_end(p)
 
     # ── Resolution helpers ──────────────────────────────────────────
 

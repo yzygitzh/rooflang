@@ -16,7 +16,7 @@ from rooflang.language.kernels.identity import Concat, Spawn
 from rooflang.language.optimization.comm import optimize_comms
 from rooflang.language.placement import Placement
 from rooflang.language.tensor import Tensor
-from rooflang.runtime.simulator import Bound, OOMError, Simulator
+from rooflang.runtime.simulator import Bound, OOMError, RunningKernel, Simulator
 
 
 # ── Test helpers ─────────────────────────────────────────────────────
@@ -180,6 +180,77 @@ class TestSingleKernel:
         assert kernel.input_bytes == 500.0
         assert result.trace[0].memory_time_us == pytest.approx(0.5)
         assert result.peak_memory[hbm] == 2000.0
+
+
+# ── End-event scheduling ─────────────────────────────────────────────
+
+
+def test_rescheduled_end_event_does_not_advance_a_stale_deadline(monkeypatch):
+    hw, gpu, _ = _hw(read_bw=1000.0, write_bw=1000.0)
+    first = SyntheticKernel(flops_val=1e6)
+    second = SyntheticKernel(flops_val=3e6)
+    graph = ComputeGraph()
+    graph.add_kernel(first)
+    graph.add_kernel(second)
+    placement = Placement(hardware=hw)
+    placement.set_kernel_device(first, gpu, stream=0)
+    placement.set_kernel_device(second, gpu, stream=1)
+
+    stale_advances = []
+    original_advance = RunningKernel.advance_to
+
+    def track_advance(self, now):
+        if self.kernel is first and abs(now - 1.0) < 1e-12:
+            stale_advances.append(now)
+        return original_advance(self, now)
+
+    monkeypatch.setattr(RunningKernel, "advance_to", track_advance)
+    result = _sim(graph, placement, hw)
+
+    assert result.total_time_us == pytest.approx(4.0)
+    assert not stale_advances
+
+
+def test_sub_ulp_progress_cannot_keep_rescheduling_an_end_event(monkeypatch):
+    hw, gpu, _ = _hw(read_bw=1000.0, write_bw=1000.0)
+    lead = SyntheticKernel(flops_val=5e11)
+    tail = SyntheticKernel(flops_val=0.0)
+    graph = ComputeGraph()
+    graph.add_kernel(lead)
+    graph.add_kernel(tail)
+    graph.add_control_edge(lead, tail)
+    placement = Placement(hardware=hw)
+    placement.set_kernel_device(lead, gpu)
+    placement.set_kernel_device(tail, gpu)
+
+    original_eta = RunningKernel.eta
+    original_advance = RunningKernel.advance_to
+    original_push = Simulator._push
+    pushed = 0
+
+    def rounded_eta(self):
+        if self.kernel is tail:
+            return self.seg_start + 1.2e-9
+        return original_eta(self)
+
+    def rounded_advance(self, now):
+        if self.kernel is tail:
+            self.seg_start = now  # A near-complete fraction no longer changes.
+            return
+        return original_advance(self, now)
+
+    def limited_push(self, *args):
+        nonlocal pushed
+        pushed += 1
+        assert pushed < 20, "end event was rescheduled without progress"
+        return original_push(self, *args)
+
+    monkeypatch.setattr(RunningKernel, "eta", rounded_eta)
+    monkeypatch.setattr(RunningKernel, "advance_to", rounded_advance)
+    monkeypatch.setattr(Simulator, "_push", limited_push)
+
+    result = _sim(graph, placement, hw)
+    assert result.total_time_us == pytest.approx(500000.0)
 
 
 # ── Stream serialization ─────────────────────────────────────────────

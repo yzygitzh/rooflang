@@ -6,10 +6,10 @@ split by phase:
 
   kernel.py     — Kernel base class + TensorDesc
   forward.py    — Slice, Gemm, StridedGemm, RMSNorm, LayerNorm,
-                  Attn, DpskV4SparseAttn
+                  Attn, MlaAttn, DpskV4SparseAttn
   backward.py   — GemmDX, GemmDW, StridedGemmDX, StridedGemmDW,
                    RMSNorm, PartialRMSNorm, LayerNorm, AttnRes, Attn,
-                   KimiK3MlaAttn, KimiK3DeltaAttn,
+                   MlaAttn, KimiK3DeltaAttn,
                    KimiK3DeltaAttnCpSummary, KimiK3DeltaAttnCpMerge,
                    KimiK3DeltaAttnStateStore, DpskV4SparseAttn
   optimizer.py  — AdamWStep

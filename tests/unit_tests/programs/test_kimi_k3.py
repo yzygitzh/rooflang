@@ -8,7 +8,7 @@ import pytest
 from rooflang.language.kernels.comm import AllGather, Scatter
 from rooflang.language.kernels.forward import (
     AttnRes, KimiK3DeltaAttn, KimiK3DeltaAttnCpMerge,
-    KimiK3DeltaAttnCpSummary, KimiK3MlaAttn, PartialRMSNorm,
+    KimiK3DeltaAttnCpSummary, MlaAttn, PartialRMSNorm,
 )
 from rooflang.programs.experiments import find_pareto_frontier as finder
 from rooflang.programs.models import kimi_k3
@@ -59,8 +59,8 @@ def test_text_graph_layer_types_caches_and_precisions(monkeypatch, decode):
     assert [layer.is_dense for layer in layers] == [True, False, False, False]
     assert all(isinstance(layer.sa, KimiK3DeltaAttn)
                for layer in layers[:3])
-    assert isinstance(layers[3].sa, KimiK3MlaAttn)
-    assert type(layers[3].sa).__name__ == "KimiK3MlaAttn"
+    assert isinstance(layers[3].sa, MlaAttn)
+    assert type(layers[3].sa).__name__ == "MlaAttn"
     assert isinstance(layers[3].kv_norm, PartialRMSNorm)
     assert layers[3].kv_norm.input_dim == 576
     assert layers[3].kv_norm.norm_dim == 512

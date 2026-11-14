@@ -573,9 +573,9 @@ class TestBwdAttn(TestKernelBase):
         assert k.flops == 10.0 * 2 * 8 * 128 * 256 * 64 * 0.5
 
 
-class TestBwdKimiK3MlaAttn(TestKernelBase):
+class TestBwdMlaAttn(TestKernelBase):
     __test__ = True
-    kernel = backward.KimiK3MlaAttn(
+    kernel = backward.MlaAttn(
         B=2, H=4, S_q=3, S_kv=5,
         qk_head_dim=6, v_head_dim=8, kv_cache_dim=10,
         kv_lora_rank=4, qk_nope_head_dim=2)
@@ -605,7 +605,7 @@ class TestBwdKimiK3MlaAttn(TestKernelBase):
         }
 
     def test_causal_dense_pairs(self):
-        kernel = backward.KimiK3MlaAttn(
+        kernel = backward.MlaAttn(
             B=1, H=2, S_q=8, S_kv=8,
             qk_head_dim=6, v_head_dim=8, kv_cache_dim=10,
             kv_lora_rank=4, qk_nope_head_dim=2, causal=True)

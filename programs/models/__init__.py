@@ -6,7 +6,7 @@
 from importlib import import_module
 
 
-MODEL_NAMES = ("dsv4_pro", "dsv4_flash", "glm_5_2_fp8", "kimi_k3")
+MODEL_NAMES = ("dsv4_pro", "dsv4_flash", "glm_5_2_fp8", "kimi_k3", "dsv2_5")
 
 
 def load_model(name):

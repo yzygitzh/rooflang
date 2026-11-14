@@ -391,8 +391,8 @@ class Attn(Kernel):
                 + 2 * self.B * self.H_kv * self.S_kv * self.Hd) * b
 
 
-class KimiK3MlaAttn(Kernel):
-    """Backward for Kimi-K3 dense MLA with an absorbed latent KV core.
+class MlaAttn(Kernel):
+    """Backward for dense MLA with an absorbed latent KV core.
 
     The main attention recomputes QK scores and differentiates both QK and
     PV contractions.  The absorbed KV-B transform has separate activation

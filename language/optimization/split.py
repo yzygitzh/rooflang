@@ -25,7 +25,7 @@ from rooflang.language.kernels.comm import Broadcast, Gather, Reduce, Scatter
 from rooflang.language.kernels.forward import (
     Attn, AttnRes, DpskV4SparseAttn, ElementwiseOp, Embedding, Gemm,
     Glm52SparseAttn, KimiK3DeltaAttn, KimiK3DeltaAttnStateStore,
-    KimiK3MlaAttn, LayerNorm, Nop,
+    LayerNorm, MlaAttn, Nop,
     PartialRMSNorm, ReadInput, RMSNorm, Sampling, Slice, StridedGemm,
     TokenCombine, TokenDispatch,
 )
@@ -101,7 +101,7 @@ def _make_dependency_gather(tensor, n):
 def _context_split_attn_decode(kernel, n):
     """Split one decode attention over equal-size persistent KV shards."""
     if not isinstance(
-            kernel, (DpskV4SparseAttn, Glm52SparseAttn, KimiK3MlaAttn)):
+            kernel, (DpskV4SparseAttn, Glm52SparseAttn, MlaAttn)):
         raise TypeError(
             "decode attention split requires an MLA/sparse-attention kernel")
     if kernel.S_kv % n != 0:
@@ -128,8 +128,8 @@ def _context_split_attn_decode(kernel, n):
             prev_comms[port] = _make_broadcast(tensor, n)
     copies = []
     for _ in range(n):
-        if isinstance(kernel, KimiK3MlaAttn):
-            copy = KimiK3MlaAttn(
+        if isinstance(kernel, MlaAttn):
+            copy = MlaAttn(
                 kernel.B, kernel.H, kernel.S_q, local_kv,
                 kernel.qk_head_dim, kernel.v_head_dim,
                 kernel.kv_cache_dim, kernel.kv_lora_rank,
@@ -490,7 +490,7 @@ def _context_split(kernel, n, *, is_prefill):
     """
     if isinstance(
             kernel, (Attn, DpskV4SparseAttn, Glm52SparseAttn,
-                     KimiK3MlaAttn)):
+                     MlaAttn)):
         if is_prefill:
             return _context_split_attn_prefill(kernel, n)
         else:
@@ -548,8 +548,8 @@ def _context_split_attn_prefill(kernel, n):
 
     copies = []
     for _ in range(n):
-        if isinstance(kernel, KimiK3MlaAttn):
-            c = KimiK3MlaAttn(
+        if isinstance(kernel, MlaAttn):
+            c = MlaAttn(
                 kernel.B, kernel.H, kernel.S_q // n, kernel.S_kv,
                 kernel.qk_head_dim, kernel.v_head_dim,
                 kernel.kv_cache_dim, kernel.kv_lora_rank,
@@ -768,8 +768,8 @@ def _make_batch_copy(kernel, n):
         c = AttnRes(
             kernel.B // n, kernel.S, kernel.D, kernel.R,
             kernel.storage_dtype, kernel.dtype_)
-    elif isinstance(kernel, KimiK3MlaAttn):
-        c = KimiK3MlaAttn(
+    elif isinstance(kernel, MlaAttn):
+        c = MlaAttn(
             kernel.B // n, kernel.H, kernel.S_q, kernel.S_kv,
             kernel.qk_head_dim, kernel.v_head_dim, kernel.kv_cache_dim,
             kernel.kv_lora_rank, kernel.qk_nope_head_dim, kernel.dtype_,

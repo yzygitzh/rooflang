@@ -14,9 +14,10 @@ from rooflang.language.kernels.identity import Spawn
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.placement import Placement
 from rooflang.language.tensor import Tensor
+from rooflang.programs.models.dsv2_5 import optimization as dsv2_5_opt
 from rooflang.programs.models.dsv4_flash import optimization as dsv4_flash_opt
 from rooflang.programs.models.glm_5_2_fp8 import optimization as glm_opt
-from rooflang.programs.models import dsv4_flash, glm_5_2_fp8, kimi_k3
+from rooflang.programs.models import dsv2_5, dsv4_flash, glm_5_2_fp8, kimi_k3
 from rooflang.programs.experiments import visualization
 from rooflang.programs.presets.b300 import B300Cluster, B300SuperChip
 
@@ -24,6 +25,7 @@ from rooflang.programs.presets.b300 import B300Cluster, B300SuperChip
 OPTIMIZATIONS = [
     pytest.param(dsv4_flash_opt, id="dsv4_flash"),
     pytest.param(glm_opt, id="glm_5_2_fp8"),
+    pytest.param(dsv2_5_opt, id="dsv2_5"),
 ]
 
 
@@ -200,8 +202,8 @@ def test_superchip_optimizer_places_a_minimal_graph(optimization):
 
 
 @pytest.mark.parametrize(
-    "model_package", [dsv4_flash, glm_5_2_fp8, kimi_k3],
-    ids=["dsv4_flash", "glm_5_2_fp8", "kimi_k3"],
+    "model_package", [dsv4_flash, glm_5_2_fp8, kimi_k3, dsv2_5],
+    ids=["dsv4_flash", "glm_5_2_fp8", "kimi_k3", "dsv2_5"],
 )
 def test_model_package_lazy_visualization_attribute(model_package):
     assert model_package.visualize_layer is visualization.visualize_layer

@@ -13,7 +13,7 @@ from typing import List
 from rooflang.language.graph import ComputeGraph
 from rooflang.language.kernels.forward import (
     AttnRes, ElementwiseOp, Embedding, Gemm, KimiK3DeltaAttn,
-    KimiK3DeltaAttnStateStore, KimiK3MlaAttn, Nop, PartialRMSNorm,
+    KimiK3DeltaAttnStateStore, MlaAttn, Nop, PartialRMSNorm,
     ReadInput, RMSNorm, Sampling, Slice,
     StridedGemm, TokenCombine, TokenDispatch,
 )
@@ -246,7 +246,7 @@ def _build_mla(g, layer, B, S, cache_len, attn_fan, is_prefill):
     g.add_data_edge(wkv, kv_norm, {"y": "x"})
     layer.kv_norm = kv_norm
 
-    sa = KimiK3MlaAttn(
+    sa = MlaAttn(
         B, H, S, cache_len, QK_HD, V_HD, KV_CACHE_DIM, KV_LORA,
         QK_NOPE_HD, dtype="fp8", kv_transform_dtype="fp8",
         q_dtype="bf16", kv_dtype="fp8", out_dtype="bf16",

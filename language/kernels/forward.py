@@ -371,8 +371,8 @@ class Attn(Kernel):
         return self.B * self.H * self.S_q * self.Hd * dtype_bytes(self.dtype_)
 
 
-class KimiK3MlaAttn(Kernel):
-    """Kimi-K3 dense MLA with an absorbed latent KV core.
+class MlaAttn(Kernel):
+    """Dense MLA with an absorbed latent KV core.
 
     The logical query/output tensors retain their per-head dimensions while
     the persistent KV input stores one shared latent plus the RoPE component.

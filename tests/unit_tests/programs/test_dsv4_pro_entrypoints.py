@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import rooflang.programs.models.dsv2_5 as dsv2_5
 import rooflang.programs.models.dsv4_flash as dsv4_flash
 import rooflang.programs.models.dsv4_pro as dsv4_pro
 import rooflang.programs.models.glm_5_2_fp8 as glm_5_2_fp8
@@ -28,11 +29,12 @@ def test_package_lazy_visualization_attribute():
 
 def test_model_loader_exposes_registered_models():
     assert MODEL_NAMES == (
-        "dsv4_pro", "dsv4_flash", "glm_5_2_fp8", "kimi_k3")
+        "dsv4_pro", "dsv4_flash", "glm_5_2_fp8", "kimi_k3", "dsv2_5")
     assert load_model("dsv4_pro") is dsv4_pro
     assert load_model("dsv4_flash") is dsv4_flash
     assert load_model("glm_5_2_fp8") is glm_5_2_fp8
     assert load_model("kimi_k3") is kimi_k3
+    assert load_model("dsv2_5") is dsv2_5
     with pytest.raises(ValueError, match="Unknown model"):
         load_model("missing")
 

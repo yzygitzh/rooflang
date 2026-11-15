@@ -7,12 +7,15 @@ import argparse
 
 from rooflang.language.hardware.component import Compute
 from rooflang.programs.models import MODEL_NAMES, load_model
+from rooflang.programs.presets.a100 import A100Cluster, A100SuperChip
 from rooflang.programs.presets.b300 import B300Cluster, B300SuperChip
 from rooflang.programs.presets.h200 import H200Cluster, H200SuperChip
 from rooflang.programs.experiments.simulation import simulate
 
 
 HARDWARE_MAP = {
+    "A100Cluster1Node": lambda: A100Cluster(n_nodes=1),
+    "A100SuperChip": lambda: A100SuperChip(),
     "B300Cluster1Node": lambda: B300Cluster(n_nodes=1),
     "B300SuperChip": lambda: B300SuperChip(),
     "H200Cluster1Node": lambda: H200Cluster(n_nodes=1),
@@ -78,7 +81,7 @@ def main():
             visualize_layer(g, viz_layer, extra_seeds=seeds)
 
     # C. Optimization
-    if isinstance(hw, (B300SuperChip, H200SuperChip)):
+    if isinstance(hw, (A100SuperChip, B300SuperChip, H200SuperChip)):
         g, p = model.optimize_model_superchip(g, hw)
     else:
         n_gpus = sum(

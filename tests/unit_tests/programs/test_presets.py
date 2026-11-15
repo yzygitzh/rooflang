@@ -6,6 +6,7 @@
 import pytest
 
 from rooflang.language.hardware.component import Compute, Memory
+from rooflang.programs.presets.a100 import A100Cluster, A100SuperChip
 from rooflang.programs.presets.ascend950dt import (
     Ascend950DTCluster,
     Ascend950DTSuperChip,
@@ -284,6 +285,7 @@ class TestH200Cluster:
     [
         (H200Cluster, "nvidia-h200-sxm", "mellanox-cx7"),
         (B300Cluster, "nvidia-b300-sxm", "mellanox-cx8"),
+        (A100Cluster, "nvidia-a100-sxm-80gb", "mellanox-cx6"),
     ],
 )
 def test_cluster_inter_node_paths_use_matching_nic_rails(
@@ -352,6 +354,191 @@ class TestH200SuperChip:
         assert len(_fabric_path(
             hw, components["n0-nvidia-h200-sxm-0"],
             components["n0-mellanox-cx7-0"])) == 2
+
+
+class TestA100Cluster:
+    def test_component_kinds(self):
+        hw = A100Cluster(n_nodes=1)
+        components = {component.name: component for component in hw.nodes}
+
+        assert components["n0-nvidia-a100-sxm-80gb-0"].kind == "gpu"
+        assert components["n0-intel-xeon-6767p-0"].kind == "cpu"
+        assert components["n0-mellanox-cx6-0"].kind == "nic"
+        assert components["n0-hbm2e-0"].kind == "hbm"
+        assert components["n0-ddr5-0"].kind == "dram"
+        assert components["n0-ssd-0"].kind == "ssd"
+        assert components["n0-nvswitch"].kind == "switch"
+
+    def test_gpu_and_hbm_specs(self):
+        hw = A100Cluster(n_nodes=1)
+        components = {component.name: component for component in hw.nodes}
+
+        gpu = components["n0-nvidia-a100-sxm-80gb-0"]
+        hbm = components["n0-hbm2e-0"]
+        hbm_fabric = hw.find_fabric(gpu, hbm)
+
+        assert gpu.tflops == {
+            "fp4": 312.0, "fp8": 312.0,
+            "bf16": 312.0, "fp16": 312.0, "fp32": 19.5,
+        }
+        assert hbm.capacity_gb == 80.0
+        assert hbm_fabric.src_to_dst_bandwidth_gbs == 2039.0
+
+    def test_aggregate_bandwidth(self):
+        hw = A100Cluster(n_nodes=2)
+        gpus = [component for component in hw.nodes
+                if isinstance(component, Compute)
+                and "nvidia-a100" in component.name]
+        node0_gpus = [gpu for gpu in gpus if gpu.name.startswith("n0-")]
+
+        assert hw.find_aggregate_bandwidth(node0_gpus) == 300.0
+        assert hw.find_aggregate_bandwidth(gpus) == 200.0
+        assert hw.find_aggregate_bandwidth(gpus[:1]) == float("inf")
+
+    def test_nvlink_and_pcie_bandwidths(self):
+        hw = A100Cluster(n_nodes=1)
+        components = {component.name: component for component in hw.nodes}
+        gpu = components["n0-nvidia-a100-sxm-80gb-0"]
+        nic = components["n0-mellanox-cx6-0"]
+        nvswitch = components["n0-nvswitch"]
+        hgx = components["n0-hgx-pcie-switch-0"]
+
+        nvlink = hw.find_fabric(gpu, nvswitch)
+        gpu_pcie = hw.find_fabric(gpu, hgx)
+        nic_pcie = hw.find_fabric(nic, hgx)
+        infiniband = hw.find_fabric(nic, components["ib-switch"])
+        gpu_nic_path = _fabric_path(hw, gpu, nic)
+
+        assert nvlink.src_to_dst_bandwidth_gbs == 300.0
+        assert nvlink.dst_to_src_bandwidth_gbs == 300.0
+        assert gpu_pcie.src_to_dst_bandwidth_gbs == 64.0
+        assert gpu_pcie.dst_to_src_bandwidth_gbs == 64.0
+        assert nic_pcie.src_to_dst_bandwidth_gbs == 64.0
+        assert nic_pcie.dst_to_src_bandwidth_gbs == 64.0
+        assert infiniband.src_to_dst_bandwidth_gbs == 25.0
+        assert infiniband.dst_to_src_bandwidth_gbs == 25.0
+        assert len(gpu_nic_path) == 2
+        assert all(fabric.name == "pcie" for fabric in gpu_nic_path)
+
+    def test_cpus_each_attach_to_four_hgx_switches(self):
+        hw = A100Cluster(n_nodes=1)
+        components = {component.name: component for component in hw.nodes}
+
+        assert "n0-cpu-pcie-switch" not in components
+        for index in range(8):
+            cpu = components[f"n0-intel-xeon-6767p-{index // 4}"]
+            other_cpu = components[
+                f"n0-intel-xeon-6767p-{1 - index // 4}"]
+            hgx = components[f"n0-hgx-pcie-switch-{index}"]
+            path = _fabric_path(hw, cpu, hgx)
+            assert len(path) == 1
+            assert path[0].src_to_dst_bandwidth_gbs == 64.0
+            assert path[0].dst_to_src_bandwidth_gbs == 64.0
+            assert len(_fabric_path(hw, other_cpu, hgx)) > 1
+
+    def test_reuses_h200_host_and_ssd_specs(self):
+        hw = A100Cluster(n_nodes=1)
+        components = {component.name: component for component in hw.nodes}
+
+        assert components["n0-intel-xeon-6767p-0"].tflops == {
+            "bf16": 255.29, "fp16": 255.29, "int8": 511.18,
+        }
+        assert components["n0-ddr5-0"].capacity_gb == 1536.0
+        for index in range(8):
+            ssd = components[f"n0-ssd-{index}"]
+            assert ssd.capacity_gb == 256000.0
+            path = _fabric_path(
+                hw, ssd, components[f"n0-hgx-pcie-switch-{index}"])
+            assert len(path) == 1
+            assert path[0].src_to_dst_bandwidth_gbs == 14.0
+            assert path[0].dst_to_src_bandwidth_gbs == 7.0
+
+    def test_per_gpu_ssd_resolves_to_gpu_not_pcie_switch(self):
+        hw = A100Cluster(n_nodes=1)
+        components = {component.name: component for component in hw.nodes}
+
+        for index in range(8):
+            assert hw.find_local_device(components[f"n0-ssd-{index}"]) \
+                is components[f"n0-nvidia-a100-sxm-80gb-{index}"]
+
+
+class TestA100SuperChip:
+    def test_aggregates_one_node(self):
+        hw = A100SuperChip()
+        components = {component.name: component for component in hw.nodes}
+
+        gpu = components["n0-nvidia-a100-sxm-80gb-0"]
+        assert gpu.tflops == {
+            "fp4": 2496.0, "fp8": 2496.0,
+            "bf16": 2496.0, "fp16": 2496.0, "fp32": 156.0,
+        }
+        assert components["n0-hbm2e-0"].capacity_gb == 640.0
+        assert components["n0-ddr5-0"].capacity_gb == 3072.0
+        assert components["n0-ssd"].capacity_gb == 2048000.0
+        assert "n0-mellanox-cx6-0" in components
+        assert not any("nvswitch" in name for name in components)
+
+    def test_aggregates_node_bandwidths(self):
+        hw = A100SuperChip()
+        components = {component.name: component for component in hw.nodes}
+
+        hbm = hw.find_fabric(
+            components["n0-nvidia-a100-sxm-80gb-0"],
+            components["n0-hbm2e-0"])
+        gpu_pcie = hw.find_fabric(
+            components["n0-nvidia-a100-sxm-80gb-0"],
+            components["n0-hgx-pcie-switch"])
+        nic_pcie = hw.find_fabric(
+            components["n0-mellanox-cx6-0"],
+            components["n0-hgx-pcie-switch"])
+        infiniband = hw.find_fabric(
+            components["n0-mellanox-cx6-0"],
+            components["ib-switch"])
+        ssd_pcie = hw.find_fabric(
+            components["n0-ssd"], components["n0-hgx-pcie-switch"])
+
+        assert hbm.src_to_dst_bandwidth_gbs == 16312.0
+        assert gpu_pcie.src_to_dst_bandwidth_gbs == 512.0
+        assert nic_pcie.src_to_dst_bandwidth_gbs == 512.0
+        assert infiniband.src_to_dst_bandwidth_gbs == 200.0
+        assert ssd_pcie.src_to_dst_bandwidth_gbs == 112.0
+        assert ssd_pcie.dst_to_src_bandwidth_gbs == 56.0
+        assert len(_fabric_path(
+            hw, components["n0-nvidia-a100-sxm-80gb-0"],
+            components["n0-mellanox-cx6-0"])) == 2
+
+
+@pytest.mark.parametrize("preset", [A100Cluster, A100SuperChip])
+def test_a100_rejects_non_positive_nic_speed(preset):
+    with pytest.raises(ValueError, match="nic_gbps"):
+        preset(nic_gbps=0)
+    with pytest.raises(ValueError, match="nic_gbps"):
+        preset(nic_gbps=-100)
+
+
+def test_a100_nic_speed_is_configurable():
+    cluster = A100Cluster(n_nodes=1, nic_gbps=100)
+    components = {component.name: component for component in cluster.nodes}
+    infiniband = cluster.find_fabric(
+        components["n0-mellanox-cx6-0"], components["ib-switch"])
+
+    assert cluster.nic_gbps == 100
+    assert infiniband.src_to_dst_bandwidth_gbs == 12.5
+    assert infiniband.dst_to_src_bandwidth_gbs == 12.5
+
+    spread = A100Cluster(n_nodes=2, nic_gbps=100)
+    gpus = [component for component in spread.nodes
+            if component.kind == "gpu"]
+    assert spread.find_aggregate_bandwidth(gpus) == 100.0
+
+    chip = A100SuperChip(nic_gbps=100)
+    components = {component.name: component for component in chip.nodes}
+    infiniband = chip.find_fabric(
+        components["n0-mellanox-cx6-0"], components["ib-switch"])
+
+    assert chip.nic_gbps == 100
+    assert infiniband.src_to_dst_bandwidth_gbs == 100.0
+    assert infiniband.dst_to_src_bandwidth_gbs == 100.0
 
 
 @pytest.mark.parametrize("preset", [GB300Cluster, GB300SuperChip])

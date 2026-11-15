@@ -133,6 +133,7 @@ def test_main_covers_cluster_prefill_decode_and_superchip(monkeypatch,
                                                           capsys):
     cluster = SimpleNamespace(nodes=[Compute("gpu0", kind="gpu")])
     superchip = _Superchip()
+    monkeypatch.setattr(main_module, "A100SuperChip", _Superchip)
     monkeypatch.setattr(main_module, "B300SuperChip", _Superchip)
     monkeypatch.setattr(main_module, "H200SuperChip", _Superchip)
     monkeypatch.setattr(main_module, "HARDWARE_MAP", {

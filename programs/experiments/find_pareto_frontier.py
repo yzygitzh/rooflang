@@ -61,6 +61,7 @@ from typing import Iterable, Iterator, Sequence
 from rooflang.language.hardware.component import Compute, Memory
 from rooflang.language.kernels.forward import Nop, Sampling
 from rooflang.programs.models import MODEL_NAMES, load_model
+from rooflang.programs.presets.a100 import A100Cluster
 from rooflang.programs.presets.ascend950dt import Ascend950DTCluster
 from rooflang.programs.presets.b300 import B300Cluster
 from rooflang.programs.presets.gb300 import GB300Cluster
@@ -101,7 +102,7 @@ WORKLOADS = {
     "decode-1m": ("decode", 1048576),
 }
 HARDWARE_NAMES = (
-    "h200", "gh200", "b300", "gb300", "ascend950dt", "rtx6000d",
+    "h200", "gh200", "a100", "b300", "gb300", "ascend950dt", "rtx6000d",
 )
 GPU_COUNTS = (8, 16, 32, 64, 128, 256, 512)
 THROUGHPUT_METRICS = {
@@ -322,6 +323,10 @@ def build_hardware(name: str, n_gpus: int):
         if n_gpus % 8:
             raise ValueError("B300 GPU count must be divisible by 8")
         return B300Cluster(n_nodes=n_gpus // 8)
+    if name == "a100":
+        if n_gpus % 8:
+            raise ValueError("A100 GPU count must be divisible by 8")
+        return A100Cluster(n_nodes=n_gpus // 8)
     if name == "gh200":
         scope = _largest_node_scope(n_gpus, maximum=GH200Cluster.max_scope)
         return GH200Cluster(nvl_scope=scope, n_nodes=n_gpus // scope)

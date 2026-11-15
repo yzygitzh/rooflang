@@ -171,7 +171,7 @@ def test_single_node_scopes_and_eight_gpu_nodes():
         assert len(gpus) == 48
         assert {gpu.name.split("-", 1)[0] for gpu in gpus} == {"n0"}
 
-    for name in ("h200", "b300"):
+    for name in ("h200", "b300", "a100"):
         hardware = build_hardware(name, 48)
         gpus = [component for component in hardware.nodes
                 if isinstance(component, Compute)
@@ -200,7 +200,7 @@ def test_large_fabric_hardware_uses_multiple_maximal_nodes(
     assert len({gpu.name.split("-", 1)[0] for gpu in gpus}) == expected_nodes
 
 
-@pytest.mark.parametrize("name", ["h200", "b300", "rtx6000d"])
+@pytest.mark.parametrize("name", ["h200", "b300", "a100", "rtx6000d"])
 def test_eight_gpu_node_hardware_rejects_partial_nodes(name):
     with pytest.raises(ValueError, match="divisible by 8"):
         build_hardware(name, 7)

@@ -75,8 +75,11 @@ def test_graph_layer_types_mla_and_bf16_caches(monkeypatch, decode):
         assert layer.sa.out_dtype == "bf16"
         assert layer.sa.kv_cache_dim == 576
         assert layer.sa.kv_lora_rank == 512
+        width = (
+            576 + 512 if decode
+            else layer.sa.qk_head_dim + layer.sa.v_head_dim)
         assert layer.sa.attention_flops == pytest.approx(
-            2 * 8 * 128 * layer.sa.selected_pairs * (576 + 512))
+            2 * 8 * 128 * layer.sa.selected_pairs * width)
         assert layer.sa.weights["kv_b"].shape == (512, 128 * 256)
         assert layer.sa.weights["kv_b"].dtype == "bf16"
         assert isinstance(layer.kv_norm, PartialRMSNorm)

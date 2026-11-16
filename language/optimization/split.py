@@ -137,6 +137,7 @@ def _context_split_attn_decode(kernel, n):
                 kernel.kv_transform_dtype,
                 q_dtype=kernel.q_dtype, kv_dtype=kernel.kv_dtype,
                 out_dtype=kernel.out_dtype, causal=kernel.causal,
+                attention_mode=kernel.attention_mode,
                 selected_pairs=kernel.selected_pairs / n,
                 kv_transform_tokens=kernel.kv_transform_tokens / n)
         elif isinstance(kernel, Glm52SparseAttn):
@@ -557,6 +558,7 @@ def _context_split_attn_prefill(kernel, n):
                 kernel.kv_transform_dtype,
                 q_dtype=kernel.q_dtype, kv_dtype=kernel.kv_dtype,
                 out_dtype=kernel.out_dtype, causal=kernel.causal,
+                attention_mode=kernel.attention_mode,
                 selected_pairs=kernel.selected_pairs / n,
                 kv_transform_tokens=kernel.kv_transform_tokens / n)
         elif isinstance(kernel, Glm52SparseAttn):
@@ -776,6 +778,7 @@ def _make_batch_copy(kernel, n):
             kernel.kv_transform_dtype,
             q_dtype=kernel.q_dtype, kv_dtype=kernel.kv_dtype,
             out_dtype=kernel.out_dtype, causal=kernel.causal,
+            attention_mode=kernel.attention_mode,
             selected_pairs=kernel.selected_pairs,
             kv_transform_tokens=kernel.kv_transform_tokens)
     elif isinstance(kernel, KimiK3DeltaAttn):

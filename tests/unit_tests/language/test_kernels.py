@@ -10,9 +10,9 @@ import pytest
 from rooflang.language.graph import ComputeGraph
 from rooflang.language.kernels.kernel import Kernel
 from rooflang.language.kernels.forward import (
-    ElementwiseOp, Embedding, Gemm, Nop, ReadInput, RMSNorm, LayerNorm,
-    Attn, DpskV4SparseAttn, Glm52SparseAttn, Slice, Sampling, TokenDispatch,
-    TokenCombine,
+    ElementwiseOp, Embedding, Gemm, MlaAttn, Nop, ReadInput, RMSNorm,
+    LayerNorm, Attn, DpskV4SparseAttn, Glm52SparseAttn, Slice, Sampling,
+    TokenDispatch, TokenCombine,
 )
 from rooflang.language.kernels import backward
 from rooflang.language.kernels.comm import (
@@ -242,6 +242,38 @@ class TestAttn(TestKernelBase):
     def test_flops_causal_asymmetric_not_halved(self):
         a = Attn(B=2, H=8, H_kv=8, S_q=128, S_kv=256, Hd=64, causal=True)
         assert a.flops == 4.0 * 2 * 8 * 128 * 256 * 64
+
+
+class TestMlaAttn:
+    def _kernel(self, *, causal, attention_mode="auto"):
+        return MlaAttn(
+            B=2, H=4, S_q=8 if causal else 1, S_kv=8,
+            qk_head_dim=16, v_head_dim=12, kv_cache_dim=20,
+            kv_lora_rank=8, qk_nope_head_dim=10,
+            causal=causal, attention_mode=attention_mode)
+
+    def test_prefill_uses_materialized_mha_width(self):
+        k = self._kernel(causal=True)
+        assert k.attention_mode == "prefill"
+        assert k.attention_width == k.qk_head_dim + k.v_head_dim
+        assert k.attention_flops == (
+            2 * k.B * k.H * k.selected_pairs * (16 + 12))
+
+    def test_decode_uses_absorbed_latent_width(self):
+        k = self._kernel(causal=False)
+        assert k.attention_mode == "decode"
+        assert k.attention_width == k.kv_cache_dim + k.kv_lora_rank
+        assert k.attention_flops == (
+            2 * k.B * k.H * k.selected_pairs * (20 + 8))
+
+    def test_explicit_mode_overrides_causal(self):
+        k = self._kernel(causal=False, attention_mode="prefill")
+        assert k.attention_mode == "prefill"
+        assert k.attention_width == k.qk_head_dim + k.v_head_dim
+
+    def test_invalid_mode_rejected(self):
+        with pytest.raises(ValueError, match="attention_mode"):
+            self._kernel(causal=False, attention_mode="bogus")
 
 
 class TestDpskV4SparseAttn(TestKernelBase):

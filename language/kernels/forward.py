@@ -372,12 +372,18 @@ class Attn(Kernel):
 
 
 class MlaAttn(Kernel):
-    """Dense MLA with an absorbed latent KV core.
+    """Dense MLA with prefill/decode-specific attention arithmetic.
 
-    The logical query/output tensors retain their per-head dimensions while
-    the persistent KV input stores one shared latent plus the RoPE component.
-    The KV-B projection is absorbed into the attention kernel and remains an
-    explicit weight for memory-footprint accounting.
+    The persistent KV input stores one shared latent plus the RoPE component.
+    The two serving phases use different contractions of the same MLA weights:
+
+    * prefill materializes per-head K/V and runs full MHA:
+      ``qk_head_dim + v_head_dim`` multiply-adds per q-kv pair;
+    * decode absorbs the KV-B projection into Q and runs in latent space:
+      ``kv_cache_dim + kv_lora_rank`` multiply-adds per q-kv pair.
+
+    The KV-B projection remains an explicit weight for memory-footprint
+    accounting in both modes.
     """
 
     def __init__(
@@ -398,9 +404,14 @@ class MlaAttn(Kernel):
         kv_dtype: str = "fp8",
         out_dtype: str | None = None,
         causal: bool = False,
+        attention_mode: str = "auto",
         selected_pairs: int | Fraction | None = None,
         kv_transform_tokens: int | Fraction | None = None,
     ):
+        if attention_mode not in ("auto", "prefill", "decode"):
+            raise ValueError(
+                "attention_mode must be one of 'auto', 'prefill', 'decode'; "
+                f"got {attention_mode!r}")
         self.B, self.H = B, H
         self.S_q, self.S_kv = S_q, S_kv
         self.qk_head_dim = qk_head_dim
@@ -414,6 +425,10 @@ class MlaAttn(Kernel):
         self.kv_dtype = kv_dtype
         self.out_dtype = out_dtype or dtype
         self.causal = causal
+        self.attention_mode = (
+            "prefill" if attention_mode == "auto" and causal
+            else "decode" if attention_mode == "auto"
+            else attention_mode)
         self.selected_pairs = (
             self._default_selected_pairs() if selected_pairs is None
             else Fraction(selected_pairs))
@@ -428,10 +443,17 @@ class MlaAttn(Kernel):
         return Fraction(self.S_q * self.S_kv)
 
     @property
+    def attention_width(self) -> int:
+        """Multi-adds per q-kv pair and head for the active MLA mode."""
+        if self.attention_mode == "prefill":
+            return self.qk_head_dim + self.v_head_dim
+        return self.kv_cache_dim + self.kv_lora_rank
+
+    @property
     def attention_flops(self) -> float:
         return float(
             2 * self.B * self.H * self.selected_pairs
-            * (self.kv_cache_dim + self.kv_lora_rank))
+            * self.attention_width)
 
     @property
     def kv_transform_flops(self) -> float:
